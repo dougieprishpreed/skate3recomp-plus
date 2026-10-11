@@ -1,6 +1,6 @@
-# Welcome to New San Van.
+# Welcome to New San Vanelona.
 
-Visit the city from the in-game locations menu of Skate 3; it's at the bottom of the list.
+Visit Skate 2's iconic city from the in-game locations menu of Skate 3.
 
 ## Complete with:
 
