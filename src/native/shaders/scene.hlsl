@@ -57,6 +57,7 @@ cbuffer CH : register(b2) {
 };
 Texture2D<float4> diffuse : register(t0);
 Texture2D<float4> lightmap : register(t1);
+Texture2D<float4> chromaticity_map : register(t11);
 Texture2D<float4> macro : register(t3);
 Texture2D<float4> decal_art : register(t4);
 // Paired second descriptor of the t4 table: the reflective families'
@@ -85,6 +86,89 @@ SamplerState smp : register(s0);
 // transparent border keeps everything outside the single placement clear;
 // wrap sampling tiled the graffiti across the whole plaza.
 SamplerState smp_clamp : register(s1);
+// Baked lighting atlas fetch. The games take one bilinear tap; lightmap
+// texels are tens of centimeters on big walls, and bilinear magnification
+// draws them as blocky diamond gradients, most visibly along baked shadow
+// edges next to the sharp live sun shadows. With scene_opts.x the atlas is
+// reconstructed with a cubic B-spline built from four bilinear taps
+// (C2-continuous, no texel-grid creases; Skate 2's LOD technique already
+// averaged four offset taps).
+float4 SampleLightmapAtlas(float2 uv) {
+  if (scene_opts.x < 0.5) {
+    return lightmap.SampleLevel(smp_clamp, uv, 0.0);
+  }
+  float2 size;
+  lightmap.GetDimensions(size.x, size.y);
+  float2 st = uv * size - 0.5;
+  float2 i0 = floor(st);
+  float2 f = st - i0;
+  float2 f2 = f * f;
+  float2 f3 = f2 * f;
+  float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+  float2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+  float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+  float2 w3 = f3 / 6.0;
+  float2 g0 = w0 + w1;
+  float2 g1 = w2 + w3;
+  // Bilinear positions between texels (i0-1, i0) and (i0+1, i0+2).
+  float2 p0 = (i0 - 0.5 + w1 / g0) / size;
+  float2 p1 = (i0 + 1.5 + w3 / g1) / size;
+  return g0.y * (g0.x * lightmap.SampleLevel(smp_clamp, p0, 0.0) +
+                 g1.x * lightmap.SampleLevel(smp_clamp, float2(p1.x, p0.y), 0.0)) +
+         g1.y * (g0.x * lightmap.SampleLevel(smp_clamp, float2(p0.x, p1.y), 0.0) +
+                 g1.x * lightmap.SampleLevel(smp_clamp, p1, 0.0));
+}
+// Packed mono lighting used by Skate 2 materials. Return gamma-space RGB
+// to the existing lighting branches, which perform their linear-space math.
+// mono2 = Skate 2's linear mono value (lm_val before chroma and the 4.5
+// multiplier), the luminosity its GetSpecularTerm scales by.
+float3 SampleWorldLightmap(float2 uv, out float mono2) {
+  float4 packed = SampleLightmapAtlas(uv);
+  mono2 = dot(packed.rgb * packed.rgb, float3(0.33, 0.34, 0.33)) / 4.5;
+  if (tint.r > 1.5) {
+    // tint.r encodes selector+2, leaving mat_tint available for fog.
+    uint channel = (uint)(tint.r - 2.0 + 0.5);
+    float luminance = channel == 0 ? packed.r : channel == 1 ? packed.g :
+                      channel == 2 ? packed.b : dot(packed.rgb, float3(0.33, 0.34, 0.33));
+    float3 chroma = chromaticity_map.SampleLevel(smp_clamp, uv, 0.0).rgb;
+    mono2 = luminance * luminance;
+    return sqrt(max(mono2 * chroma * 4.5, 0.0));
+  }
+  return packed.rgb;
+}
+float3 SampleWorldLightmap(float2 uv) {
+  float mono2 = 0.0;
+  return SampleWorldLightmap(uv, mono2);
+}
+// Skate 2 GetSpecularTerm (baseenvironment / decalenvironment /
+// building_ceiling_worldspace / transparentenvironment PS, render.big
+// shader sources): phong vs the real sun (power 10 + 290 ecc, tint
+// (18, 15, 10.5) x sat(lum - 0.1)) plus the `environment` cube reflection
+// (refmask x cube x lerp(lum, 1, 0.3 sat(4 (refmask - 1.5))) x 1.5), both
+// times the fresnel. The game fills g_fresnelLookupTexture from
+// material_envattributes/default (8, 1, 5) as lerp(1, 5, (1 - u)^8) / 5 and
+// the PS rescales by 5: exactly lerp(1, 5, (1 - N.E)^8). Returned in our
+// units: Skate 2's diffuse doubles through ApplyOverlay (2 x base x
+// overlay, 0.5-neutral) where the ported diffuse does not, so the term is
+// halved to keep its ratio to the diffuse. masks = spec/ecc/refmask,
+// N = shading normal, E = eye vector, lum = cLightMap.a (the shadowed mono
+// lightmap).
+float3 Skate2SpecTerm(float3 masks, float3 N, float3 E, float lum, bool cube_on) {
+  float3 L = sh_sun.xyz;
+  float fres = lerp(1.0, 5.0, pow(1.0 - saturate(dot(E, N)), 8.0));
+  float3 R = 2.0 * N * dot(N, L) - L;
+  float ks = pow(max(saturate(dot(R, E)), 1e-6), 10.0 + 290.0 * masks.g);
+  float3 term = masks.r * ks * float3(18.0, 15.0, 10.5) * saturate(lum - 0.1);
+  if (cube_on) {
+    // reflect(E, N) with xy negated (the source's ref_vec.xy *= -1); the
+    // console's 640p fetch LOD via scene_opts.y.
+    float3 rv = E - 2.0 * N * dot(E, N);
+    float3 cube = env_cube.SampleBias(smp, float3(-rv.x, -rv.y, rv.z), scene_opts.y).rgb;
+    float rl = 0.3 * saturate(4.0 * (masks.b - 1.5));
+    term += masks.b * cube * lerp(lum, 1.0, rl) * 1.5;
+  }
+  return 0.5 * term * fres;
+}
 struct VSOut {
   float4 pos : SV_Position;
   float3 rpos : TEXCOORD0;
@@ -124,12 +208,81 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
   } else {
     n = mul(n, (float3x3)world);
   }
-  o.pos = mul(mp, mvp);
+  // Skate 2 vertexanimate.fx (flags, fam 15) / treeanimate.fx (trees,
+  // fam 10) vertex wave, verbatim: TEXCOORD1.zw (carried in uv3) weights a
+  // per-axis sine of the animation clock by the material's m_params rows.
+  // Enabled only while New San Van is loaded (s2_anim_t.y).
+  if (s2_anim_t.y > 0.0 && tint.g == 0.0 &&
+      (abs(cam_pos.w + 15.0) < 0.5 || abs(cam_pos.w + 10.0) < 0.5)) {
+    int r = cam_pos.w < -12.5 ? 0 : 3;
+    float3 uvscale = float3(uv3.x, uv3.y, uv3.x + uv3.y) - float3(0.5, 0.5, 1.0);
+    float3 wave_time = s2_anim_t.xxx - uvscale;
+    float3 amplitude = uvscale * float3(s2_anim[r].w, s2_anim[r + 1].w, s2_anim[r + 2].w);
+    mp.xyz += sin(wave_time * s2_anim[r + 1].xyz + s2_anim[r + 2].xyz) * amplitude;
+  }
+  // Skate 2 glare.fx (fam 17, lamp halos): each quad corner sits at its
+  // center + (uv - 0.5) in xz; the VS collapses it to the center and
+  // re-expands it camera-facing by glareScale (misc.w) along the view's
+  // right/up axes, then takes its depth from a point glareScale/2 toward the
+  // camera so the halo clears the lamp globe it sits in. The view axes are
+  // the projection's clip x/y/w columns (camera right / up / forward).
+  if (abs(cam_pos.w + 17.0) < 0.5 && tint.g == 0.0) {
+    float2 uvs = uv - 0.5;
+    float3 c = p;
+    c.xz = p.xz - uvs;
+    float3 right = normalize(float3(mvp[0][0], mvp[1][0], mvp[2][0]));
+    float3 up = normalize(float3(mvp[0][1], mvp[1][1], mvp[2][1]));
+    float3 fwd = normalize(float3(mvp[0][3], mvp[1][3], mvp[2][3]));
+    o.rpos = mul(float4(c, 1.0), world).xyz - cam_pos.xyz +
+             misc.w * (uvs.x * right - uvs.y * up);
+    o.pos = mul(float4(o.rpos, 1.0), mvp);
+    float4 pulled = mul(float4(o.rpos - fwd * (misc.w * 0.5), 1.0), mvp);
+    if (pulled.w > 1e-3) {
+      o.pos.z = pulled.z / pulled.w * o.pos.w;
+    }
+    o.uv = uv;
+    o.uv2 = uv2;
+    o.nrm = n;
+    o.uv3 = uv3;
+    o.tanb = float4(0.0, 0.0, 0.0, 0.0);
+    return o;
+  }
+  // mvp is the view-projection re-based on cam_pos.xyz (RebasedViewProj):
+  // projecting the camera-relative position keeps float32 depth stable at
+  // distance, where absolute ~1 km coordinates made layered surfaces flicker.
   o.rpos = mul(mp, world).xyz - cam_pos.xyz;
+  o.pos = mul(float4(o.rpos, 1.0), mvp);
+  // Hall of Meat bones (char fam 8): depth taken from a point 0.5 m nearer
+  // the camera (at most half the view depth), screen position unchanged, so
+  // the bone clears the skater's own flesh and hair in the depth test while
+  // world geometry in front of the skater still hides it.
+  if (abs(cam_pos.w - 8.0) < 0.5 && tint.g > 0.0 && o.pos.w > 1e-3) {
+    float3 fwd = normalize(float3(mvp[0][3], mvp[1][3], mvp[2][3]));
+    float pull = min(0.5, o.pos.w * 0.5);
+    float4 pulled = mul(float4(o.rpos - fwd * pull, 1.0), mvp);
+    if (pulled.w > 1e-3) {
+      o.pos.z = pulled.z / pulled.w * o.pos.w;
+    }
+  }
   o.uv = uv;
   o.uv2 = uv2;
   o.nrm = n;
   o.uv3 = uv3;
+  // Traffic light lamps (fam 20), TrafficLightStateLookup verbatim: a lamp
+  // vertex shows its lit UV (TEXCOORD1, uv2) while component
+  // floor(TEXCOORD0.z * 4) (uv3.x, see DecodeMesh) of the game's lamp state
+  // vector (mat_tint: g_TrafficLightsStatus_1/_2) exceeds 1, else its unlit
+  // UV (TEXCOORD0.xy).
+  if (abs(cam_pos.w + 20.0) < 0.5 && tint.g == 0.0) {
+    int lamp = (int)floor(uv3.x * 4.0);
+    float state = lamp == 0 ? mat_tint.x
+                : lamp == 1 ? mat_tint.y
+                : lamp == 2 ? mat_tint.z
+                : lamp == 3 ? mat_tint.w : 0.0;
+    if (state > 1.0) {
+      o.uv = uv2;
+    }
+  }
   // Stored binormal + handedness from the blend-weight bytes (statics
   // only; skinned items use those bytes for actual weights). w passes
   // RAW: ~0 = no stored frame, ~0.39 = negative handedness, ~0.78 =
@@ -183,6 +336,36 @@ bool ShowcaseLayerOn(float px_x, int bit) {
 #include "scene_char.hlsli"
 #include "scene_dynobj.hlsli"
 #include "scene_water.hlsli"
+// Skate 2 transparentenvironment_defaultPS (fam 36, New San Van
+// environment.transparent; render.big source): body = the shadowed lightmap
+// x D^2 x a (no kd, no macro) plus GetSpecularTerm off the VERTEX normal
+// with the raw masks, then the shared fog / exposure / tone chain; the blend
+// factor is a^2, alpha-tested at ALPHAREF 16. Same half-scale units as the
+// fam 1/3 port (Skate2SpecTerm), the CSM receive of the exact families.
+// The spec/refmask term is what colors the Waterfront railing's etched
+// glass at grazing angles (default_gray masks, the waterfront cube).
+float4 ShadeSkate2Transparent(VSOut i, float4 albedo, float fog_a,
+                              float3 fog_rgb, float expo) {
+  float a2 = albedo.a * albedo.a;
+  clip(a2 - 15.5 / 255.0);
+  float3 n = dot(i.nrm, i.nrm) > 0.01 ? normalize(i.nrm)
+                                      : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+  float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, i.nrm, i.pos.xy),
+                SampleStaticSun(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy));
+  float mono2 = 0.0;
+  float3 lmg = SampleWorldLightmap(i.uv2, mono2);
+  float3 lml = tint.r > 0.0 ? min(lmg * lmg, s + sh_color.rgb) : lmg * lmg;
+  float3 lin = 0.5 * lml * albedo.rgb * albedo.rgb * albedo.a;
+  if (overlay.x > 0.5) {
+    float sil = dot(n, sh_sun.xyz) > 0.0 ? s : 1.0;
+    float lum = lerp(min(mono2, 0.04), mono2, sil);
+    lin += Skate2SpecTerm(decal_art.Sample(smp, i.uv).rgb, n, -normalize(i.rpos), lum,
+                          overlay.y > 0.5);
+  }
+  fog_a *= sh_env.x;  // material multiplier (PS c11.y)
+  lin *= NightGrade();
+  return ToneOut((lin * fog_a + fog_rgb) * expo, a2, false);
+}
 // The full material shading for every family (see ps_main below; the
 // showcase wrapper substitutes the early build-up stages' looks over this
 // result's rgb while keeping its alpha).
@@ -207,8 +390,20 @@ float4 ShadePixel(VSOut i) {
     // it alpha-BLENDS in the sorted sub-pass. Fam 14 (scrollincandescent)
     // never alpha-tests either (its technique sets no test state, and its
     // PS ignores the diffuse alpha entirely).
-    if (cam_pos.w > -12.5 || cam_pos.w < -14.5) {
-      float aref = cam_pos.w < -0.5 ? 0.1176 : 0.35;
+    // Skate 2 fams 16-18 test only per their own technique (in their
+    // branches, misc.y); the Skate 2 building glass (fam 1 with the
+    // misc.y floor-height flag) is opaque: the interior strip shows there.
+    bool s2_own_test = (cam_pos.w < -15.5 && cam_pos.w > -19.5) ||
+                       (abs(cam_pos.w + 1.0) < 0.5 && misc.y > 0.0);
+    // misc.x = -2: a Skate 2 effect with no alpha test at all
+    // (baseenvironment, defaultenvironment, decalenvironment, terrain,
+    // advertisement, building, proxyworld: opaque whatever the diffuse
+    // alpha holds; the world ALPHAREF punched speckled holes in art whose
+    // alpha carries a distressed edge, e.g. the Stadium's BLACK BOX flags).
+    if ((cam_pos.w > -12.5 || cam_pos.w < -14.5) && !s2_own_test && misc.x > -1.5) {
+      // misc.x = -1: Skate 2 decalzbias overlay (ALPHAREF 16 on the plain
+      // diffuse alpha; it then blends by that alpha, see the return).
+      float aref = misc.x < -0.5 ? 0.0627 : (cam_pos.w < -0.5 ? 0.1176 : 0.35);
       clip(misc.x > 0.0 ? albedo.a * albedo.a - 0.0627 : albedo.a - aref);
     }
   }
@@ -229,6 +424,14 @@ float4 ShadePixel(VSOut i) {
     // rpos + (0, cam.y - sky_h, 0).
     float3 dome = normalize(i.rpos + float3(0.0, cam_pos.y - mat_tint.w, 0.0));
     float3 lin = albedo.rgb * albedo.rgb;
+    if (overlay.z > 0.5) {
+      // Skate 2 sky_defaultPS: skycolour = gradient + detail - 0.5 (the
+      // cloud layer; m_params[1] tint/saturation is identity (1,1,1,1) in
+      // skater.bin), then MoveToLinearSpaceRGB. Same sampler/uv as the
+      // gradient (S2 i_detail: wrap U, clamp V like i_diffuse).
+      float3 sky = max(albedo.rgb + detail_map.Sample(smp, i.uv).rgb - 0.5, 0.0);
+      lin = sky * sky;
+    }
     float dotPL = saturate(dot(dome, mat_tint.xyz));
     float sinA = sqrt(saturate(1.0 - dotPL * dotPL));
     float4 sun = decal_art.Sample(smp_clamp, float2(sinA / overlay.x, 0.5 / 16.0));
@@ -260,18 +463,27 @@ float4 ShadePixel(VSOut i) {
     float fam = -cam_pos.w;
     float3 dlin = albedo.rgb * albedo.rgb;
     // Global distance fog (VS c5/c6, captured per frame): every world PS
-    // ends with col * fog.a + fog.rgb before exposure/tonemap.
+    // ends with col * fog.a + fog.rgb before exposure/tonemap. Its in-scatter
+    // is sky light: dimmed with the world at night (NightGrade).
     float fdist = length(i.rpos);
     float f1 = saturate(fdist * sh_fogp.x + sh_fogp.y);
     if (sh_fogp.z != 1.0) {
       f1 = pow(max(f1, 1e-6), sh_fogp.z);
     }
-    float3 fog_rgb = sh_fogc.rgb * f1;
+    float3 fog_rgb = sh_fogc.rgb * f1 * NightGrade();
     float fog_a = 1.0 + sh_fogc.a * f1;
     float expo = sh_sun.w;
     float3 lin;
     float out_a = 1.0;
     bool reduced_tone = false;
+    if (fam > 19.5 && fam < 20.5) {
+      // trafficlight_one/two_defaultPS (the signal lamps; Skate 3's ucode is
+      // the Skate 2 source byte for byte): the lamp texture as fetched (this
+      // shader never linearizes it) x m_params[0].y (misc.z), the world fog,
+      // its exposure g_envattributes[2].x (misc.w), tone; alpha = D.a. The
+      // VS already chose the lit or unlit lamp UV.
+      return ToneOut((albedo.rgb * misc.z * fog_a + fog_rgb) * misc.w, albedo.a, false);
+    }
     // Water families (30 flowingwateralpha / 31 ocean /
     // 32 oceanreflection): exact ports in scene_water.hlsli.
     if (fam > 29.5 && fam < 30.5) {
@@ -283,14 +495,73 @@ float4 ShadePixel(VSOut i) {
     if (fam > 31.5 && fam < 32.5) {
       return ShadeOceanReflection(i, dlin, fog_a, fog_rgb, expo);
     }
-    if (fam > 8.5 && fam < 12.5) {
+    if (fam > 32.5 && fam < 34.5) {
+      return ShadeSkate2Water(i, fam < 33.5, fog_a, fog_rgb, expo);
+    }
+    if (fam > 34.5 && fam < 35.5) {
+      return ShadeSkate2Ocean(i, fog_a, fog_rgb, expo);
+    }
+    if (fam > 35.5 && fam < 36.5) {
+      return ShadeSkate2Transparent(i, albedo, fog_a, fog_rgb, expo);
+    }
+    if (fam > 18.5 && fam < 19.5) {
+      // visualindicator_defaultPS (the Hall of Meat bone overlays), from
+      // its ucode: D^2 x i_colortint.rgb (mat_tint) x m_params[0].y
+      // (misc.z), world fog, its own exposure g_envattributes[2].x (misc.w),
+      // unlit; alpha = D.a x tint.a, straight-alpha blended.
+      float ia = albedo.a * mat_tint.a;
+      clip(ia - 0.5 / 255.0);
+      float3 il = dlin * mat_tint.rgb * misc.z;
+      return ToneOut((il * fog_a + fog_rgb) * misc.w, ia, false);
+    }
+    if (fam > 16.5 && fam < 17.5) {
+      // Skate 2 glare_defaultPS: the raw texture, no linearization, fog,
+      // exposure or tone (authored in final gamma space), ONE/ONE additive;
+      // ALPHAREF 1 (misc.y).
+      clip(albedo.a - (misc.y - 0.5 / 255.0));
+      return float4(PassGamma(albedo.rgb), 1.0);
+    }
+    if (fam > 17.5 && fam < 18.5) {
+      // Skate 2 godrayspotlight_defaultPS: |N.V| x D^2, written straight
+      // (no fog / exposure / tone), ONE/ONE additive.
+      float3 gn = dot(i.nrm, i.nrm) > 0.01
+                      ? normalize(i.nrm)
+                      : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
+      float va = abs(dot(gn, normalize(-i.rpos)));
+      return float4(PassGamma(va * dlin), 1.0);
+    }
+    if (fam > 15.5 && fam < 16.5) {
+      // Skate 2 baseincandescent / zbiasincandescent(backlit) /
+      // transparentincandescent / videoscreen PS (one shared body):
+      // D^2 * lerp(1, packed lightmap (4.5 chroma), m_params[0].x) *
+      // m_params[0].y, then the shared fog/exposure/tone tail. No shadow
+      // receive, no kd, no frame material multiplier. misc.z/w = x/y,
+      // misc.y = the technique's alpha-test reference (0 = none).
+      if (misc.y > 0.0) {
+        clip(albedo.a - (misc.y - 0.5 / 255.0));
+      }
+      float3 lmf = float3(1.0, 1.0, 1.0);
+      if (misc.z > 0.0) {
+        float3 lmg = SampleWorldLightmap(i.uv2);
+        lmf = lerp(lmf, lmg * lmg * NightGrade(), misc.z);
+      }
+      lin = dlin * lmf * misc.w;
+      out_a = albedo.a;
+    } else if (fam > 14.5 && fam < 15.5) {
+      // Skate 2 vertexanimate_defaultPS (flags): packed lightmap (4.5) x
+      // diffuse x g_ViewDotLight.x (the tree lightmap-scale row), no floor,
+      // no material multiplier; alpha from the diffuse.
+      float3 lmg = SampleWorldLightmap(i.uv2);
+      lin = dlin * (lmg * lmg) * sh_env.y;
+      out_a = albedo.a;
+    } else if (fam > 8.5 && fam < 12.5) {
       // tree/treeanimate: D^2 * max(lm^2, floor) * scale [* tint mult];
       // proxyworld/incandescent: D^2 * scale. No shadow receive, no kd, no
       // material multiplier on the fog term.
       if (fam < 10.5) {
         // Console lightmap semantics: bilinear, clamped, mip 0 (see the
         // main env fetch below).
-        float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
+        float3 lmg = SampleWorldLightmap(i.uv2);
         lin = dlin * max(lmg * lmg, sh_env.z) * sh_env.y;
         if (fam < 9.5) {
           lin *= sh_env.w;
@@ -309,12 +580,21 @@ float4 ShadePixel(VSOut i) {
       // (ucode-exact: scrollincandescent_defaultPS).
       float3 sd = diffuse.Sample(smp, i.uv + misc.xy).rgb;
       lin = sd * sd * misc.z;
+      // Skate 2's scrollincandescent adds baseincandescent's lightmap lerp
+      // (misc.w = m_params[0].x; 0 on native Skate 3 items).
+      if (misc.w > 0.0) {
+        float3 slm = SampleWorldLightmap(i.uv2);
+        lin *= lerp(float3(1.0, 1.0, 1.0), slm * slm * NightGrade(), misc.w);
+      }
     } else {
       // Environment families: macro overlay (0.5-neutral, fades under decal
       // art), linear decal composite, lightmap squared and min-clamped
       // against (CSM s + shadow color), kd, phong spec vs the shader's
       // fixed literal light, cube reflection on 5/6.
       float3 ov = float3(1.0, 1.0, 1.0);
+      // Skate 2 environment PS port (misc.x -3/-4 on fams 1/3, see
+      // Skate2SpecTerm and the kd / spec blocks below).
+      bool s2x = misc.x < -2.5 && fam < 4.5;
       // Decals-&-grime build-up layer (bit 256): macro weathering and decal
       // art both render neutral until revealed.
       bool sc_decals = ShowcaseLayerOn(i.pos.x, 256);
@@ -338,12 +618,40 @@ float4 ShadePixel(VSOut i) {
         // the no-fade model (measured from a matched A/B capture pair).
       }
       float3 dcol = dlin * ov;
+      if (fam < 1.5 && misc.y > 0.0) {
+        // Skate 2 building_ceiling_worldspace (building.default): behind
+        // the window glass (1 - diffuse alpha) the interior ceiling
+        // (diffuse2 at t9) is projected per floor (floorHeightMeters in
+        // misc.y, floorCount in overlay.x) along the view ray, then lit
+        // like the rest of the surface. Verbatim from the S2 PS.
+        float3 bv = normalize(-i.rpos);
+        float bez = length(bv.xz);
+        float2 bxz = bez > 1e-5 ? bv.xz / bez : float2(0.0, 0.0);
+        float bvy = abs(bv.y) > 1e-4 ? bv.y : (bv.y < 0.0 ? -1e-4 : 1e-4);
+        float bd = bez * frac(i.uv.y * overlay.x) * misc.y / bvy;
+        float2 buv = (i.rpos.xz + cam_pos.xz) + bxz * bd;
+        float3 strip = spec2_map.Sample(smp, buv * 0.3).rgb;
+        dcol = (dlin + strip * strip * (1.0 - albedo.a)) * ov;
+        // Its PS takes the diffuse WITHOUT ApplyOverlay's 2x (base and decal
+        // environment double it against their 0.5-neutral default_gray
+        // overlay), so in the half-scale units of the ported diffuse (see
+        // Skate2SpecTerm) a window lights exactly like the wall beside it.
+        if (s2x) {
+          dcol *= 0.5;
+        }
+      }
       // CSM shadow term s = sat(infront + 1 - coverage) from the native
       // atlas (SampleCsmShadow bias/cascade conventions; the soft variant
       // adds the contact-hardening filter when PCSS is enabled), min'd
-      // with the native static sun-shadow term.
+      // with the native static sun-shadow term. misc.y = -1 on fam 2 (the
+      // Stadium crowd seating, see IsSkate2DepthYield): the static term at
+      // its full strength (scene_opts.z) instead of the venue-scaled one,
+      // keeping the stands in the roof's shade while the floodlit floor
+      // shows its own baked lighting.
+      float nsm_strength = (fam > 1.5 && fam < 2.5 && misc.y < -0.5) ? scene_opts.z : nsm_p.x;
       float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, i.nrm, i.pos.xy),
-                    SampleStaticSun(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy));
+                    SampleStaticSunStrength(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy,
+                                            nsm_strength));
       // Lightmap fetch = the console's semantics: BILINEAR, CLAMPED, mip 0.
       // The composed atlas pages are single-level on console and the fetch
       // constants carry clamp_x/clamp_y = 2. Sampling them with the aniso-8
@@ -354,7 +662,8 @@ float4 ShadePixel(VSOut i) {
       // cells wrapping in from v ~ 0) glowed ~2x bright while the right
       // awning went dark, with the decode, UVs and constants all verified
       // exact (diagnosed via the mode-7 raw-lightmap isolation view).
-      float3 lmg = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
+      float lm_mono2 = 0.0;
+      float3 lmg = SampleWorldLightmap(i.uv2, lm_mono2);
       // F12 isolation mode 7: visualize the RAW lightmap sample; mode 8:
       // visualize the lightmap unwrap coordinate (frac(uv2*16) in rg).
       // Debug taps live on fams 5/6/13 only; on fams 1-4 misc.z carries
@@ -385,8 +694,13 @@ float4 ShadePixel(VSOut i) {
       // at t8, 4 = spec2ch at t9); fams 5/6 derive vnd from the reflective
       // path's nt below. Without a normal map the exact flat-map fold
       // 0.39 * 2.39562 = 0.93429 applies (the v1 constant).
+      // Skate 2 environment PS port (s2x): its own GetTangentLight axis
+      // (0.64, 0.64, 0.420465) with 1 / normalize(axis).z = 2.373547; the
+      // flat fold is 0.997993.
+      float3 tl_axis = s2x ? float3(0.64, 0.64, 0.420465) : float3(0.58, 0.62, 0.39);
+      float tl_norm = s2x ? 2.373547 : 2.39562;
       uint v2f = fam < 4.5 ? (uint)(misc.z + 0.5) : 0u;
-      float kd = 0.93429;
+      float kd = tl_axis.z * tl_norm;
       float3 wn = dot(i.nrm, i.nrm) > 0.01
                       ? normalize(i.nrm)
                       : normalize(cross(ddx(i.rpos), ddy(i.rpos)));
@@ -440,9 +754,9 @@ float4 ShadePixel(VSOut i) {
         // mirror-sharp glass).
         wn = normalize(vnd_raw.x * kt + vnd_raw.y * kb +
                        wn * max(vnd_raw.z, 0.05));
-        kd = (vnd.x * 0.58 * sign(dot(kt, sh_sun.xyz)) +
-              vnd.y * 0.62 * sign(dot(kb, sh_sun.xyz)) +
-              vnd.z * 0.39) * 2.39562;
+        kd = (vnd.x * tl_axis.x * AxisSign(dot(kt, sh_sun.xyz)) +
+              vnd.y * tl_axis.y * AxisSign(dot(kb, sh_sun.xyz)) +
+              vnd.z * tl_axis.z) * tl_norm;
       }
       // misc.z = 3 (F12 reflection isolation): force the flat normal.
       // Only the reflective families (5/6/13) ever carry overlay.w == 4;
@@ -491,68 +805,86 @@ float4 ShadePixel(VSOut i) {
           // axes computed above (stored frame when the mesh carries one),
           // built from the pre-mapping geometric normal.
           float3 v56 = fam < 5.5 ? normalize(nt) : nt;
-          kd = (v56.x * 0.58 * sign(dot(kt, sh_sun.xyz)) +
-                v56.y * 0.62 * sign(dot(kb, sh_sun.xyz)) +
+          kd = (v56.x * 0.58 * AxisSign(dot(kt, sh_sun.xyz)) +
+                v56.y * 0.62 * AxisSign(dot(kb, sh_sun.xyz)) +
                 v56.z * 0.39) * 2.39562;
       }
       // Fam 13 has no kd term at all; its body is D^2 * lml * ALPHA,
       // premultiplied once in the shader on top of the a^2 blend factor
       // (verified 0.0-error vs the ucode).
       lin = fam > 12.5 ? lml * dcol * albedo.a : lml * kd * dcol;
-      if (overlay.w > 2.5) {
-        // spec/ecc/refmask at t4: phong vs the FIXED literal light
-        // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
-        // scaled by the clamped lightmap green and the spec mask.
-        float4 masks = decal_art.Sample(smp, i.uv);
-        float3 vd = -normalize(i.rpos);
-        float3 Ls = float3(-0.14, 0.5, 0.9);
-        float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
-        float bp = saturate(dot(vd, -refl));
-        float ks = pow(max(bp, 1e-6), 10.0 + 290.0 * masks.y);
-        // misc.z = 5 (F12 reflection isolation): body only, no spec/cube.
-        if (abs(misc.z - 5.0) > 0.5) {
-          lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
+      if (s2x) {
+        // Skate 2 GetSpecularTerm in place of the Skate 3 fixed-light phong
+        // below (masks at t4 on fam 1, at t9 on the decal family): masks
+        // through ApplyOverlay (2 x masks x overlay; building_ceiling takes
+        // them raw), the sun gate on the MAPPED normal (shadow_inv_lerp =
+        // N.L > 0 ? CSM : 1), luminosity = cLightMap.a.
+        bool s2_masks = fam < 2.5 ? overlay.w > 2.5 : (v2f & 4u) != 0u;
+        if (s2_masks) {
+          float3 sm = fam < 2.5 ? decal_art.Sample(smp, i.uv).rgb
+                                : spec2_map.Sample(smp, i.uv).rgb;
+          bool raw_masks = (fam < 1.5 && misc.y > 0.0) || overlay.z <= 0.0;
+          float3 mk = raw_masks ? sm : 2.0 * sm * ov;
+          float sil = dot(wn, sh_sun.xyz) > 0.0 ? s : 1.0;
+          float lum = lerp(min(lm_mono2, 0.04), lm_mono2, sil);
+          lin += Skate2SpecTerm(mk, wn, -normalize(i.rpos), lum, misc.x > -3.5);
         }
-        if (((fam > 4.5 && fam < 6.5) || fam > 12.5) &&
-            abs(misc.z - 5.0) > 0.5 && abs(misc.z - 1.0) > 0.5) {
-          // Cube reflection: reflect(E, wN) with xy negated (the source's
-          // ref_vec.xy *= -1), luminosity lerped toward 1 by
-          // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
-          float3 rv = vd - 2.0 * wn * dot(vd, wn);
-          // misc.y = cube LOD bias log2(render_height / 640): the guest
-          // computes the cube fetch's gradient LOD at its own 1152x640
-          // render; at 4K our per-pixel gradients are ~3.4x smaller, so
-          // without the bias baked cube detail (the plaza streetlight
-          // heads) survives through mips the console's fetch blurs away.
-          // F12 isolation (misc.z): mode 2 samples the ABSOLUTE level in
-          // misc.w; other modes add misc.w as extra bias; mode 4 shows the
-          // raw cube sample in place of the shaded result.
-          float3 dir = float3(-rv.x, -rv.y, rv.z);
-          // Mode 6 gives the slider to the NM fetch; the cube keeps just
-          // the automatic bias there.
-          float cube_extra = misc.z > 5.5 ? 0.0 : misc.w;
-          float3 cube = abs(misc.z - 2.0) < 0.5
-                            ? env_cube.SampleLevel(smp, dir, misc.w).rgb
-                            : env_cube.SampleBias(smp, dir, misc.y + cube_extra).rgb;
-          float rl = 0.3 * saturate(4.0 * masks.z - 2.6);
-          float lum = lml.g + rl * (1.0 - lml.g);
-          lin += cube * lum * masks.z * 1.5;
-          if (abs(misc.z - 4.0) < 0.5) {
-            lin = cube * cube;
+      } else {
+        if (overlay.w > 2.5) {
+          // spec/ecc/refmask at t4: phong vs the FIXED literal light
+          // (-0.14, 0.5, 0.9), power 10 + 290*ecc, tint (2.1, 1.8, 1.5),
+          // scaled by the clamped lightmap green and the spec mask.
+          float4 masks = decal_art.Sample(smp, i.uv);
+          float3 vd = -normalize(i.rpos);
+          float3 Ls = float3(-0.14, 0.5, 0.9);
+          float3 refl = Ls - 2.0 * wn * dot(wn, Ls);
+          float bp = saturate(dot(vd, -refl));
+          float ks = pow(max(bp, 1e-6), 10.0 + 290.0 * masks.y);
+          // misc.z = 5 (F12 reflection isolation): body only, no spec/cube.
+          if (abs(misc.z - 5.0) > 0.5) {
+            lin += ks * float3(2.1, 1.8, 1.5) * lml.g * masks.x;
+          }
+          if (((fam > 4.5 && fam < 6.5) || fam > 12.5) &&
+              abs(misc.z - 5.0) > 0.5 && abs(misc.z - 1.0) > 0.5) {
+            // Cube reflection: reflect(E, wN) with xy negated (the source's
+            // ref_vec.xy *= -1), luminosity lerped toward 1 by
+            // 0.3 * sat(4*refmask - 2.6), x refmask x reflection_scale 1.5.
+            float3 rv = vd - 2.0 * wn * dot(vd, wn);
+            // misc.y = cube LOD bias log2(render_height / 640): the guest
+            // computes the cube fetch's gradient LOD at its own 1152x640
+            // render; at 4K our per-pixel gradients are ~3.4x smaller, so
+            // without the bias baked cube detail (the plaza streetlight
+            // heads) survives through mips the console's fetch blurs away.
+            // F12 isolation (misc.z): mode 2 samples the ABSOLUTE level in
+            // misc.w; other modes add misc.w as extra bias; mode 4 shows the
+            // raw cube sample in place of the shaded result.
+            float3 dir = float3(-rv.x, -rv.y, rv.z);
+            // Mode 6 gives the slider to the NM fetch; the cube keeps just
+            // the automatic bias there.
+            float cube_extra = misc.z > 5.5 ? 0.0 : misc.w;
+            float3 cube = abs(misc.z - 2.0) < 0.5
+                              ? env_cube.SampleLevel(smp, dir, misc.w).rgb
+                              : env_cube.SampleBias(smp, dir, misc.y + cube_extra).rgb;
+            float rl = 0.3 * saturate(4.0 * masks.z - 2.6);
+            float lum = lml.g + rl * (1.0 - lml.g);
+            lin += cube * lum * masks.z * 1.5;
+            if (abs(misc.z - 4.0) < 0.5) {
+              lin = cube * cube;
+            }
           }
         }
-      }
-      // v2 decal-family spec (spec/ecc at t9): the same phong-vs-fixed-
-      // light term as the base families; the decal art occupies t4 on
-      // fams 3/4, so their masks ride the second pair table.
-      if ((v2f & 4u) != 0u) {
-        float2 m2 = spec2_map.Sample(smp, i.uv).rg;
-        float3 vd2 = -normalize(i.rpos);
-        float3 Ls2 = float3(-0.14, 0.5, 0.9);
-        float3 refl2 = Ls2 - 2.0 * wn * dot(wn, Ls2);
-        float ks2 =
-            pow(max(saturate(dot(vd2, -refl2)), 1e-6), 10.0 + 290.0 * m2.y);
-        lin += ks2 * float3(2.1, 1.8, 1.5) * lml.g * m2.x;
+        // v2 decal-family spec (spec/ecc at t9): the same phong-vs-fixed-
+        // light term as the base families; the decal art occupies t4 on
+        // fams 3/4, so their masks ride the second pair table.
+        if ((v2f & 4u) != 0u) {
+          float2 m2 = spec2_map.Sample(smp, i.uv).rg;
+          float3 vd2 = -normalize(i.rpos);
+          float3 Ls2 = float3(-0.14, 0.5, 0.9);
+          float3 refl2 = Ls2 - 2.0 * wn * dot(wn, Ls2);
+          float ks2 =
+              pow(max(saturate(dot(vd2, -refl2)), 1e-6), 10.0 + 290.0 * m2.y);
+          lin += ks2 * float3(2.1, 1.8, 1.5) * lml.g * m2.x;
+        }
       }
       if (fam > 12.5) {
         // Fam 13 blend factor: the PS outputs a^2 (straight-alpha blend on
@@ -564,6 +896,14 @@ float4 ShadePixel(VSOut i) {
         reduced_tone = fam > 7.5;  // environmentdiffuse's cheap tonemap
       }
       fog_a *= sh_env.x;  // material multiplier (PS c11.y)
+    }
+    // New San Vanelona at night: baked and pre-lit world light (every family
+    // here except the emissive 12 incandescent, 14 scrollincandescent and 16
+    // Skate 2 incandescent, whose lightmap shares dim above).
+    bool emissive = (fam > 11.5 && fam < 12.5) || (fam > 13.5 && fam < 14.5) ||
+                    (fam > 15.5 && fam < 16.5);
+    if (!emissive) {
+      lin *= NightGrade();
     }
     // Fog -> exposure -> tonemap -> sqrt, then the postfx uber's measured
     // 1.41 scene multiplier (same as the character branch).
@@ -614,7 +954,7 @@ float4 ShadePixel(VSOut i) {
     // Console lightmap semantics: bilinear, clamped, mip 0; the composed
     // atlas pages are single-level; mip/wrap sampling bled neighbor cells
     // and page edges (see the exact env fetch).
-    light = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb * 2.0;
+    light = SampleWorldLightmap(i.uv2) * 2.0;
   } else {
     // Smooth per-vertex normal when the mesh has one; face normal from
     // position derivatives otherwise.
@@ -637,14 +977,24 @@ float4 ShadePixel(VSOut i) {
   // its x4 linear multiplier), so the clamp maps to min(light, sqrt(s+c8))
   // per channel. A fixed-denominator curve here read pitch-black and
   // double-darkened baked shade.
-  if (sh_misc.y > 0.0 && tint.g == 0.0 && tint.b == 0.0 && misc.x == 0.0) {
+  // Gate: the frame's shadow rows are staged (sh_color.w = shadow-color
+  // luma, set whenever the rows are valid). The CSM enable (sh_misc.y)
+  // only exists on frames where a dynamic caster drew; gating the whole
+  // receive on it dropped the static sun shadow and the clamp for those
+  // single frames (the lit-up flashes). SampleCsmShadowSoft returns 1 while
+  // the CSM is off.
+  if ((sh_misc.y > 0.0 || sh_color.w > 0.0) && tint.g == 0.0 && tint.b == 0.0 &&
+      misc.x <= 0.0) {
     // Uncovered positions return 1 and the min-clamp is a no-op there.
     float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, i.nrm, i.pos.xy),
                   SampleStaticSun(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy));
     light = min(light, sqrt(s + sh_color.rgb));
   }
+  if (tint.r > 0.0 && tint.b == 0.0) {
+    light *= sqrt(NightGrade());  // New San Vanelona at night (gamma space)
+  }
   float3 lit = albedo.rgb * light;
-  if (mat_tint.w > 0.0 && misc.x == 0.0) {
+  if (tint.r < 1.5 && mat_tint.w > 0.0 && misc.x <= 0.0) {
     lit *= mat_tint.rgb;
   }
   if (misc.x > 1.5) {
@@ -701,12 +1051,13 @@ float4 ShadePixel(VSOut i) {
       float3 h = normalize(vd + normalize(-sh_z.xyz));
       col += pow(saturate(dot(wn, h)), 90.0) * 0.35;            // sun sparkle
     }
+    col *= sqrt(NightGrade());  // New San Vanelona at night (gamma space)
     float fade = saturate(length(i.rpos) * misc.y + misc.z);
     if (misc.w != 1.0) {
       fade = pow(max(fade, 1e-4), misc.w);
     }
     col = sqrt(max(col * col * saturate(1.0 + fade * mat_tint.w) +
-                   fade * mat_tint.rgb, 0.0));
+                   fade * mat_tint.rgb * NightGrade(), 0.0));
     // Opaque: the game's murk hides the canal bed entirely (and our bed
     // shading is untrustworthy under water: striped lightmap unwraps).
     return float4(PassGamma(col), 1.0);
@@ -725,10 +1076,12 @@ float4 ShadePixel(VSOut i) {
       fade = pow(max(fade, 1e-4), misc.w);
     }
     lit = sqrt(max(lit * lit * saturate(1.0 + fade * mat_tint.w) +
-                   fade * mat_tint.rgb, 0.0));
+                   fade * mat_tint.rgb * NightGrade(), 0.0));
     return float4(PassGamma(lit), albedo.a * albedo.a);
   }
-  return float4(PassGamma(lit), 1.0);
+  // decalzbias.fx (misc.x = -1): returncolour.a = cDiffuse.a (straight
+  // blend). Everything else, the no-alpha-test marker -2 included, is 1.
+  return float4(PassGamma(lit), abs(misc.x + 1.0) < 0.5 ? albedo.a : 1.0);
 }
 float4 ps_main(VSOut i) : SV_Target {
   int mask = ShowcaseMask(i.pos.x);
@@ -786,7 +1139,7 @@ float4 ps_main(VSOut i) : SV_Target {
     // to full materials only adds normal/detail maps, specular,
     // reflections and weathering instead of also re-grading the frame's
     // tone. The shadow layer joins with the game's own lightmap min-clamp.
-    float3 lm = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb;
+    float3 lm = SampleWorldLightmap(i.uv2);
     float3 lml = lm * lm;
     if ((mask & 8) != 0) {
       lml = min(lml, s + sh_color.rgb);
@@ -808,7 +1161,7 @@ float4 ps_main(VSOut i) : SV_Target {
     // surfaces without a lightmap (characters, props).
     float3 lite;
     if (tint.r > 0.0) {
-      lite = lightmap.SampleLevel(smp_clamp, i.uv2, 0.0).rgb * 2.0;
+      lite = SampleWorldLightmap(i.uv2) * 2.0;
     } else {
       float wrap = 0.35 + 0.65 * saturate(dot(n, ldir));
       lite = float3(wrap, wrap, wrap);
@@ -950,7 +1303,7 @@ float4 ps_refl_gbuf(VSOut i) : SV_Target {
   // every downstream depth test (all rays die at the visibility gate).
   return float4(OctEncode(wn), i.pos.w, w * (trans > 0.5 ? -1.0 : 1.0));
 }
-// Shadow caster pass: vs_main runs with mvp = (world *) lightVP built from
+// Shadow caster pass: vs_main runs with mvp = lightVP (zero origin) built from
 // the captured receiver rows, so SV_Position.z IS the light-space depth
 // (the height-ramp row; viewport z range 0..1, DepthClip off so casters
 // outside the 12 m depth window clamp like the game accepts). MIN blend on
@@ -970,7 +1323,10 @@ float2 ps_shadow_caster_clip(VSOut i) : SV_Target {
   // raw leaf cutout rasters as binary salt-and-pepper dapple; two mip
   // levels of alpha pre-filtering merge it into the soft blobs the baked
   // lighting shows. The low ALPHAREF keeps mip-averaged coverage from
-  // eroding the canopy.
-  clip(diffuse.SampleBias(smp, i.uv, 2.0).a - 0.1176);
+  // eroding the canopy. The static map passes a per-tile bias as
+  // misc.x = 100 + bias (its mid/far tiles already rasterize coarser);
+  // other caster passes keep +2.
+  float bias = misc.x > 50.0 ? misc.x - 100.0 : 2.0;
+  clip(diffuse.SampleBias(smp, i.uv, bias).a - 0.1176);
   return float2(i.pos.z, 0.0);
 }

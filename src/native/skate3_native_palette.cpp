@@ -19,6 +19,8 @@
 #include "native/skate3_native_guest_read.h"
 #include "skate3_native_scene.h"
 
+REXCVAR_DECLARE(bool, skate3_native_render_scene_capture_log);
+
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_palette_serve, true, "Skate 3",
                     "Serve character bone palettes from the game's own packed "
                     "m_matrices snapshots (taken at pack-function exit: the exact "
@@ -471,8 +473,55 @@ struct ServeHist {
 };
 std::unordered_map<uint32_t, ServeHist> g_serve_hist;
 
+// Divergence probe (diagnostic, bounded): a served snapshot that moves a
+// bone the mesh uses > 0.3 m away from this frame's DRAW-BANK capture (the
+// palette the game's own draw consumed; dbg_src 1/2) means the serve picked
+// the wrong pack (another pass, a stale pose, another piece). Logged with
+// the pick's provenance so the detached-shoe class can be named.
+void ProbeServeDivergence(const DrawItem& item, const float* rows, uint32_t n,
+                          uint32_t needed, const void* pick, bool prev_set,
+                          bool ubt, uint32_t entity, bool exact, bool hyst) {
+  if (!REXCVAR_GET(skate3_native_render_scene_capture_log)) {
+    return;
+  }
+  if (item.dbg_src > 2 || item.dbg_src == 0) {
+    return;  // no same-frame bank capture to compare against
+  }
+  const uint32_t lim = std::min<uint32_t>(needed != 0 ? needed : n, n);
+  float worst = 0.0f;
+  uint32_t worst_r = 0;
+  for (uint32_t r = 0; r < lim && (r + 1) * 12 <= item.bones.size(); ++r) {
+    const float dx = rows[r * 12 + 3] - item.bones[r * 12 + 3];
+    const float dy = rows[r * 12 + 7] - item.bones[r * 12 + 7];
+    const float dz = rows[r * 12 + 11] - item.bones[r * 12 + 11];
+    const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > worst) {
+      worst = d;
+      worst_r = r;
+    }
+  }
+  if (worst <= 0.3f) {
+    return;
+  }
+  static std::atomic<uint32_t> logs{0};
+  const uint32_t k = logs.fetch_add(1, std::memory_order_relaxed);
+  if (k < 96 || (k & 255u) == 0) {
+    REXLOG_WARN(
+        "native-serve-diverge: mesh={:08X} ctx={:08X} material={} fam={} src={} "
+        "rows={} needed={} worst_row={} d={:.2f}m bank=({:.2f},{:.2f},{:.2f}) "
+        "served=({:.2f},{:.2f},{:.2f}) pick={} set={} ubt={} entity={:08X} "
+        "exact={} hyst={} (n={})",
+        item.mesh, item.ctx, item.material_name, item.char_family, item.dbg_src, n,
+        needed, worst_r, worst, item.bones[worst_r * 12 + 3],
+        item.bones[worst_r * 12 + 7], item.bones[worst_r * 12 + 11],
+        rows[worst_r * 12 + 3], rows[worst_r * 12 + 7], rows[worst_r * 12 + 11],
+        pick, prev_set ? "prev" : "cur", ubt, entity, exact, hyst, k);
+  }
+}
+
 uint32_t ServeAuthoritativePalettesImpl(uint8_t* base,
-                                        skate3::native_scene::FrameScene& scene) {
+                                        skate3::native_scene::FrameScene& scene,
+                                        size_t first_item) {
   if (!REXCVAR_GET(skate3_native_render_scene_palette_serve) ||
       !g_pal_ok.load(std::memory_order_relaxed)) {
     return 0;
@@ -482,7 +531,8 @@ uint32_t ServeAuthoritativePalettesImpl(uint8_t* base,
     return 0;
   }
   uint32_t served = 0;
-  for (DrawItem& item : scene.items) {
+  for (size_t item_i = first_item; item_i < scene.items.size(); ++item_i) {
+    DrawItem& item = scene.items[item_i];
     // Pending items are half-built (the fixup/rescue machinery owns them);
     // LW-store substitutions (dbg_src 10) are already authoritative.
     if (!item.skinned || item.ctx == 0 || item.bones.size() < 12 ||
@@ -804,6 +854,8 @@ uint32_t ServeAuthoritativePalettesImpl(uint8_t* base,
           cr = cbuf;
         }
         if (HashRows(cr, size_t(n) * 12) == hist.h1) {
+          ProbeServeDivergence(item, cr, n, needed, pick, false, c.ubt,
+                               pick != nullptr ? pick->entity : 0, served_exact, true);
           std::memcpy(item.bones.data(), cr, size_t(n) * 12 * sizeof(float));
           std::fill(item.bones.begin() + size_t(n) * 12, item.bones.end(),
                     0.0f);
@@ -827,6 +879,12 @@ uint32_t ServeAuthoritativePalettesImpl(uint8_t* base,
     hist.t[0] = pick_rows[3];
     hist.t[1] = pick_rows[7];
     hist.t[2] = pick_rows[11];
+    ProbeServeDivergence(
+        item, pick_rows, n, needed, pick,
+        pick != nullptr && !g_packs_prev.empty() && pick >= g_packs_prev.data() &&
+            pick < g_packs_prev.data() + g_packs_prev.size(),
+        pick != nullptr && pick->ubt, pick != nullptr ? pick->entity : 0, served_exact,
+        false);
     std::memcpy(item.bones.data(), pick_rows, size_t(n) * 12 * sizeof(float));
     // Zero the tail: rows beyond the game's own packed count are never
     // indexed by the mesh, and leftover bank-capture garbage there would
@@ -878,9 +936,11 @@ bool CaptureActive() {
 
 }  // namespace
 
+
 uint32_t ServeAuthoritativePalettes(uint8_t* base,
-                                    skate3::native_scene::FrameScene& scene) {
-  return ServeAuthoritativePalettesImpl(base, scene);
+                                    skate3::native_scene::FrameScene& scene,
+                                    size_t first_item) {
+  return ServeAuthoritativePalettesImpl(base, scene, first_item);
 }
 
 uint32_t ExchangePackOwner(uint32_t entity) {

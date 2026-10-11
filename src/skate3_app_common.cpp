@@ -3,18 +3,25 @@
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
 #include "skate3_iso_installer.h"
+#include "skate3_nsv_installer.h"
+#include "skate3_jumbotron.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
+#include "skate3_perf_recorder.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
 #include "skate3_win_icon.h"
 #include "skate3_title_update_installer.h"
+#include "skate3_nsv_menu.h"
 #include "skate3_user_settings.h"
+#include "skate3_world_loading.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
@@ -63,11 +70,13 @@
 #include <rex/system/xam/user_profile.h>
 #include <rex/system.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 #include <rex/ui/overlay/simple_settings_overlay.h>
 
 #include <imgui.h>
+#include <spdlog/sinks/sink.h>
 #include <toml++/toml.hpp>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -398,7 +407,8 @@ constexpr int kDefaultResolutionScale = 2;
 
 void ApplyFirstRunVideoDefaults(const std::filesystem::path& settings_path,
                                 const std::filesystem::path& developer_config_path) {
-  if (std::filesystem::exists(settings_path) ||
+  if (ConfigFileContainsAnyKey(settings_path, {"resolution_scale", "draw_resolution_scale_x",
+                                               "draw_resolution_scale_y"}) ||
       DeveloperConfigHasResolutionScaleOverride(developer_config_path) ||
       rex::cvar::HasNonDefaultValue("resolution_scale") ||
       rex::cvar::HasNonDefaultValue("draw_resolution_scale_x") ||
@@ -416,9 +426,9 @@ void LoadAndNormalizeSimpleSettings(const std::filesystem::path& settings_path,
                                     const std::filesystem::path& developer_config_path) {
   if (std::filesystem::exists(settings_path)) {
     rex::cvar::LoadConfig(settings_path);
-  } else {
-    ApplyFirstRunVideoDefaults(settings_path, developer_config_path);
   }
+  // A shipped diagnostic template is not an explicit resolution preference.
+  ApplyFirstRunVideoDefaults(settings_path, developer_config_path);
   rex::ui::EnsureSimpleSettingsConfig(settings_path);
 }
 
@@ -504,6 +514,75 @@ std::vector<std::filesystem::path> DiscoverDlcSourceDirectories(
   return dirs;
 }
 
+// The SDK logs every guest tw/td trap hit (generated ppc_trap). A guest
+// thread stuck in a trapping loop wrote ~230,000 such lines a second in
+// run150, and the rotating log discarded everything before the hang. The
+// cpu category keeps the first 32 per run, then each power-of-two count, each
+// with its running count; the first four also carry the trapping thread's
+// skate3.exe frames as image addresses (recompiled guest functions; resolve
+// with llvm-symbolizer against skate3.pdb).
+class GuestTrapLogThrottle final : public spdlog::sinks::sink {
+ public:
+  explicit GuestTrapLogThrottle(std::vector<spdlog::sink_ptr> inner) : inner_(std::move(inner)) {}
+
+  void log(const spdlog::details::log_msg& msg) override {
+    const std::string_view text(msg.payload.data(), msg.payload.size());
+    if (!text.starts_with("tw/td trap hit")) {
+      Forward(msg);
+      return;
+    }
+    const uint64_t hits = hits_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (hits > 32 && (hits & (hits - 1)) != 0) return;
+    std::string line = std::string(text) + " [hit " + std::to_string(hits) + "]";
+#if defined(_WIN32)
+    if (hits <= 4) {
+      void* frames[48];
+      const USHORT count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+      const auto image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+      const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+          image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
+      const uintptr_t end = image + nt->OptionalHeader.SizeOfImage;
+      line += " frames=";
+      for (USHORT i = 0; i < count; ++i) {
+        const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+        if (address < image || address >= end) continue;
+        char hex[24];
+        std::snprintf(hex, sizeof(hex), "%llX,",
+                      static_cast<unsigned long long>(0x140000000ull + (address - image)));
+        line += hex;
+      }
+    }
+#endif
+    spdlog::details::log_msg copy = msg;
+    copy.payload = line;
+    Forward(copy);
+  }
+  void flush() override {
+    for (auto& sink : inner_) sink->flush();
+  }
+  void set_pattern(const std::string& pattern) override {
+    for (auto& sink : inner_) sink->set_pattern(pattern);
+  }
+  void set_formatter(std::unique_ptr<spdlog::formatter> formatter) override {
+    for (auto& sink : inner_) sink->set_formatter(formatter->clone());
+  }
+
+ private:
+  void Forward(const spdlog::details::log_msg& msg) {
+    for (auto& sink : inner_)
+      if (sink->should_log(msg.level)) sink->log(msg);
+  }
+  std::vector<spdlog::sink_ptr> inner_;
+  std::atomic<uint64_t> hits_{0};
+};
+
+// Before guest execution: nothing logs to the cpu category concurrently.
+void InstallGuestTrapLogThrottle() {
+  auto logger = rex::GetLogger(rex::log::cpu());
+  if (!logger || logger->sinks().empty()) return;
+  auto throttle = std::make_shared<GuestTrapLogThrottle>(logger->sinks());
+  logger->sinks().assign(1, throttle);
+}
 }  // namespace
 
 #if !SKATE3_HAS_TITLE_UPDATE
@@ -524,7 +603,7 @@ void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();
-  DisableActiveDebugDiagnostics();
+  skate3::EnsureDiagnosticSettings(user_settings_path_);
 }
 
 void Skate3BaseApp::OnConfigureFonts(ImFontAtlas* atlas) {
@@ -602,6 +681,17 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   auto runtime_paths = defaults;
   runtime_paths.game_data_root = ResolveRuntimeGameDataRoot(runtime_paths);
   runtime_paths.config_path.clear();
+#if defined(_WIN32)
+  if (!skate3::IsGameInstalled(runtime_paths.game_data_root) ||
+      !skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root) ||
+      !skate3::IsNewSanVanInstalled(rex::filesystem::GetAppRootFolder(), runtime_paths.user_data_root)) {
+    if (!skate3::RunNewSanVanSetup(app_context(), window(), imgui_drawer(), runtime_paths,
+                                   user_settings_path_)) {
+      app_context().QuitFromUIThread();
+      return std::nullopt;
+    }
+  }
+#else
   if (!skate3::IsGameInstalled(runtime_paths.game_data_root)) {
     REXLOG_INFO("Game files not found at {}; launching rexglue ISO installer",
                 runtime_paths.game_data_root.string());
@@ -664,6 +754,7 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     runtime_paths = std::move(tu_paths);
   }
 #endif
+#endif
 #if defined(_WIN32)
   // Window/taskbar + Explorer icon sourced from the user's OWN game art at
   // runtime (game/nxeart); the shipped exe and the repo carry no EA
@@ -707,6 +798,10 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                         "Toggle native/emulated renderer", [] {
                           skate3::native_scene::ToggleSceneEnabled();
                         });
+  rex::ui::RegisterBind("bind_skate3_new_san_van", "Ctrl+F7",
+                        "Load New San Van (experimental)", [] {
+                          skate3::world_loading::RequestLoad();
+                        });
   rex::ui::RegisterBind("bind_skate3_save_draw_fingerprints", "F8",
                         "Save draw fingerprint log", [this] {
                           SaveDrawFingerprintLog();
@@ -716,13 +811,28 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
                           LogDebugMarker();
                         });
   rex::ui::RegisterBind("bind_skate3_log_user_marker", "F10",
-                        "Write marker to log", [this] {
+                        "Write marker + lighting history to log", [this] {
+                          LogUserMarker();
+                        });
+  // Windows treats F10 as the menu-activation key, and run 087's F10
+  // presses never reached the log; Insert is the dependable alternative.
+  rex::ui::RegisterBind("bind_skate3_log_user_marker_alt", "Insert",
+                        "Write marker + lighting history to log (alternate)", [this] {
                           LogUserMarker();
                         });
   rex::ui::RegisterBind("bind_skate3_native_debug", "F12",
                         "Native render debug menu", [this] {
                           ToggleNativeDebug();
                         });
+  // Performance capture: the recorder writes the last ~30 s plus the few
+  // seconds after the press (logs/perf_*.csv + a log summary). This runs on
+  // the window thread, which paints and presents: named for the profiler.
+  rex::ui::RegisterBind("bind_skate3_perf_capture", "Home",
+                        "Save performance capture", [] {
+                          skate3::perf_recorder::RequestCapture();
+                        });
+  skate3::perf_recorder::SetPresenter(drawer->presenter());
+  skate3::perf_recorder::NameCurrentThread("Host UI");
   rex::ui::RegisterBind("bind_skate3_showcase", "Ctrl+Shift+B",
                         "Graphics build-up showcase", [] {
                           // A capture/recording tool, not a player feature:
@@ -745,6 +855,7 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
 }
 
 void Skate3BaseApp::OnPostSetup() {
+  InstallGuestTrapLogThrottle();
   skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
@@ -784,6 +895,10 @@ void Skate3BaseApp::OnPostSetup() {
   }
   InstallDlcPackages();
   InstallRecipeOverlay();
+  skate3::world_loading::Install(runtime()->file_system(), rex::filesystem::GetAppRootFolder());
+  skate3::world_loading::PrepareSky(runtime()->game_data_root(), runtime()->user_data_root());
+  skate3::nsv_menu::Install(rex::filesystem::GetAppRootFolder());
+  skate3::jumbotron::Install(rex::filesystem::GetAppRootFolder());
 
   // Register retail multi-entry-function alternate entries.
 #if !SKATE3_HAS_TITLE_UPDATE
@@ -814,6 +929,8 @@ void Skate3BaseApp::OnPostSetup() {
 }
 
 void Skate3BaseApp::OnShutdown() {
+  // Before the presenter is torn down (the recorder samples it).
+  skate3::perf_recorder::SetPresenter(nullptr);
   rex::ui::UnregisterBind("bind_skate3_menu");
   rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
@@ -1065,7 +1182,10 @@ void Skate3BaseApp::SaveDrawFingerprintLog() {
 
 void Skate3BaseApp::LogUserMarker() {
   const uint32_t marker = debug_marker_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-  REXLOG_WARN("USER LOG MARKER #{}: F10 pressed", marker);
+  REXLOG_WARN("USER LOG MARKER #{}: F10/Insert pressed", marker);
+  // The press marks a moment the player saw (the shadow flash hunt): the
+  // renderer dumps its per-frame lighting history leading up to it.
+  skate3::native_scene::RequestLightHistory(marker);
 }
 
 void Skate3BaseApp::LogDebugMarker() {

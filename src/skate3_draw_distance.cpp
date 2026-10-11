@@ -30,13 +30,14 @@
 //
 // The game refreshes (2) and (3) every frame and (1) on config apply, so each
 // hook rescales the freshly written values in place and nothing compounds.
-// The cull threshold is additionally reapplied once per frame from the
-// GetLODDistancesFromAttrib hook (the view's cull object is at view+8) so
-// cvar changes take effect without a config reload.
+// The cull threshold is additionally reapplied at its live consumer
+// (8288DCC8), using only objects observed at the configuration setter.
+// View+8 is a camera and must never be treated as a cull object.
 
 #include "generated/skate3_init.h"
 #include "native/skate3_native_guest_read.h"
 #include "skate3_demo_path.h"
+#include "skate3_world_loading.h"
 #include "skate3_native_scene.h"
 
 #include <algorithm>
@@ -56,12 +57,21 @@
 #include <windows.h>
 #endif
 
+// World streaming diagnostics (skate3_world_loading.cpp).
+REXCVAR_DECLARE(bool, skate3_world_load_probe);
+
 REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
                       "of the world and cost proportionally more GPU/CPU.")
     .range(0.25, 16.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skate2_draw_distance_scale, 0.0, "Skate 3",
+                      "New San Van world draw distance override. 0 inherits the "
+                      "global setting; 1 is original distance. Applies to all "
+                      "world contribution culling, not just buildings.")
+    .range(0.0, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
@@ -85,6 +95,12 @@ REXCVAR_DEFINE_BOOL(skate3_draw_distance_debug, false, "Skate 3",
                     "stream load/unload requests. Used to attribute a specific "
                     "pop-in to the culling vs. streaming system.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Log033: the 3x3 residency expansion completes its loads but crashes in
+// downstream guest spatial-record construction. Keep this experimental path
+// opt-in until its allocation/lifecycle requirements are understood.
+REXCVAR_DEFINE_BOOL(skate3_skate2_sim_prefetch, false, "Skate 3",
+                    "Experimental New San Van collision neighbourhood preload (known crash; leave disabled)");
 
 namespace {
 
@@ -143,7 +159,9 @@ CullThresholdSlot g_cull_slots[16];
 size_t g_cull_slot_count = 0;
 
 uint32_t ScaledThresholdBits(uint32_t base_bits) {
-  const double scale = REXCVAR_GET(skate3_draw_distance_scale);
+  const double bam_scale = REXCVAR_GET(skate3_skate2_draw_distance_scale);
+  const double scale = skate3::world_loading::IsSkate2Gameplay() && bam_scale > 0.0
+      ? std::max(0.25, bam_scale) : REXCVAR_GET(skate3_draw_distance_scale);
   if (std::abs(scale - 1.0) <= kScaleEpsilon || scale <= 0.0) {
     return base_bits;
   }
@@ -155,7 +173,7 @@ uint32_t ScaledThresholdBits(uint32_t base_bits) {
   return bits;
 }
 
-void EnsureCullThresholdScaled(uint8_t* base, uint32_t cull_object) {
+void EnsureCullThresholdScaled(uint8_t* base, uint32_t cull_object, bool require_registered = false) {
   if (!PlausibleGuestAddr(cull_object)) {
     return;
   }
@@ -172,6 +190,7 @@ void EnsureCullThresholdScaled(uint8_t* base, uint32_t cull_object) {
     }
   }
   if (slot == nullptr) {
+    if (require_registered) return;
     if (g_cull_slot_count >= sizeof(g_cull_slots) / sizeof(g_cull_slots[0])) {
       return;
     }
@@ -186,6 +205,9 @@ void EnsureCullThresholdScaled(uint8_t* base, uint32_t cull_object) {
   if (scaled != current) {
     const uint32_t raw = __builtin_bswap32(scaled);
     std::memcpy(base + addr, &raw, 4);
+    REXLOG_INFO("draw-distance-applied: bam={} object={:08X} base={:08X} scaled={:08X} global={} bam_override={}",
+        skate3::world_loading::IsSkate2Gameplay(), cull_object, slot->base_bits, scaled,
+        REXCVAR_GET(skate3_draw_distance_scale), REXCVAR_GET(skate3_skate2_draw_distance_scale));
   }
   slot->written_bits = scaled;
 }
@@ -289,6 +311,88 @@ void MaybePollDebugMarkerKey() {
   was_down = down;
 }
 
+// BAM's Sim grid gathers only the occupied cell. Log032 shows repeated
+// boundary waits although the actual Sim loads take 16-50ms: they join a
+// serial streaming queue only after the skater crosses the boundary. Keep
+// the surrounding 3x3 Sim neighbourhood requested through the normal differ.
+// The caller holds the focus lock; temporary probe positions cannot race
+// MoveStreamFocus. No cached guest pointers survive a gather or map change.
+template <typename Context>
+void PrefetchSkate2Sim(Context& ctx, uint8_t* base, uint32_t sys,
+                       uint32_t focus, uint32_t out) {
+  if (!REXCVAR_GET(skate3_skate2_sim_prefetch) ||
+      !skate3::world_loading::IsSkate2Gameplay() ||
+      skate3::native_scene::LoadingOrFrontendActive() ||
+      !PlausibleGuestAddr(focus) || !PlausibleGuestAddr(out) ||
+      LoadGuestU32(base, focus + 32) != 1 ||
+      ((LoadGuestU32(base, focus + 20) >> 24) && LoadGuestU32(base, focus + 40))) return;
+  const uint32_t vanilla_count = LoadGuestU32(base, out + 1032);
+  const uint32_t groups = LoadGuestU32(base, sys + 52);
+  if (!vanilla_count || vanilla_count > 64 || !PlausibleGuestAddr(groups) ||
+      LoadGuestU32(base, sys + 56) <= groups) return;
+  const uint32_t group = LoadGuestU32(base, groups);
+  if (!PlausibleGuestAddr(group)) return;
+  const uint32_t step = LoadGuestU32(base, group + 600);
+  if (!step || step > 4096) return;
+  ProbeRecord records[64]{};
+  size_t count = 0;
+  const float x = LoadGuestF32(base, focus), z = LoadGuestF32(base, focus + 8);
+  if (!std::isfinite(x) || !std::isfinite(z)) return;
+  const auto absorb = [&](bool vanilla) {
+    const uint32_t n = std::min(LoadGuestU32(base, out + 1032), 64u);
+    for (uint32_t i = 0; i < n && count < 64; ++i) {
+      const uint32_t rec = out + 8 + i * 16;
+      const uint64_t id = LoadGuestU64(base, rec);
+      size_t j = 0;
+      while (j < count && records[j].id != id) ++j;
+      if (j != count) continue;
+      auto& dest = records[count];
+      std::memcpy(dest.blob, base + rec, 16);
+      if (!vanilla && !ProbeRecordIsLive(base, id, dest.blob)) continue;
+      dest.id = id;
+      dest.vanilla = vanilla;
+      const uint32_t cell = LoadGuestU32(base, rec + 8);
+      // Priorities must be measured from the real focus, not from each
+      // displaced probe. Otherwise every neighbour looks like the closest.
+      const float dx = LoadGuestF32(base, cell + 80) - x;
+      const float dz = LoadGuestF32(base, cell + 88) - z;
+      dest.dist = dx * dx + dz * dz;
+      uint32_t bits;
+      std::memcpy(&bits, &dest.dist, 4);
+      bits = __builtin_bswap32(bits);
+      std::memcpy(dest.blob + 12, &bits, 4);
+      ++count;
+    }
+  };
+  absorb(true);
+  uint8_t saved_position[16], saved_header[8];
+  std::memcpy(saved_position, base + focus, 16);
+  std::memcpy(saved_header, base + out, 8);
+  for (int dx = -1; dx <= 1; ++dx) {
+    for (int dz = -1; dz <= 1; ++dz) {
+      if (!dx && !dz) continue;
+      StoreGuestF32(base, focus, x + float(step) * dx);
+      StoreGuestF32(base, focus + 8, z + float(step) * dz);
+      auto call = ctx;
+      call.r3.u64 = sys;
+      call.r4.u64 = focus;
+      call.r5.u64 = out;
+      __imp__sub_8247B3A0(call, base);
+      absorb(false);
+    }
+  }
+  std::memcpy(base + focus, saved_position, 16);
+  std::memcpy(base + out, saved_header, 8);
+  // The occupied cell must remain first: FindCollections uses record 0
+  // as its current-cell identity. Neighbours affect residency only.
+  std::stable_sort(records, records + count, [](const auto& a, const auto& b) {
+    if (a.vanilla != b.vanilla) return a.vanilla;
+    return a.dist < b.dist;
+  });
+  for (size_t i = 0; i < count; ++i)
+    std::memcpy(base + out + 8 + i * 16, records[i].blob, 16);
+  StoreGuestU32(base, out + 1032, uint32_t(count));
+}
 }  // namespace
 
 // Sk8 cull-parameter setter: [cullObject+6060] = flags, [cullObject+6064] =
@@ -373,6 +477,7 @@ extern "C" REX_FUNC(sub_8247B3A0) {
   const uint32_t focus = ctx.r4.u32;
   const uint32_t out = ctx.r5.u32;
   __imp__sub_8247B3A0(ctx, base);
+  PrefetchSkate2Sim(ctx, base, sys, focus, out);
   const double probe = REXCVAR_GET(skate3_draw_distance_stream_probe);
   if (probe < 1.0 || !PlausibleGuestAddr(focus) || !PlausibleGuestAddr(out)) {
     return;
@@ -705,7 +810,13 @@ extern "C" REX_FUNC(sub_8247BB50) {
     REXLOG_WARN("draw_distance: stream LOAD-COMPLETE id=0x{:016X}",
                 ctx.r4.u64);
   }
+  const auto sys = ctx.r3.u32;
+  const auto id = ctx.r4.u64;
   __imp__sub_8247BB50(ctx, base);
+  if (REXCVAR_GET(skate3_world_load_probe) && skate3::world_loading::IsSkate2Gameplay()) {
+    REXLOG_INFO("world-cell-activation: phase=activate id={:016X} load_active={:016X} unload_active={:016X}",
+                id, LoadGuestU64(base, sys + 71416), LoadGuestU64(base, sys + 71424));
+  }
 }
 
 extern "C" REX_FUNC(sub_8247BD28) {
@@ -713,13 +824,18 @@ extern "C" REX_FUNC(sub_8247BD28) {
     REXLOG_WARN("draw_distance: stream UNLOAD-COMPLETE id=0x{:016X}",
                 ctx.r4.u64);
   }
+  const auto sys = ctx.r3.u32;
+  const auto id = ctx.r4.u64;
   __imp__sub_8247BD28(ctx, base);
+  if (REXCVAR_GET(skate3_world_load_probe) && skate3::world_loading::IsSkate2Gameplay()) {
+    REXLOG_INFO("world-cell-activation: phase=deactivate id={:016X} load_active={:016X} unload_active={:016X}",
+                id, LoadGuestU64(base, sys + 71416), LoadGuestU64(base, sys + 71424));
+  }
 }
 
 // SceneRenderView::GetLODDistancesFromAttrib: rewrites the six squared LOD
 // switch distances on the view every frame. Scale them by k^2 (squared
-// domain), and take the per-frame opportunity to reapply the cull threshold
-// on this view's cull object.
+// domain). World contribution thresholds are handled at the cull consumer.
 extern "C" REX_FUNC(sub_827E1AD8) {
   const uint32_t view = ctx.r3.u32;
   __imp__sub_827E1AD8(ctx, base);
@@ -736,5 +852,13 @@ extern "C" REX_FUNC(sub_827E1AD8) {
                     float(double(LoadGuestF32(base, addr)) * squared));
     }
   }
-  EnsureCullThresholdScaled(base, LoadGuestU32(base, view + 8));
+  // view+8 is the ViewCamera, NOT the cull object. Reapply at the live
+  // cull consumer below, where r3 has the same type as the config setter.
+}
+
+// 8288DCC8 consumes the cull object's active lists (+5200/+5204). Only touch
+// an object previously observed at the authoritative 8288DC58 setter.
+extern "C" REX_FUNC(sub_8288DCC8) {
+  EnsureCullThresholdScaled(base, ctx.r3.u32, true);
+  __imp__sub_8288DCC8(ctx, base);
 }

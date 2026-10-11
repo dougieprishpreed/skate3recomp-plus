@@ -1,21 +1,40 @@
-# Build output and generated recompilation sources
+# Build output, generated recompilation and local research
 /out/
 /build/
 /generated/
 /generated.backup-*/
-/tools/
+/reports/
+/HANDOFF.md
+/scripts/
 
-# Local game dump and retail media. Users must provide their own copy.
+# User-supplied retail games, title updates, DLC and prepared game content
 /game/
+/mods/
+/dlc/
+/0000000000000000/
+/TU_*
 *.iso
 *.xex
+*.xexp
+*.big
+*.rx2
+*.bh
 
-# Local runtime/config overrides
+# Runtime state and local configuration
+/installer/
+/install-state/
+/install-backups/
+/logs/
+/saves/
+/cache/
+/native_render_snapshots/
+/portable.txt
+/settings.toml
 skate3.toml
 skate3_ultrawide_targets*.toml
 CMakeUserPresets.json
 
-# Diagnostics and binary build products
+# Compiled products and diagnostics
 *.log
 *.dmp
 *.wpix
@@ -26,12 +45,19 @@ CMakeUserPresets.json
 *.obj
 *.lib
 *.exe
+*.dll
 *.map
+*.zip
 
-# Editor and CMake scratch
+# Python, editors and CMake scratch
+__pycache__/
+*.py[cod]
+.venv/
+venv/
 /.vs/
 /.vscode/
 /.cache/
 
-# Local developer scripts (texture decoding, extraction, bootstrap helpers)
-/scripts/
+# Local diagnostic probes tied to developer game-dump paths
+/tools/dump_entries.py
+/tools/find_identities.py

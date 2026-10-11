@@ -80,6 +80,20 @@ std::string TomlString(std::string_view value) {
 
 }  // namespace
 
+void EnsureDiagnosticSettings(const std::filesystem::path& path) {
+  // Registry-based, so newly added probes appear without maintaining a second list.
+  // SaveConfigValues merges with existing preferences, including explicit false values.
+  std::vector<std::string_view> names;
+  for (const auto& flag : rex::cvar::GetRegistry()) {
+    if (flag.type == rex::cvar::FlagType::Command) continue;
+    bool diagnostic = flag.is_debug_only || flag.name.starts_with("skate3_");
+    for (const char* term : {"debug", "perf", "profil", "log", "trace", "dump", "capture", "validation", "probe"})
+      diagnostic |= flag.name.find(term) != std::string::npos;
+    if (diagnostic) names.push_back(flag.name);
+  }
+  rex::cvar::SaveConfigValues(path, names);
+}
+
 std::filesystem::path ProfilesFilePath(const std::filesystem::path& user_data_root) {
   return user_data_root / "profiles" / "profiles.toml";
 }

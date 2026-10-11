@@ -35,8 +35,8 @@ float4 ShadeDynObject(VSOut i, float4 albedo) {
   // GetTangentLight's fixed SIGNED tangent-space light: the signs come
   // from the frame axes dotted with the dynobj bank's own sun (c9:
   // dyn_sun, not the world families' sh_sun).
-  float3 Lt = float3(0.58 * sign(dot(kt, dyn_sun.xyz)),
-                     0.62 * sign(dot(kb, dyn_sun.xyz)), 0.39);
+  float3 Lt = float3(0.58 * AxisSign(dot(kt, dyn_sun.xyz)),
+                     0.62 * AxisSign(dot(kb, dyn_sun.xyz)), 0.39);
   // vnd = (2*base.xy + 2*detail.xy - 2, 2*base.z - 1), NORMALIZED for
   // both the kd dot and the TBN mapping (both dynobj variants).
   float3 vndn = float3(0.0, 0.0, 1.0);
@@ -129,7 +129,7 @@ float4 ShadeDynObject(VSOut i, float4 albedo) {
   if (sh_fogp.z != 1.0) {
     f1 = pow(max(f1, 1e-6), sh_fogp.z);
   }
-  float3 fog_rgb = sh_fogc.rgb * f1;
+  float3 fog_rgb = sh_fogc.rgb * f1 * NightGrade();  // sky in-scatter (night: dimmed)
   float fog_a = (1.0 + sh_fogc.a * f1) * dyn_misc.x;  // x material multiplier
   float3 xe = (lin * fog_a + fog_rgb) * dyn_sun.w;
   return ToneOut(xe, 1.0, false);

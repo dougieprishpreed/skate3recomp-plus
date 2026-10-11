@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 
@@ -10,6 +11,9 @@ namespace skate3 {
 // True when both title update payloads (default.xexp and
 // data/webkit/EAWebkit.xexp) are staged in game_root and match the pinned
 // SHA-256 hashes the recompilation was generated from.
+bool DownloadTitleUpdateForSetup(const std::filesystem::path& staging,
+                                  std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total,
+                                  std::string& error);
 bool IsTitleUpdateInstalled(const std::filesystem::path& game_root);
 
 // Stages the title update payloads into game_root from a local source file:

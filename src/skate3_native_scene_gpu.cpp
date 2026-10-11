@@ -3,8 +3,13 @@
 // it through the RHI (D3D12 / Vulkan) into the guest output texture. Shared
 // cross-thread state lives in skate3_native_scene_state.h.
 
+#include "skate3_jumbotron.h"
 #include "skate3_native_debug_dialog.h"
 #include "skate3_native_scene.h"
+#include "skate3_perf_recorder.h"
+#include "skate3_world_loading.h"
+#include "skate3_skate2_water_data.h"
+#include "skate3_texture_565.h"
 
 #include "generated/skate3_init.h"
 
@@ -21,6 +26,7 @@
 #include <deque>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -60,6 +66,26 @@
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
+REXCVAR_DECLARE(bool, skate3_skate2_texture_probe);
+REXCVAR_DEFINE_BOOL(skate3_skate2_material_depth_bias, true, "Skate 3",
+                    "Apply authored depth separation to New San Van overlay materials")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skate2_night_brightness, 1.0, "Skate 3",
+                      "New San Vanelona at night (skate3_skate2_night): multiplier on the "
+                      "Sanitarium-matched night light (0.25-4; 1 = the Sanitarium's levels)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skate2_ocean_glare, 0.25, "Skate 3",
+                      "New San Vanelona's sea and lakes: how much of the extra sky reflection "
+                      "the water shows at a low angle, as across the bay (0-1; 1 = Skate 2's "
+                      "original, which washes the distant sea out to white; 0 = as reflective "
+                      "as seen from above). Close and steep views are unchanged")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(bool, skate3_skate2_hide_inherited_backdrop);
+REXCVAR_DECLARE(bool, skate3_skate2_jumbotron);  // skate3_jumbotron.cpp
+REXCVAR_DECLARE(bool, skate3_skate2_transparent_parity);
+REXCVAR_DECLARE(bool, skate3_skate2_env_specular);
+REXCVAR_DECLARE(bool, skate3_skate2_stadium_crowd_shade);
+REXCVAR_DECLARE(bool, skate3_skate2_native_occlusion);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
@@ -78,6 +104,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_fmv_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_hdr_packed);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lightmaps);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lightmap_smooth);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lm_dump);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_loading_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
@@ -86,12 +113,14 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_unsuppress);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_pause_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_log);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_capture_log);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_perf_interval);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_perf_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_occlusion_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_display_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_grab_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_native);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_postfx_motion_blur);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_readback);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_photo_yield);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_refl_bias_auto);
@@ -101,6 +130,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_ropa_inline);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_selection_outline);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_caster_parity);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_pcss);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_prop_world_shade);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_static_casters);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_blocker_m);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_max_m);
@@ -108,7 +138,9 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_min_texel);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias_vk);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_venue);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
+REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_budget_ms);
 REXCVAR_DECLARE(int32_t, skate3_native_render_scene_shadow_static_size);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
@@ -124,6 +156,10 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_ssr);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_mips);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_tex_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_indicator_xray);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_cac_stamps);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_cac_stamp_overlay);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_cac_cloth_dirt);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_v2);
 REXCVAR_DECLARE(double, skate3_menu_blur_sigma);
 REXCVAR_DECLARE(double, skate3_native_render_scene_2d_sharp);
@@ -170,6 +206,32 @@ REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 
 namespace skate3::native_scene {
+// New San Vanelona at night (skate3_skate2_night). The Sanitarium download
+// renders with the game's default render location: its world record names
+// render location 'sanitarium', which no shipped vault defines, so the
+// lookup (82794FD8 / 827950A8) falls back to 'default'/'freeskate', the same
+// sun, ambient, fog and exposure New San Van runs. Its night is in its art:
+// the night sky and night-baked lightmaps. Its 324 lightmaps (used texels,
+// linear = texel^2 as the world shaders square them) average linear
+// (0.0442, 0.0539, 0.0594); New San Van's (1427 layerpage + 917 chromo
+// pages, linear = mono^2 * chroma * 4.5 as SampleWorldLightmap) average
+// (0.2557, 0.2743, 0.2864). Their ratio brings New San Van's baked light to
+// the Sanitarium's levels (median and 90th percentile then agree within 7%;
+// out/research/log150 lightmap_stats.py, nsv_lightmap_stats.py). Characters,
+// cars, props and the live sun stay as the Sanitarium has them: default.
+constexpr float kNightGrade[3] = {0.1728f, 0.1967f, 0.2073f};
+
+bool NightGrade(float grade[3]) {
+  grade[0] = grade[1] = grade[2] = 1.0f;
+  if (!skate3::world_loading::NightSky() || !skate3::world_loading::IsSkate2Gameplay()) {
+    return false;
+  }
+  const float level =
+      float(std::clamp(REXCVAR_GET(skate3_skate2_night_brightness), 0.25, 4.0));
+  for (int i = 0; i < 3; ++i) grade[i] = kNightGrade[i] * level;
+  return true;
+}
+
 namespace {
 
 // Retire a guest texture's GPU resources AND its view. Destruction is
@@ -228,6 +290,210 @@ bool ReadStableTexWords(uint8_t* base, uint32_t tex_ptr, uint32_t out[6]) {
   return true;
 }
 
+// Scene VS projection constant (cbuffer C `mvp`): the view-projection re-based
+// on `origin`, the value the same draw passes in cam_pos.xyz. vs_main projects
+// (world position - origin), so (p - o) * M == p * vp in exact arithmetic.
+// Projecting absolute world coordinates (~1 km) in float32 cancels large
+// terms; the resulting depth noise (~9 cm at 120 m, ~30 cm at 200 m with the
+// game's 0.1 near plane) let layered surfaces a few cm apart swap depth order
+// as the camera moved: the distance-only flicker of run 080 (lighthouse gate
+// stripes, ivy decals). Only the translation row carries the large terms; it
+// is formed in double. Passes without a camera origin pass zero: plain vp.
+//
+// reversed: the main scene depth buffer is REVERSED-Z (clear 0, GREATER).
+// Standard D3D depth z/w = A - nA/w crowds the whole far range next to 1.0
+// where float32 has its coarsest steps: with the game's 0.1 near plane,
+// layers 11 cm apart swap order past ~250 m (Old Town ivy) and 0.7 m apart
+// past ~800 m (skyscraper windows) even after re-basing (run 081). Storing
+// 1 - z/w instead = (1 - A) + nA/w puts float32's dense exponent range at
+// the far end. The column (w - z) is formed here in double so the tiny
+// (1 - A) coefficient never cancels on the GPU. depth_offset adds a constant
+// to the stored depth (d' += offset), used for authored overlay depth bias.
+void RebasedViewProj(const float vp[16], const float origin[3], float out[16],
+                     bool reversed = false, double depth_offset = 0.0) {
+  double m[16];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c) m[r * 4 + c] = vp[r * 4 + c];
+  for (int c = 0; c < 4; ++c)
+    m[12 + c] = double(origin[0]) * vp[c] + double(origin[1]) * vp[4 + c] +
+                double(origin[2]) * vp[8 + c] + double(vp[12 + c]);
+  if (reversed) {
+    for (int r = 0; r < 4; ++r)
+      m[r * 4 + 2] = m[r * 4 + 3] - m[r * 4 + 2] + depth_offset * m[r * 4 + 3];
+  }
+  for (int i = 0; i < 16; ++i) out[i] = float(m[i]);
+}
+// kReversedZ: skate3_native_scene_gpu_internal.h.
+
+// Original S2 water families, identified by material class and source GUID
+// namespace, not individual pond/fountain names. S3 water keeps its own path.
+bool IsSkate2Water(const DrawItem& item) {
+  return item.water && item.water_ocean == 0 && item.packed_lightmap &&
+         uint32_t(item.diffuse_guid) == 0x03E3870Au;
+}
+bool IsSkate2Ocean(const DrawItem& item) {
+  // S2 ocean uses a selected mono lightmap plus chromaticity; S3 uses RGB.
+  // There is no diffuse GUID on this family. Never select S3's captured
+  // ocean parameters merely because a native ocean was loaded earlier.
+  return item.water && item.water_ocean == 1 && item.packed_lightmap;
+}
+// The Skate 2 Stadium's crowd seating (crowd_stadium, environmentsimple):
+// 1) Its top tread lies IN the plane of the concrete walkway between the
+//    tiers (y 22.14, 56-139 m2 per stand section, different triangulation).
+//    Skate 2's 24-bit depth buffer collapses the two depths and the later
+//    draw wins; our float depth keeps the interpolation rounding, so the two
+//    fought per pixel (the flickering strip below the "skate 2" band). The
+//    seating draws a hair farther (draw_item).
+// 2) It keeps the roof's static shade that the venue factor lifts from the
+//    floodlit floor (misc.y = -1, skate3_skate2_stadium_crowd_shade).
+// Texture identity is the only handle: seating and walkway are both
+// environmentsimple.default with nothing else to tell them apart.
+bool IsSkate2StadiumCrowd(const DrawItem& item) {
+  return skate3::world_loading::IsSkate2Gameplay() && !item.skinned &&
+         (item.diffuse_guid & 0x0000FFFFFFFFFFFEull) == 0x00003D6D03E3870Aull;
+}
+
+// Read-only follow-up to log055. Sample the reported downtown trouble spot,
+// plus sky draws everywhere. Refresh the budget so a long approach cannot
+// consume all diagnostics before the player reaches the problem. Live material
+// snapshots can race streaming; resolved GPU descriptors below are authoritative
+// for this draw, whereas guest channel rows are supporting evidence only.
+void TraceBamLighting(uint8_t* base, const FrameScene& scene,
+                      uint64_t frame, const DrawItem& item,
+                      const GuestTexture* lightmap,
+                      const GuestTexture* chromaticity, float shader_mode,
+                      int debug_mode) {
+  if (!REXCVAR_GET(skate3_skate2_texture_probe) ||
+      !skate3::world_loading::IsSkate2Gameplay() || item.retained || item.skinned)
+    return;
+  const float dx = scene.cam_pos[0] - 276.921f;
+  const float dz = scene.cam_pos[2] - 845.396f;
+  if (!item.unlit && dx * dx + dz * dz > 250.0f * 250.0f) return;
+  static std::unordered_map<uint64_t, uint64_t> last_seen;
+  static uint64_t window = 0, last_frame = 0;
+  static unsigned window_count = 0, frame_count = 0;
+  if (frame < window || frame - window >= 600) {
+    window = frame;
+    window_count = 0;
+  }
+  if (frame != last_frame) { last_frame = frame; frame_count = 0; }
+  if (window_count >= 128 || frame_count >= 4) return;
+  const uint64_t state_key = (uint64_t(item.mesh) << 32) ^ item.lightmap_tex ^
+      (uint64_t(item.chromaticity_tex) << 1) ^ std::bit_cast<uint32_t>(shader_mode) ^
+      (uint64_t(lightmap != nullptr) << 63) ^ (uint64_t(debug_mode) << 56);
+  const auto it = last_seen.find(state_key);
+  if (it != last_seen.end() && frame >= it->second && frame - it->second < 1800)
+    return;
+  if (last_seen.size() >= 4096) last_seen.clear();
+  last_seen[state_key] = frame;
+  ++window_count;
+  ++frame_count;
+  uint32_t material = 0;
+  GuestTryLoadU32(base, item.mesh + 0x24, &material);
+  REXLOG_INFO("world-lighting-draw: frame={} mesh={:08X} material={:08X} cam=({},{},{}) family={} unlit={} water={} packed={} mode={} debug={} dot=({},{},{},{}) lm={:08X} chroma={:08X} lm_resolved={} chroma_resolved={}",
+      frame, item.mesh, material, scene.cam_pos[0], scene.cam_pos[1], scene.cam_pos[2],
+      item.env_family, item.unlit, item.water, item.packed_lightmap, shader_mode,
+      debug_mode, item.mono_lightmap_dot[0], item.mono_lightmap_dot[1],
+      item.mono_lightmap_dot[2], item.mono_lightmap_dot[3], item.lightmap_tex,
+      item.chromaticity_tex, lightmap && lightmap != &g_r.white,
+      chromaticity && chromaticity != &g_r.white);
+  const auto texture = [&](const char* role, uint32_t ptr, const GuestTexture* gpu) {
+    uint32_t live[6] = {}, resolved[6] = {};
+    const bool stable = ptr && ReadStableTexWords(base, ptr, live);
+    if (gpu && gpu != &g_r.white)
+      std::copy_n(gpu->fetch_words, 6, resolved);
+    REXLOG_INFO("world-lighting-texture: frame={} mesh={:08X} role={} ptr={:08X} stable={} live=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] gpu=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+        frame, item.mesh, role, ptr, stable, live[0], live[1], live[2], live[3], live[4], live[5],
+        resolved[0], resolved[1], resolved[2], resolved[3], resolved[4], resolved[5]);
+  };
+  texture("lightmap", item.lightmap_tex, lightmap);
+  texture("chromaticity", item.chromaticity_tex, chromaticity);
+  if (item.unlit) {
+    REXLOG_INFO("world-sky-placement: frame={} mesh={:08X} sky_height={} world=({},{},{}) draw=({},{},{}) bbox_min=({},{},{}) bbox_max=({},{},{}) diffuse={:08X}",
+        frame, item.mesh, scene.sky_height, item.world[12], item.world[13], item.world[14],
+        item.world[12] + scene.cam_pos[0], item.world[13] + scene.sky_height,
+        item.world[14] + scene.cam_pos[2], item.bbox_min[0], item.bbox_min[1],
+        item.bbox_min[2], item.bbox_max[0], item.bbox_max[1], item.bbox_max[2], item.diffuse_tex);
+  }
+  uint32_t header[3] = {};
+  if (!material || !GuestTryCopy(header, base + material, sizeof(header))) return;
+  const uint32_t count = SwapU32(header[0]), channels = SwapU32(header[2]);
+  uint32_t rows[32][8] = {};
+  if (!count || count > 32 || !channels ||
+      !GuestTryCopy(rows, base + channels, count * sizeof(rows[0]))) return;
+  for (uint32_t i = 0; i < count; ++i) {
+    for (auto& word : rows[i]) word = SwapU32(word);
+    char name[33] = {};
+    if (rows[i][0]) GuestTryCopy(name, base + rows[i][0], sizeof(name) - 1);
+    for (char& c : name) if (c && (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126)) c = '?';
+    // The full material inventory in056 identified lighting identities. Keep
+    // the next comparison focused so long traversals do not flood rotated logs.
+    if (std::strcmp(name, "lightmap") != 0 && std::strcmp(name, "chromaticity") != 0 &&
+        std::strcmp(name, "diffuse") != 0) continue;
+    uint32_t selected = 0;
+    if (rows[i][7]) GuestTryLoadU32(base, rows[i][7], &selected);
+    REXLOG_INFO("world-lighting-channel: frame={} mesh={:08X} index={} name={} flags={:08X} guid={:08X}{:08X} stream={:08X} selected={:08X}",
+        frame, item.mesh, i, name, rows[i][1], rows[i][4], rows[i][5], rows[i][7], selected);
+  }
+}
+
+// Surface probe (Insert / F10, with the lighting history): distance along
+// the screen-centre ray to the item's bounding box, negative on a miss. The
+// box is the mesh-local bbox under the item's world affine (row vectors:
+// world = local * A + t), so the slab test runs in local space.
+float PickRayHit(const DrawItem& item, const float origin[3], const float dir[3]) {
+  const float* w = item.world;
+  const float a00 = w[0], a01 = w[1], a02 = w[2];
+  const float a10 = w[4], a11 = w[5], a12 = w[6];
+  const float a20 = w[8], a21 = w[9], a22 = w[10];
+  const float det = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) +
+                    a02 * (a10 * a21 - a11 * a20);
+  if (!(std::fabs(det) > 1e-12f)) {
+    return -1.0f;
+  }
+  const float r = 1.0f / det;
+  const float inv[3][3] = {
+      {(a11 * a22 - a12 * a21) * r, (a02 * a21 - a01 * a22) * r, (a01 * a12 - a02 * a11) * r},
+      {(a12 * a20 - a10 * a22) * r, (a00 * a22 - a02 * a20) * r, (a02 * a10 - a00 * a12) * r},
+      {(a10 * a21 - a11 * a20) * r, (a01 * a20 - a00 * a21) * r, (a00 * a11 - a01 * a10) * r}};
+  const float q[3] = {origin[0] - w[12], origin[1] - w[13], origin[2] - w[14]};
+  float tn = 0.0f, tf = 1e30f;
+  for (int k = 0; k < 3; ++k) {
+    const float o = q[0] * inv[0][k] + q[1] * inv[1][k] + q[2] * inv[2][k];
+    const float d = dir[0] * inv[0][k] + dir[1] * inv[1][k] + dir[2] * inv[2][k];
+    if (std::fabs(d) < 1e-12f) {
+      if (o < item.bbox_min[k] || o > item.bbox_max[k]) {
+        return -1.0f;
+      }
+      continue;
+    }
+    const float t1 = (item.bbox_min[k] - o) / d;
+    const float t2 = (item.bbox_max[k] - o) / d;
+    tn = std::max(tn, std::min(t1, t2));
+    tf = std::min(tf, std::max(t1, t2));
+  }
+  return tf >= tn ? tn : -1.0f;
+}
+
+// One bound texture for the surface probe: the fallback it is, or its fetch
+// format/size words, mip count and validity.
+std::string PickTextureDesc(const GuestTexture* t) {
+  if (t == nullptr) {
+    return "none";
+  }
+  if (t == &g_r.white) {
+    return "white";
+  }
+  if (t == &g_r.white_cube) {
+    return "white_cube";
+  }
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "[%08X %08X mips=%u valid=%d near_black=%d]",
+                t->fetch_words[1], t->fetch_words[2], t->srv_mips, t->valid ? 1 : 0,
+                t->near_black ? 1 : 0);
+  return buf;
+}
+
 // Frames-per-second estimate for the eviction age guards. The LRU clocks
 // are frame-stamped, so wall-clock idle thresholds must convert through the
 // live frame rate: a fixed frame count that means 30 seconds at 60 fps
@@ -265,6 +531,55 @@ void UpdateEvictFpsEstimate(uint64_t frame_number) {
 // live content into a re-decode loop.
 constexpr size_t kTexEvictPerFrame = 64;
 constexpr double kTexEvictMinIdleSeconds = 45.0;
+
+// Victim selection shared by the store LRUs: one full scan collects up to
+// kEvictBatch idle entries, oldest last, and the following frames consume
+// them kEvictPerFrame at a time, re-checking each against the idle guard
+// (an entry used again since the scan is skipped). A scan walks every entry
+// (~24k meshes / ~12k textures late in a dense session); rescanning on
+// every draining frame was a render-thread cost that grew with the session.
+constexpr size_t kEvictBatch = 1024;
+
+template <typename Store, typename Key>
+bool RefillEvictionBatch(const Store& store, uint64_t frame_number, uint64_t min_idle_frames,
+                         std::vector<std::pair<uint64_t, Key>>& batch) {
+  batch.clear();
+  for (const auto& [key, entry] : store) {
+    if (entry.last_used_frame + min_idle_frames < frame_number) {
+      batch.emplace_back(entry.last_used_frame, key);
+    }
+  }
+  if (batch.empty()) {
+    return false;
+  }
+  const size_t take = std::min(batch.size(), kEvictBatch);
+  std::nth_element(batch.begin(), batch.begin() + (take - 1), batch.end());
+  batch.resize(take);
+  std::sort(batch.begin(), batch.end(), std::greater<>());
+  return true;
+}
+
+// Pops the next still-idle candidate into `key`; refills from one store
+// scan at most once per call. False = nothing idle (the caller parks).
+template <typename Store, typename Key>
+bool NextEvictionVictim(const Store& store, uint64_t frame_number, uint64_t min_idle_frames,
+                        std::vector<std::pair<uint64_t, Key>>& batch, bool& refilled,
+                        Key& key) {
+  while (true) {
+    if (batch.empty()) {
+      if (refilled || !RefillEvictionBatch(store, frame_number, min_idle_frames, batch)) {
+        return false;
+      }
+      refilled = true;
+    }
+    key = batch.back().second;
+    batch.pop_back();
+    const auto it = store.find(key);
+    if (it != store.end() && it->second.last_used_frame + min_idle_frames < frame_number) {
+      return true;
+    }
+  }
+}
 
 // Byte-budget layer over the count caps: the caps above bound ENTRY counts,
 // but per-entry sizes differ per map, and after a map switch the union of
@@ -369,15 +684,13 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
                   g_r.tex_store.size(), g_tex_store_bytes >> 20, s_evicted_run);
     }
   }
-  if (!s_evicting || frame_number < s_next_scan_frame) {
+  static std::vector<std::pair<uint64_t, uint64_t>> s_batch;  // (last-used frame, key)
+  if (!s_evicting) {
+    s_batch.clear();
     return;
   }
-  std::vector<std::pair<uint64_t, uint64_t>> ages;  // (last-used frame, key)
-  ages.reserve(g_r.tex_store.size());
-  for (const auto& [k, t] : g_r.tex_store) {
-    if (t.last_used_frame + min_idle_frames < frame_number) {
-      ages.emplace_back(t.last_used_frame, k);
-    }
+  if (frame_number < s_next_scan_frame) {
+    return;
   }
   size_t excess = g_r.tex_store.size() > low_water
                       ? g_r.tex_store.size() - low_water
@@ -390,25 +703,26 @@ void EvictTexStore(uint64_t frame_number, uint64_t submission) {
                                   std::max<size_t>(1, g_r.tex_store.size()));
     excess = std::max(excess, size_t((g_tex_store_bytes - byte_low) / avg) + 1);
   }
-  const size_t n = std::min({ages.size(), excess, kTexEvictPerFrame});
-  if (n == 0) {
-    // Everything over the cap is recent (a dense area's live working set):
-    // park and re-scan later instead of burning a full-store scan per frame.
-    s_next_scan_frame = frame_number + 120;
-    return;
-  }
-  std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
-  for (size_t i = 0; i < n; ++i) {
-    const auto it = g_r.tex_store.find(ages[i].second);
-    if (it != g_r.tex_store.end()) {
-      g_tex_store_bytes -= std::min<uint64_t>(g_tex_store_bytes,
-                                              it->second.gpu_bytes);
-      RetireGuestTexture(it->second, submission);
-      g_r.tex_store.erase(it);
+  const size_t n = std::min(excess, kTexEvictPerFrame);
+  size_t evicted = 0;
+  bool refilled = false;
+  uint64_t key = 0;
+  while (evicted < n) {
+    if (!NextEvictionVictim(g_r.tex_store, frame_number, min_idle_frames, s_batch, refilled,
+                            key)) {
+      // Everything over the cap is recent (a dense area's live working set):
+      // park and re-scan later instead of burning a full-store scan per frame.
+      s_next_scan_frame = frame_number + 120;
+      break;
     }
+    const auto it = g_r.tex_store.find(key);
+    g_tex_store_bytes -= std::min<uint64_t>(g_tex_store_bytes, it->second.gpu_bytes);
+    RetireGuestTexture(it->second, submission);
+    g_r.tex_store.erase(it);
+    ++evicted;
   }
-  s_evicted_run += n;
-  g_store_evicted.fetch_add(n, std::memory_order_relaxed);
+  s_evicted_run += evicted;
+  g_store_evicted.fetch_add(evicted, std::memory_order_relaxed);
 }
 
 // Mesh cache LRU, same amortized shape: without it every streamed arena's
@@ -470,15 +784,13 @@ void EvictMeshStore(uint64_t frame_number) {
                   g_r.meshes.size(), g_mesh_store_bytes >> 20, s_evicted_run);
     }
   }
-  if (!s_evicting || frame_number < s_next_scan_frame) {
+  static std::vector<std::pair<uint64_t, uint32_t>> s_batch;  // (last-used frame, key)
+  if (!s_evicting) {
+    s_batch.clear();
     return;
   }
-  std::vector<std::pair<uint64_t, uint32_t>> ages;  // (last-used frame, key)
-  ages.reserve(g_r.meshes.size());
-  for (const auto& [k, m] : g_r.meshes) {
-    if (m.last_used_frame + min_idle_frames < frame_number) {
-      ages.emplace_back(m.last_used_frame, k);
-    }
+  if (frame_number < s_next_scan_frame) {
+    return;
   }
   size_t excess =
       g_r.meshes.size() > low_water ? g_r.meshes.size() - low_water : 0;
@@ -487,27 +799,29 @@ void EvictMeshStore(uint64_t frame_number) {
         1, g_mesh_store_bytes / std::max<size_t>(1, g_r.meshes.size()));
     excess = std::max(excess, size_t((g_mesh_store_bytes - byte_low) / avg) + 1);
   }
-  const size_t n = std::min({ages.size(), excess, kMeshEvictPerFrame});
-  if (n == 0) {
-    // Everything over the cap is in recent use (a dense map's population):
-    // park and re-scan later instead of burning a full-store scan per frame.
-    s_next_scan_frame = frame_number + 120;
-    return;
-  }
-  std::nth_element(ages.begin(), ages.begin() + (n - 1), ages.end());
-  for (size_t i = 0; i < n; ++i) {
-    const auto it = g_r.meshes.find(ages[i].second);
-    if (it != g_r.meshes.end()) {
-      g_mesh_store_bytes -= std::min<uint64_t>(
-          g_mesh_store_bytes,
-          uint64_t(it->second.vb_view.size_bytes) + it->second.ib_view.size_bytes);
-      g_r.device->DestroyDeferred(it->second.vb);
-      g_r.device->DestroyDeferred(it->second.ib);
-      g_r.ropa_shapes.erase(it->first);
-      g_r.meshes.erase(it);
+  const size_t n = std::min(excess, kMeshEvictPerFrame);
+  size_t evicted = 0;
+  bool refilled = false;
+  uint32_t key = 0;
+  while (evicted < n) {
+    if (!NextEvictionVictim(g_r.meshes, frame_number, min_idle_frames, s_batch, refilled,
+                            key)) {
+      // Everything over the cap is in recent use (a dense map's population):
+      // park and re-scan later instead of burning a full-store scan per frame.
+      s_next_scan_frame = frame_number + 120;
+      break;
     }
+    const auto it = g_r.meshes.find(key);
+    g_mesh_store_bytes -= std::min<uint64_t>(
+        g_mesh_store_bytes,
+        uint64_t(it->second.vb_view.size_bytes) + it->second.ib_view.size_bytes);
+    g_r.device->DestroyDeferred(it->second.vb);
+    g_r.device->DestroyDeferred(it->second.ib);
+    g_r.ropa_shapes.erase(it->first);
+    g_r.meshes.erase(it);
+    ++evicted;
   }
-  s_evicted_run += n;
+  s_evicted_run += evicted;
 }
 
 // Environment-cube cache LRU: a handful of cubes serve any one area, but
@@ -895,7 +1209,11 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     // Exception: hair meshes, their second texcoord is the strand-alpha
     // UV, passed RAW by the hair VS (o0.zw = uv, float2), and the ocean,
     // whose VS passes the lightmap UV raw (Out.UV.zw = In.LM, no abs).
-    if (item.char_family < 4 && item.water_ocean == 0) {
+    // CAC skin too: cacstamp_skin_defaultVS feeds its raw second texcoord
+    // into the tattoo-UV rows (no abs). Traffic light lamps (fam 20) as
+    // well: their second texcoord is the lit-lamp diffuse UV, passed raw.
+    if (item.char_family < 4 && item.water_ocean == 0 && item.env_family != 20 &&
+        std::strcmp(item.material_name, "character.skin") != 0) {
       dst[v * 14 + 5] = std::fabs(dst[v * 14 + 5]);
       dst[v * 14 + 6] = std::fabs(dst[v * 14 + 6]);
     }
@@ -926,6 +1244,36 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     } else {
       dst[v * 14 + 12] = dst[v * 14 + 3];
       dst[v * 14 + 13] = dst[v * 14 + 4];
+    }
+    // Vertex-animated families (10 animated.tree, 15 S2 animated.flag) have
+    // no decal art; the slot carries TEXCOORD1.zw instead, the per-vertex
+    // wave weights of vertexanimate.fx / treeanimate.fx (S2 stores
+    // TEXCOORD1 as 4 x s16 snorm). 0.5 = no motion when absent.
+    if (item.env_family == 10 || item.env_family == 15) {
+      if (item.uv2_fmt == 26) {
+        decode_uv(25, item.uv2_offset + 4, dst[v * 14 + 12], dst[v * 14 + 13]);
+      } else if (item.uv2_fmt == 32) {
+        decode_uv(31, item.uv2_offset + 4, dst[v * 14 + 12], dst[v * 14 + 13]);
+      } else if (item.uv2_fmt == 38) {
+        decode_uv(37, item.uv2_offset + 8, dst[v * 14 + 12], dst[v * 14 + 13]);
+      } else {
+        dst[v * 14 + 12] = 0.5f;
+        dst[v * 14 + 13] = 0.5f;
+      }
+    }
+    // Traffic light lamps (fam 20): the slot carries TEXCOORD0.zw, the lamp's
+    // status lookup (trafficlight VS: index = floor(TEXCOORD0.z * 4)). The
+    // half4 case is already the decal-art decode above; a two-component
+    // first texcoord reads z = 0 like the vertex fetch (status x).
+    if (item.env_family == 20) {
+      if (item.uv_fmt == 26) {
+        decode_uv(25, item.uv_offset + 4, dst[v * 14 + 12], dst[v * 14 + 13]);
+      } else if (item.uv_fmt == 38) {
+        decode_uv(37, item.uv_offset + 8, dst[v * 14 + 12], dst[v * 14 + 13]);
+      } else if (item.uv_fmt != 32) {
+        dst[v * 14 + 12] = 0.0f;
+        dst[v * 14 + 13] = 0.0f;
+      }
     }
     // Vertex normal: k_10_11_11 packed (x 11 bits, y 11 bits, z 10 bits,
     // LSB to MSB, signed). Zero when absent -> derivative face-normal
@@ -1010,6 +1358,30 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
                                 (pk(b3[2]) << 16) |
                                 ((sx > 0 ? 200u : 100u) << 24);
         std::memcpy(&dst[v * 14 + 7], &packed, 4);
+      } else if (!item.skinned && item.tan_fmt == 16) {
+        // Skate 2 world layout (baseenvironment VS_IN: pos, uv, lm_norm,
+        // TANGENT; no usage-3 element): the k_10_11_11 element is the
+        // TANGENT and the VS derives vBinormal = signs.x * cross(vNormal,
+        // vTangent). Pack that binormal with the unwrap sign.x as the
+        // handedness: the shader's T = cross(B, N) x handedness then
+        // reproduces the authored tangent (cross(sx * (N x T), N) = sx * T
+        // for an orthonormal pair). Without a stored frame these meshes fell
+        // back to the screen-derivative frame, whose kd sign terms were
+        // rounding noise wherever an axis sat perpendicular to the sun: the
+        // static on the Stadium BLACK BOX flags.
+        float t3[3];
+        unpack_10_11_11(item.tangent_offset, t3);
+        const float hs = sx > 0 ? 1.0f : -1.0f;
+        float b3[3] = {hs * (n3[1] * t3[2] - n3[2] * t3[1]),
+                       hs * (n3[2] * t3[0] - n3[0] * t3[2]),
+                       hs * (n3[0] * t3[1] - n3[1] * t3[0])};
+        const float bl = std::sqrt(b3[0] * b3[0] + b3[1] * b3[1] + b3[2] * b3[2]);
+        if (bl > 0.1f) {  // degenerate frame: keep the screen fallback
+          const uint32_t packed = pk(b3[0] / bl) | (pk(b3[1] / bl) << 8) |
+                                  (pk(b3[2] / bl) << 16) |
+                                  ((sx > 0 ? 200u : 100u) << 24);
+          std::memcpy(&dst[v * 14 + 7], &packed, 4);
+        }
       }
     } else if (item.normal_fmt == 16) {
       // (Vehicle meshes: the game's VS derives cross(tangent, binormal)
@@ -1106,11 +1478,27 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   if (item.ropa) {
     out.ropa_verts.assign(dst, dst + size_t(num_verts) * 14);
   }
+  // Bounded offline capture for the persistent BAM sign flicker. Capture the
+  // decoded geometry actually uploaded, not a second read of mutable guest data.
+  const unsigned bam_probe_group = BamGeometryProbeGroup(item);
+  const bool capture_bam_geometry =
+      REXCVAR_GET(skate3_skate2_texture_probe) &&
+      (skate3::world_loading::IsSkate2Gameplay() || bam_probe_group >= 5) &&
+      !item.skinned && !item.dyn_entity &&
+      num_verts <= 65536 && item.ib_count <= 262144 &&
+      bam_probe_group != 0;
+  std::vector<float> bam_capture_vertices;
+  if (capture_bam_geometry)
+    bam_capture_vertices.assign(dst, dst + size_t(num_verts) * 14);
   device->Unmap(vb);
   // Blend indices outside the captured palette read garbage rows and mangle
   // the vertex. Indices are plain bone numbers, bone k = palette rows 3k.
   // (Dyn decode jobs carry no palette: the item's bones ride the scene item,
   // not the decode; skip the check there.)
+  if (max_bi >= 0) {
+    out.bone_lo = int16_t(min_bi);
+    out.bone_hi = int16_t(max_bi);
+  }
   if (item.skinned && max_bi >= 0 && !item.bones.empty()) {
     const uint32_t palette_bones = uint32_t(item.bones.size() / 12);
     if (uint32_t(max_bi) >= palette_bones) {
@@ -1263,6 +1651,50 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
                       item.mesh, item.ib_count, twins, tris.size());
         }
       }
+    }
+  }
+  if (capture_bam_geometry) {
+    // Decode can run on workers. One synchronized write per mesh generation,
+    // with hard count/byte limits; a fresh directory isolates each process run.
+    static std::mutex capture_mutex;
+    static std::unordered_set<uint64_t> captured;
+    static std::array<size_t, 7> capture_bytes{};
+    static std::array<unsigned, 7> capture_counts{};
+    static const auto directory = std::filesystem::path("logs/bam_geometry") /
+        std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+    std::lock_guard<std::mutex> lock(capture_mutex);
+    const uint64_t key = item.fingerprint ^ (uint64_t(item.mesh) << 32);
+    const size_t bytes = bam_capture_vertices.size() * sizeof(float) + size_t(item.ib_count) * 2;
+    const unsigned limit = bam_probe_group >= 5 ? 96 : bam_probe_group >= 3 ? 192 : 96;
+    if (capture_counts[bam_probe_group] < limit &&
+        capture_bytes[bam_probe_group] + bytes <= size_t(limit) * 256 * 1024 &&
+        captured.insert(key).second) {
+      capture_bytes[bam_probe_group] += bytes;
+      ++capture_counts[bam_probe_group];
+      std::error_code ec;
+      std::filesystem::create_directories(directory, ec);
+      const auto stem = directory / (std::to_string(item.mesh) + "-" + std::to_string(item.fingerprint));
+      std::ofstream vertices(stem.string() + ".vertices.bin", std::ios::binary);
+      std::ofstream indices(stem.string() + ".indices.bin", std::ios::binary);
+      std::ofstream metadata(stem.string() + ".txt");
+      vertices.write(reinterpret_cast<const char*>(bam_capture_vertices.data()), bam_capture_vertices.size() * sizeof(float));
+      indices.write(reinterpret_cast<const char*>(dst_ib), size_t(item.ib_count) * 2);
+      metadata << "format=decoded-v1 float32-le stride=56 index=u16-le\n"
+          << "mesh=" << item.mesh << " guid=" << item.diffuse_guid << " material=" << item.material_name
+          << " family=" << unsigned(item.env_family) << " sheet=" << two_sided
+          << " probe_group=" << bam_probe_group
+          << " pos_fmt=" << unsigned(item.pos_fmt)
+          << " vertices=" << num_verts << " indices=" << item.ib_count << "\nworld=";
+      for (float f : item.world) metadata << f << ',';
+      metadata << "\nbbox_min=";
+      for (float f : item.bbox_min) metadata << f << ',';
+      metadata << "\nbbox_max=";
+      for (float f : item.bbox_max) metadata << f << ',';
+      metadata << "\nranges=" << DescribeDrawRanges(item.draws) << '\n';
+      vertices.flush(); indices.flush(); metadata.flush();
+      REXLOG_INFO("world-geometry-capture: mesh={:08X} guid={:016X} material={} ok={} path={} bytes={}",
+          item.mesh, item.diffuse_guid, item.material_name,
+          !ec && bool(vertices) && bool(indices) && bool(metadata), stem.string(), bytes);
     }
   }
   device->Unmap(ib);
@@ -2299,7 +2731,8 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
   const xenos::TextureFormat cube_base_fmt = rex::graphics::GetBaseFormat(info.format);
   const bool rgba_chain =
       (cube_base_fmt == xenos::TextureFormat::k_DXT1 ||
-       cube_base_fmt == xenos::TextureFormat::k_8_8_8_8) &&
+       cube_base_fmt == xenos::TextureFormat::k_8_8_8_8 ||
+       cube_base_fmt == xenos::TextureFormat::k_5_6_5) &&
       width >= 8 && (width & (width - 1)) == 0 && width == height;
   uint32_t mip_levels = 1;
   if (!rgba_chain && info.memory.mip_address != 0 && (width & (width - 1)) == 0 &&
@@ -2328,7 +2761,12 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
     uint32_t ox = 0, oy = 0;
     L.addr = m == 0 ? info.memory.base_address : info.GetMipLocation(m, &ox, &oy, true);
     L.pitch_blocks = ext.block_pitch_h;
-    L.slice_bytes = ext.block_pitch_h * ext.block_pitch_v * bytes_per_block;
+    // Cube faces are separate Xenos array subresources, each page-aligned.
+    // A 32x32 565 face occupies 2048 texel bytes but has a 4096-byte stride;
+    // using the raw texel size read padding as every other reflection face.
+    const uint32_t face_bytes = ext.block_pitch_h * ext.block_pitch_v * bytes_per_block;
+    L.slice_bytes = (face_bytes + xenos::kTextureSubresourceAlignmentBytes - 1u) &
+                    ~(xenos::kTextureSubresourceAlignmentBytes - 1u);
     const uint32_t mw = std::max(width >> m, 1u);
     const uint32_t mh = std::max(height >> m, 1u);
     L.cols = (mw + block_w - 1) / block_w;
@@ -2440,6 +2878,15 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
               std::memcpy(&rgba[(size_t(by * 4 + r) * width + bx * 4) * 4],
                           px[r * 4], 16);
             }
+          }
+        } else if (cube_base_fmt == xenos::TextureFormat::k_5_6_5) {
+          // Unlike BC1 endpoints, plain Xenos 565 is low-X/high-Z.
+          // The old cube copy omitted the conversion used by 2D textures,
+          // reversing reflection colours (blue water became orange).
+          for (uint32_t x = 0; x < width; ++x) {
+            uint16_t value;
+            std::memcpy(&value, bc_row.data() + size_t(x) * 2, 2);
+            skate3::texture::Decode565(value, &rgba[(size_t(by) * width + x) * 4]);
           }
         } else {
           // k_8_8_8_8: post-endian-swap bytes are already component order
@@ -2612,6 +3059,14 @@ bool EnsureGuestCubeTexture(const NativeGuestOutputRenderContext& context, uint8
                       bytes_per_block);
         }
         SwapGuestEndian(out_row, row_bytes, info.endianness);
+        if (cube_base_fmt == xenos::TextureFormat::k_5_6_5) {
+          for (uint32_t x = 0; x < row_bytes; x += 2) {
+            uint16_t value;
+            std::memcpy(&value, out_row + x, 2);
+            value = skate3::texture::Host565(value);
+            std::memcpy(out_row + x, &value, 2);
+          }
+        }
       }
     }
   }
@@ -2743,9 +3198,11 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     // overlay.w == 4 (pair bound).
     ld.params[5] = {nrhi::BindingParamKind::kTextureTable, 4, 2,
                     nrhi::Visibility::kPixel};
-    // Dynamic-shadow additions: per-frame receiver constants (b1).
+    // Dynamic-shadow additions: per-frame receiver constants (b1). Visible
+    // to the VS too (Skate 2 vertex-animation rows); visibility costs no
+    // root-signature DWORDs.
     ld.params[6] = {nrhi::BindingParamKind::kConstantBuffer, /*b*/ 1, 1,
-                    nrhi::Visibility::kPixel};
+                    nrhi::Visibility::kAll};
     // Environment cube (t6) + blurred shadow atlas (t7) as ONE two-entry
     // table (bound together via SetTexturePair); merging them freed the
     // root-signature DWORD the v2 material table below needs.
@@ -2757,7 +3214,7 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     // existing table costs no root-signature DWORDs. Bound together via
     // SetTextures (a pair-only bind would drop t10 to the backend
     // fallback).
-    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 3,
+    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 4,
                     nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
@@ -2803,9 +3260,12 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   // previous pipelines (in-flight frames keep them alive via the deferred
   // destruction queue).
   for (nrhi::Pipeline** p :
-       {&g_r.pso, &g_r.pso_cullback, &g_r.pso_transparent, &g_r.pso_fade,
+       {&g_r.pso, &g_r.pso_bam_zbias, &g_r.pso_cullback, &g_r.pso_transparent, &g_r.pso_fade,
         &g_r.pso_hair_a, &g_r.pso_hair_b, &g_r.pso_nodepth,
-        &g_r.pso_outline_mask}) {
+        &g_r.pso_outline_mask, &g_r.pso_s2_add[0], &g_r.pso_s2_add[1],
+        &g_r.pso_s2_add[2], &g_r.pso_s2_add[3], &g_r.pso_indicator_xray,
+        &g_r.pso_s2_decal[0], &g_r.pso_s2_decal[1], &g_r.pso_s2_trans[0],
+        &g_r.pso_s2_trans[1]}) {
     if (*p != nullptr) {
       device->DestroyDeferred(*p);
       *p = nullptr;
@@ -2854,7 +3314,8 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   pso.depth_clip = true;
   pso.depth.test_enable = true;
   pso.depth.write_enable = true;
-  pso.depth.func = nrhi::CompareFunc::kLess;
+  // Reversed-Z scene depth (see RebasedViewProj): nearer = greater.
+  pso.depth.func = kReversedZ ? nrhi::CompareFunc::kGreater : nrhi::CompareFunc::kLess;
   pso.rtv_format = scene_fmt;
   pso.dsv_format = nrhi::Format::kD32_FLOAT;
   pso.sample_count = g_r.msaa;
@@ -2873,6 +3334,19 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
     REXLOG_WARN("native-scene: cull-back PSO creation failed");
     // sheets fall back to the uncull(ed) PSO
   }
+  // Skate2 zbiasincandescent*.xml: DEPTHBIAS=-0.0001 and slope=1.
+  // D32 near the far end of [0,1) has ULP=2^-24. Preserve the authored
+  // offset there (ceil away from zero), with the usual float-depth scaling
+  // for nearer primitives. Restrict this material correction to BAM draws.
+  // Reversed Z: the constant part rides in the item's projection matrix
+  // (draw_item, +1678 * 2^-24 of reversed depth); the slope term keeps its
+  // magnitude with the sign of the reversed depth axis.
+  pso.depth_bias = kReversedZ ? 0 : -1678;
+  pso.depth_bias_slope = kReversedZ ? -1.0f : 1.0f;
+  g_r.pso_bam_zbias = device->CreateGraphicsPipeline(pso);
+  if (!g_r.pso_bam_zbias) REXLOG_WARN("native-scene: BAM depth-bias PSO creation failed");
+  pso.depth_bias = 0;
+  pso.depth_bias_slope = 0.0f;
   pso.cull = nrhi::CullMode::kNone;
   // Transparent variant: straight alpha blend, depth-tested, no z-write.
   pso.depth.write_enable = false;
@@ -2884,6 +3358,11 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   pso.blend.dst_alpha = nrhi::BlendFactor::kInvSrcAlpha;
   pso.blend.op_alpha = nrhi::BlendOp::kAdd;
   g_r.pso_transparent = device->CreateGraphicsPipeline(pso);
+  // visualindicator x-ray variant: the transparent blend without the depth
+  // test (see skate3_native_render_scene_indicator_xray).
+  pso.depth.test_enable = false;
+  g_r.pso_indicator_xray = device->CreateGraphicsPipeline(pso);
+  pso.depth.test_enable = true;
   // Entity-fade variant: z-write ON (see RendererState::pso_fade). Drawn
   // at the head of the blended sub-pass so glass/hair still composite
   // over the faded body.
@@ -2900,6 +3379,92 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   g_r.pso_hair_a = device->CreateGraphicsPipeline(pso);
   pso.cull = nrhi::CullMode::kFront;
   g_r.pso_hair_b = device->CreateGraphicsPipeline(pso);
+  // Skate 2 additive effects (zbiasincandescent / transparentincandescent /
+  // glare / godrayspotlight technique XMLs: SRCBLEND ONE, DESTBLEND ONE,
+  // ADD; zbiasincandescent also COLORWRITE RGB, all four leave the scene
+  // alpha alone here). CULLMODE FRONT maps to our kFront (the banner
+  // calibration above); glare sets no cull state.
+  {
+    nrhi::GraphicsPipelineDesc add = pso;
+    add.blend.enable = true;
+    add.blend.src = nrhi::BlendFactor::kOne;
+    add.blend.dst = nrhi::BlendFactor::kOne;
+    add.blend.op = nrhi::BlendOp::kAdd;
+    add.blend.src_alpha = nrhi::BlendFactor::kZero;
+    add.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    add.blend.op_alpha = nrhi::BlendOp::kAdd;
+    add.blend.write_mask = 0x7;
+    add.cull = nrhi::CullMode::kFront;
+    add.depth.write_enable = true;
+    add.depth_bias = kReversedZ ? 0 : -1678;  // same split as pso_bam_zbias
+    add.depth_bias_slope = kReversedZ ? -1.0f : 1.0f;
+    g_r.pso_s2_add[0] = device->CreateGraphicsPipeline(add);
+    add.depth_bias = 0;
+    add.depth_bias_slope = 0.0f;
+    g_r.pso_s2_add[1] = device->CreateGraphicsPipeline(add);
+    add.depth.write_enable = false;
+    add.cull = nrhi::CullMode::kNone;
+    g_r.pso_s2_add[2] = device->CreateGraphicsPipeline(add);
+    add.cull = nrhi::CullMode::kFront;
+    g_r.pso_s2_add[3] = device->CreateGraphicsPipeline(add);
+    for (nrhi::Pipeline* p : g_r.pso_s2_add) {
+      if (p == nullptr) REXLOG_WARN("native-scene: Skate 2 additive PSO creation failed");
+    }
+  }
+  // Skate 2 decalzbias.xml (decal.default, s2_blend 5): SRCALPHA /
+  // INVSRCALPHA, COLORWRITE RGB, z-write, DEPTHBIAS -0.0001 slope 1 (the
+  // pso_bam_zbias split: the constant rides in the matrix under reversed
+  // Z), CULLMODE FRONT (our kFront, the banner calibration above);
+  // [1] = mirrored instances (flipped winding keeps the same faces).
+  {
+    nrhi::GraphicsPipelineDesc dec = pso;
+    dec.blend.enable = true;
+    dec.blend.src = nrhi::BlendFactor::kSrcAlpha;
+    dec.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+    dec.blend.op = nrhi::BlendOp::kAdd;
+    dec.blend.src_alpha = nrhi::BlendFactor::kZero;
+    dec.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    dec.blend.op_alpha = nrhi::BlendOp::kAdd;
+    dec.blend.write_mask = 0x7;
+    dec.depth.write_enable = true;
+    dec.depth_bias = kReversedZ ? 0 : -1678;
+    dec.depth_bias_slope = kReversedZ ? -1.0f : 1.0f;
+    dec.cull = nrhi::CullMode::kFront;
+    g_r.pso_s2_decal[0] = device->CreateGraphicsPipeline(dec);
+    dec.cull = nrhi::CullMode::kBack;
+    g_r.pso_s2_decal[1] = device->CreateGraphicsPipeline(dec);
+    for (nrhi::Pipeline* p : g_r.pso_s2_decal) {
+      if (p == nullptr) REXLOG_WARN("native-scene: Skate 2 decal PSO creation failed");
+    }
+  }
+  // Skate 2 transparentenvironment.xml (environment.transparent in New San
+  // Van): SRCALPHA / INVSRCALPHA, COLORWRITE RGB, z-write ON, CULLMODE
+  // FRONT (our kFront), ALPHAREF 16 on a^2 in the shader; no depth bias.
+  // [1] = mirrored instances. The Skate 3 transparent state (cull none,
+  // z-write off) drew every layer of the nearly opaque Waterfront sail
+  // canopies (diffuse alpha 239-255) in index order, far faces and inner
+  // panels over the near ones.
+  {
+    nrhi::GraphicsPipelineDesc tr = pso;
+    tr.blend.enable = true;
+    tr.blend.src = nrhi::BlendFactor::kSrcAlpha;
+    tr.blend.dst = nrhi::BlendFactor::kInvSrcAlpha;
+    tr.blend.op = nrhi::BlendOp::kAdd;
+    tr.blend.src_alpha = nrhi::BlendFactor::kZero;
+    tr.blend.dst_alpha = nrhi::BlendFactor::kOne;
+    tr.blend.op_alpha = nrhi::BlendOp::kAdd;
+    tr.blend.write_mask = 0x7;
+    tr.depth.write_enable = true;
+    tr.depth_bias = 0;
+    tr.depth_bias_slope = 0.0f;
+    tr.cull = nrhi::CullMode::kFront;
+    g_r.pso_s2_trans[0] = device->CreateGraphicsPipeline(tr);
+    tr.cull = nrhi::CullMode::kBack;
+    g_r.pso_s2_trans[1] = device->CreateGraphicsPipeline(tr);
+    for (nrhi::Pipeline* p : g_r.pso_s2_trans) {
+      if (p == nullptr) REXLOG_WARN("native-scene: Skate 2 transparent PSO creation failed");
+    }
+  }
   pso.cull = nrhi::CullMode::kNone;
   pso.blend = {};
   pso.depth.write_enable = true;
@@ -3212,7 +3777,8 @@ bool EnsureSplinePsos(const NativeGuestOutputRenderContext& context) {
     sp.depth_clip = true;
     sp.depth.test_enable = true;
     sp.depth.write_enable = false;
-    sp.depth.func = nrhi::CompareFunc::kLessEqual;
+    sp.depth.func = kReversedZ ? nrhi::CompareFunc::kGreaterEqual
+                               : nrhi::CompareFunc::kLessEqual;
     sp.input_elements = input_spline;
     sp.input_element_count = 3;
     sp.vertex_stride = 28;
@@ -3300,6 +3866,14 @@ bool EnsureShadowPsos(const NativeGuestOutputRenderContext& context) {
     g_r.pso_shadow_caster = device->CreateGraphicsPipeline(cp);
     cp.ps = cpc;
     g_r.pso_shadow_caster_clip = device->CreateGraphicsPipeline(cp);
+    // Hall of Meat bone depth mask (see RendererState::pso_hom_depth): the
+    // same MIN-blend depth write through the MAIN camera, near-plane clip on.
+    cp.ps = cps;
+    cp.depth_clip = true;
+    g_r.pso_hom_depth = device->CreateGraphicsPipeline(cp);
+    if (g_r.pso_hom_depth == nullptr) {
+      REXLOG_WARN("native-scene: HoM depth-mask PSO creation failed (bones grade with the chain)");
+    }
     nrhi::GraphicsPipelineDesc bp;
     bp.layout = g_r.layout;
     bp.vs = bvs;
@@ -3706,6 +4280,15 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
     }
     device->DestroyDeferred(g_r.static_sun);
     g_r.static_sun = nullptr;
+    if (g_r.static_sun_back_srv != nullptr) {
+      device->DestroyDeferred(g_r.static_sun_back_srv);
+      g_r.static_sun_back_srv = nullptr;
+    }
+    if (g_r.static_sun_back != nullptr) {
+      device->DestroyDeferred(g_r.static_sun_back);
+      g_r.static_sun_back = nullptr;
+    }
+    g_r.nsm_build.active = false;
     g_r.nsm_built_radius = 0.0f;
   }
   if (!g_r.static_sun && g_r.shadow_raw != nullptr &&
@@ -3749,9 +4332,29 @@ bool EnsureShadowResources(const NativeGuestOutputRenderContext& context) {
       return false;
     }
     g_r.static_sun_in_srv = false;
+    // Back atlas for rebuilds spread over several frames (see
+    // RendererState::static_sun_back). Up to 4096 per tile (192 MB each);
+    // larger maps, or a failed allocation, rebuild in one frame instead.
+    if (g_r.static_sun_size <= 4096) {
+      desc.width = g_r.static_sun_size * 3;
+      desc.height = g_r.static_sun_size;
+      g_r.static_sun_back = device->CreateTexture(desc);
+      if (g_r.static_sun_back != nullptr) {
+        nrhi::TextureViewDesc vd;
+        vd.mip_levels = 1;
+        g_r.static_sun_back_srv = device->CreateTextureView(g_r.static_sun_back, vd);
+        if (g_r.static_sun_back_srv == nullptr) {
+          device->DestroyDeferred(g_r.static_sun_back);
+          g_r.static_sun_back = nullptr;
+        }
+      }
+    }
+    g_r.static_sun_back_in_srv = false;
     REXLOG_INFO(
-        "native-scene: static sun-shadow map created ({}x{}, 3 cascades)",
-        g_r.static_sun_size * 3, g_r.static_sun_size);
+        "native-scene: static sun-shadow map created ({}x{}, 3 cascades; rebuilds {})",
+        g_r.static_sun_size * 3, g_r.static_sun_size,
+        g_r.static_sun_back != nullptr ? "spread over frames into a second map"
+                                       : "in one frame (no second map)");
   }
   if (!g_r.shadow_cb) {
     // Always created (even with shadows off): the scene PS declares b1 and
@@ -3943,6 +4546,43 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
     }
     g_r.white.valid = true;
   }
+  if (!g_r.chroma_neutral.valid) {
+    nrhi::TextureDesc desc;
+    desc.width = 1;
+    desc.height = 1;
+    desc.format = nrhi::Format::kR8G8B8A8_UNORM;
+    desc.initial_state = nrhi::ResourceState::kCopyDest;
+    g_r.chroma_neutral.texture = device->CreateTexture(desc);
+    if (g_r.chroma_neutral.texture == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
+    g_r.chroma_neutral.upload = CreateUploadBuffer(device, 256, nrhi::BufferBindClass::kCopySrc);
+    if (!g_r.chroma_neutral.upload) {
+      g_r.failed = true;
+      return false;
+    }
+    // New San Van's mean chromaticity over its 917 chromo pages
+    // (out/research/log150 lm_nsv.json): 0.309, 0.332, 0.346.
+    uint8_t* mapping = static_cast<uint8_t*>(device->Map(g_r.chroma_neutral.upload));
+    const uint8_t neutral[4] = {79, 85, 88, 255};
+    std::memcpy(mapping, neutral, sizeof(neutral));
+    device->Unmap(g_r.chroma_neutral.upload);
+    context.cmd->CopyBufferToTexture(g_r.chroma_neutral.texture, 0, 0,
+                                     g_r.chroma_neutral.upload, 0, 256, 1, 1, 1);
+    context.cmd->Barrier(g_r.chroma_neutral.texture, nrhi::ResourceState::kCopyDest,
+                         nrhi::ResourceState::kPixelShaderResource);
+    g_r.device->DestroyDeferred(g_r.chroma_neutral.upload);
+    g_r.chroma_neutral.upload = nullptr;
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.chroma_neutral.srv = device->CreateTextureView(g_r.chroma_neutral.texture, vd);
+    if (g_r.chroma_neutral.srv == nullptr) {
+      g_r.failed = true;
+      return false;
+    }
+    g_r.chroma_neutral.valid = true;
+  }
   if (!g_r.white_cube.valid) {
     // 1x1x6 mid-gray fallback cube for the water reflection slot (t6): a
     // TextureCube SRV must always be bound where the shader declares one.
@@ -4036,7 +4676,7 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
     desc.sample_count = g_r.msaa;
     desc.usage = nrhi::kTextureUsageDepthStencil;
     desc.initial_state = nrhi::ResourceState::kDepthWrite;
-    desc.clear_depth = 1.0f;
+    desc.clear_depth = kReversedZ ? 0.0f : 1.0f;
     g_r.depth = g_r.device->CreateTexture(desc);
     if (g_r.depth == nullptr) {
       g_r.failed = true;
@@ -4271,6 +4911,7 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   const auto within = [&] { return std::chrono::steady_clock::now() < deadline; };
 
   bool need_mesh = false;
+  std::array<TexStickySite, kTexStickySlots> carried_sticky{};  // MeshBuffers::sticky
   auto mit = g_r.meshes.find(item.mesh);
   if (mit == g_r.meshes.end()) {
     need_mesh = true;
@@ -4289,6 +4930,9 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
         REXLOG_DEBUG("native-scene: settle mesh REVALIDATE mesh={:08X} fp {:016X}->{:016X}",
                      item.mesh, mit->second.fingerprint, item.fingerprint);
       }
+      if (mit->second.identity == 0 || mit->second.identity == MeshIdentity(item)) {
+        carried_sticky = mit->second.sticky;  // same mesh refilled
+      }
       PoolMeshBuffer(g_r.device, mit->second.vb);
       PoolMeshBuffer(g_r.device, mit->second.ib);
       g_r.meshes.erase(mit);
@@ -4306,6 +4950,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       if (DecodeMesh(g_r.device, base, item, buffers)) {
         buffers.fingerprint = item.fingerprint;
         buffers.last_used_frame = frame_number;
+        buffers.sticky = carried_sticky;
+        buffers.identity = MeshIdentity(item);
         g_r.meshes.emplace(item.mesh, buffers);
       }
       // Failures retry through the draw path (logged + counted there).
@@ -4420,7 +5066,8 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
   // Environment cube (negative-cached like the draw path).
   if ((item.water || item.char_family >= 6 ||
        (item.env_family >= 5 && item.env_family <= 6) ||
-       item.env_family == 13) &&
+       item.env_family == 13 ||
+       (item.s2_env && REXCVAR_GET(skate3_skate2_env_specular))) &&
       item.water_env != 0 && !g_r.cube_textures.contains(item.water_env)) {
     if (!within()) {
       ++wc.deferred;
@@ -4624,6 +5271,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   stage_texture(item.diffuse_tex);
   if (REXCVAR_GET(skate3_native_render_scene_lightmaps)) {
     stage_texture(item.lightmap_tex);
+    stage_texture(item.chromaticity_tex);
   }
   if (REXCVAR_GET(skate3_native_render_scene_macro)) {
     stage_texture(item.macro_tex);
@@ -4661,6 +5309,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
 }
 
 void PrewarmWorkerLoop() {
+  skate3::perf_recorder::NameCurrentThread("Native decode worker");
 #if defined(_WIN32)
   // Below-normal priority: the workers flood in exactly when the guest's
   // single-threaded world ACTIVATION runs (registration is the final load
@@ -4859,9 +5508,16 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         PoolMeshBuffer(g_r.device, r.buffers.ib);
         mit->second.last_used_frame = frame_number;
       } else {
+        r.buffers.identity = MeshIdentity(r.item);
         if (mit != g_r.meshes.end()) {
           // Stale decode (miss-driven revalidation heal): swap it out. The
-          // old buffers may be referenced by the in-flight submission.
+          // old buffers may be referenced by the in-flight submission. The
+          // sticky history carries over only for the same mesh refilled.
+          if (mit->second.identity == 0 || mit->second.identity == r.buffers.identity) {
+            r.buffers.sticky = mit->second.sticky;
+          } else {
+            g_mesh_identity_resets.fetch_add(1, std::memory_order_relaxed);
+          }
           PoolMeshBuffer(g_r.device, mit->second.vb);
           PoolMeshBuffer(g_r.device, mit->second.ib);
           g_r.meshes.erase(mit);
@@ -5076,6 +5732,17 @@ bool g_loading_native_frame = false;
 // loading screen, so yielding there would flash the stale pre-load frame.
 bool g_loading_hold = false;
 
+// Drops every static sun-map caster record with its bounds, index, pending
+// additions and any rebuild in progress (indices would dangle).
+void ClearStaticCasterCache() {
+  g_r.static_casters.clear();
+  g_r.static_caster_bounds.clear();
+  g_r.static_caster_index.clear();
+  g_r.nsm_pending.clear();
+  g_r.nsm_build.active = false;
+  g_r.nsm_build.late.clear();
+}
+
 // Menus / pause / loading yield gate (see the comment at the call site):
 // returns true when RenderScene must yield this frame to the emulated
 // output. Handles the cache clears on entry and the takeover re-arm +
@@ -5271,10 +5938,14 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       // records whose meshes survive the transition would keep casting
       // (an entire arriving area sat under the previous map's building
       // shadows). Invalidate the sun map with it.
-      g_r.static_casters.clear();
+      ClearStaticCasterCache();
+      // Pending-texture waits are keyed by guest object address, which the
+      // next map reuses for different content.
+      g_r.tex_pending_first.clear();
       g_r.nsm_dirty = true;
       g_r.static_sun_valid = false;
       g_r.nsm_built_radius = 0.0f;
+      g_r.nsm_capture_seen = false;
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
       g_prewarm_seen.clear();
       g_prewarm_tex_seen.clear();
@@ -5973,7 +6644,7 @@ bool YieldForCasEditor(uint8_t* base) {
   }
   if (signal == nullptr) {
     // Shader heartbeat: the editor's own "_nis" pixel shaders were set
-    // within the last 0.5 s (see IsCasEditorPs): covers editor entry
+    // within the last 0.5 s (see ClassifyBoundShader): covers editor entry
     // points that use a different FE screen id (the startup new-game flow
     // stayed NATIVE on the FE detection alone).
     const int64_t last_ns = g_cas_ps_last_ns.load(std::memory_order_relaxed);
@@ -6019,7 +6690,9 @@ void ReleaseRetiredAndFlushCaches(const NativeGuestOutputRenderContext& context)
     g_r.tex_store.clear();
     g_r.tex_routes.clear();
     g_r.words_sticky.clear();
-    g_r.tex_sticky.clear();
+    for (auto& [key, m] : g_r.meshes) {
+      m.sticky = {};
+    }
     g_r.tex_pending_first.clear();
     REXLOG_INFO("native-scene: texture cache flushed (debug dialog)");
   }
@@ -6076,13 +6749,348 @@ static nrhi::TextureView* LookupResolvedTexture(uint32_t tex_ptr) {
 // plan-view footprint. This map gives static shade a true sun axis, a
 // full-range depth window (no clamp blobs) and its own resolution;
 // receivers min it with the CSM term (SampleStaticSun), bottoming out at
-// the configured strength. Re-rendered every frame; the box follows the
-// camera, with the origin snapped to the texel grid so the static raster
-// never swims sub-texel (foliage shimmer).
+// the configured strength. The box follows the camera, with the origin
+// snapped to the texel grid so the static raster never swims sub-texel
+// (foliage shimmer).
+//
+// Per-frame cost is bounded independently of the session-grown caster
+// cache (run 158: a full rebuild walked the whole cache per tile and cost
+// 8-15 ms at 13,000 cached casters, every 30 frames while moving in dense
+// New San Van areas; the "every second or so" stutter):
+// - records are contiguous with compact world bounds, culled before any
+//   record or mesh-store lookup;
+// - newly seen or changed casters are added to the SERVED map as they
+//   arrive (MIN blend accumulates order-independently), never by a redraw;
+// - a full rebuild (camera drift, sun change, periodic, content changed in
+//   place) renders into the back atlas over as many frames as the budget
+//   needs and swaps in with its rows when complete.
+
+// Cascade ratios (keep in sync with SampleStaticSun's kRatioInner /
+// kRatioMid) and per-tile cull thresholds in FAR uc units (finer tiles
+// cover 1/ratio of the far extent), with a 5% margin.
+constexpr float kNsmRatioMid = 2.0f;
+constexpr float kNsmRatioInner = 6.0f;
+constexpr float kNsmTileCull[3] = {1.05f / kNsmRatioInner, 1.05f / kNsmRatioMid, 1.05f};
+
+// World AABB (center + half extents) of a record's mesh box under its
+// transform. World-space statics (Skate 2's BAM cells, Skate 3's own
+// pre-transformed scenery) carry an identity transform; the bounds, not
+// the translation, say where they are.
+RendererState::CasterBounds StaticCasterBounds(const RendererState::StaticCaster& rec) {
+  float lo[3] = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                 std::numeric_limits<float>::max()};
+  float hi[3] = {-lo[0], -lo[1], -lo[2]};
+  for (int corner = 0; corner < 8; ++corner) {
+    const float px = (corner & 1) ? rec.bbox_max[0] : rec.bbox_min[0];
+    const float py = (corner & 2) ? rec.bbox_max[1] : rec.bbox_min[1];
+    const float pz = (corner & 4) ? rec.bbox_max[2] : rec.bbox_min[2];
+    for (int a = 0; a < 3; ++a) {
+      const float w = px * rec.world[0 + a] + py * rec.world[4 + a] + pz * rec.world[8 + a] +
+                      rec.world[12 + a];
+      lo[a] = std::min(lo[a], w);
+      hi[a] = std::max(hi[a], w);
+    }
+  }
+  RendererState::CasterBounds b;
+  for (int a = 0; a < 3; ++a) {
+    b.c[a] = 0.5f * (lo[a] + hi[a]);
+    b.h[a] = 0.5f * (hi[a] - lo[a]);
+  }
+  b.clip = rec.clip ? 1u : 0u;
+  return b;
+}
+
+// Swap-removes record i and its bounds, repointing the moved record's key.
+void RemoveStaticCaster(size_t i) {
+  auto& recs = g_r.static_casters;
+  auto& bounds = g_r.static_caster_bounds;
+  g_r.static_caster_index.erase(recs[i].key);
+  const size_t last = recs.size() - 1;
+  if (i != last) {
+    recs[i] = std::move(recs[last]);
+    bounds[i] = bounds[last];
+    g_r.static_caster_index[recs[i].key] = uint32_t(i);
+  }
+  recs.pop_back();
+  bounds.pop_back();
+}
+
+// Queues record idx for addition to the served map (once at a time).
+void NsmQueueCaster(uint32_t idx) {
+  RendererState::StaticCaster& rec = g_r.static_casters[idx];
+  if (!rec.queued) {
+    rec.queued = true;
+    g_r.nsm_pending.push_back({rec.key, 0});
+  }
+}
+
+// Exact projection of a caster's world box onto map rows: can it touch
+// tile `tile`?
+bool NsmCasterInTile(const RendererState::CasterBounds& b, const float* rows, int tile) {
+  const float cull = kNsmTileCull[tile];
+  const float u = rows[0] * b.c[0] + rows[1] * b.c[1] + rows[2] * b.c[2] + rows[3];
+  const float eu = std::fabs(rows[0]) * b.h[0] + std::fabs(rows[1]) * b.h[1] +
+                   std::fabs(rows[2]) * b.h[2];
+  if (u - eu > cull || u + eu < -cull) {
+    return false;
+  }
+  const float v = rows[4] * b.c[0] + rows[5] * b.c[1] + rows[6] * b.c[2] + rows[7];
+  const float ev = std::fabs(rows[4]) * b.h[0] + std::fabs(rows[5]) * b.h[1] +
+                   std::fabs(rows[6]) * b.h[2];
+  return !(v - ev > cull || v + ev < -cull);
+}
+
+void NsmSetTile(nrhi::Cmd* cmd, int tile) {
+  const float size = float(g_r.static_sun_size);
+  cmd->SetViewport(nrhi::Viewport{size * tile, 0.0f, size, size, 0.0f, 1.0f});
+  cmd->SetScissor(nrhi::Rect{int32_t(g_r.static_sun_size) * tile, 0,
+                             int32_t(g_r.static_sun_size) * (tile + 1),
+                             int32_t(g_r.static_sun_size)});
+}
+
+// Binds a static sun atlas as the render target for caster draws.
+void NsmBindTarget(nrhi::Cmd* cmd, nrhi::Texture* target, bool& in_srv,
+                   uint32_t bone_region) {
+  if (in_srv) {
+    cmd->Barrier(target, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kRenderTarget);
+    cmd->FlushBarriers();
+    in_srv = false;
+  }
+  cmd->SetRenderTargets(target, nullptr);
+  cmd->SetBindingLayout(g_r.layout);
+  cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
+}
+
+void NsmReleaseTarget(nrhi::Cmd* cmd, nrhi::Texture* target, bool& in_srv) {
+  cmd->Barrier(target, nrhi::ResourceState::kRenderTarget,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  in_srv = true;
+}
+
+// Rasterizes one cached caster into the bound tile with view-projection
+// tvp. False when its mesh is not resident, or the arena address was
+// reused for different content (drawing it would raster a foreign mesh
+// into the map); the record refreshes the next time the item is seen.
+bool NsmDrawCaster(nrhi::Cmd* cmd, const RendererState::StaticCaster& rec, const float* tvp,
+                   int tile, uint32_t bone_region, uint64_t frame_number,
+                   nrhi::Pipeline*& bound_pipeline) {
+  auto mit = g_r.meshes.find(rec.mesh);
+  if (mit == g_r.meshes.end() || mit->second.fingerprint != rec.fingerprint) {
+    return false;
+  }
+  // NSM casters cover a wide radius the main pass never draws; touch the
+  // LRU clock so the cascades keep their meshes resident.
+  mit->second.last_used_frame = frame_number;
+  nrhi::Pipeline* pso = rec.clip ? g_r.pso_shadow_caster_clip : g_r.pso_shadow_caster;
+  if (pso != bound_pipeline) {
+    cmd->SetPipeline(pso);
+    bound_pipeline = pso;
+  }
+  float constants[52] = {};
+  std::memcpy(constants, rec.world, sizeof(rec.world));
+  constexpr float kNoOrigin[3] = {0.0f, 0.0f, 0.0f};
+  RebasedViewProj(tvp, kNoOrigin, constants + 16);
+  // Foliage alpha LOD bias per tile (misc.x = 100 + bias, read by
+  // ps_shadow_caster_clip): +2 on the inner tile softens leaf dapple into
+  // blobs; the mid/far tiles already rasterize 3x/6x coarser, and the same
+  // +2 there turned canopies into 20-70 cm blocks. The bias shrinks by
+  // log2 of the density ratio so every tile pre-filters the alpha to about
+  // the same world size.
+  constexpr float kTileAlphaBias[3] = {2.0f, 0.415f, 0.0f};
+  constants[48] = 100.0f + kTileAlphaBias[tile];
+  cmd->SetRootConstants(0, 52, constants, 0);
+  cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
+  if (rec.clip) {
+    nrhi::TextureView* srv = LookupResolvedTexture(rec.diffuse_tex);
+    cmd->SetTexture(1, srv != nullptr ? srv : g_r.white.srv);
+  }
+  cmd->SetVertexBuffer(mit->second.vb_view.buffer, mit->second.vb_view.offset,
+                       mit->second.vb_view.size_bytes, mit->second.vb_view.stride);
+  cmd->SetIndexBuffer(mit->second.ib_view.buffer, mit->second.ib_view.offset,
+                      mit->second.ib_view.size_bytes);
+  for (const DrawEntry& draw : rec.draws) {
+    if (draw.prim == 4) {
+      cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
+    } else if (draw.prim == 6) {
+      cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleStrip);
+    } else {
+      continue;
+    }
+    cmd->DrawIndexed(draw.index_count, draw.start_index, draw.base_vertex);
+  }
+  return true;
+}
+
+// Draws a caster into every tile of `rows` it touches. False when its mesh
+// was not resident.
+bool NsmDrawCasterAllTiles(nrhi::Cmd* cmd, uint32_t idx, const float* rows,
+                           const float (*vp)[16], uint32_t bone_region,
+                           uint64_t frame_number, nrhi::Pipeline*& bound_pipeline,
+                           uint32_t* draws) {
+  const RendererState::CasterBounds& b = g_r.static_caster_bounds[idx];
+  const RendererState::StaticCaster& rec = g_r.static_casters[idx];
+  for (int tile = 0; tile < 3; ++tile) {
+    if (!NsmCasterInTile(b, rows, tile)) {
+      continue;
+    }
+    NsmSetTile(cmd, tile);
+    if (!NsmDrawCaster(cmd, rec, vp[tile], tile, bone_region, frame_number, bound_pipeline)) {
+      return false;
+    }
+    ++*draws;
+  }
+  return true;
+}
+
+// Per-tile view-projections from map rows: the far transform, and the mid
+// and inner tiles as exact rescales of its X/Y columns (same origin; the
+// shader selects tiles by the same ratios). Snapping used the FAR texel
+// grid, whose multiples are also finer-texel multiples (integer 1:2:6
+// chain), so every tile stays swim-free.
+void NsmTileViewProj(const float rows[12], float (*vp)[16]) {
+  float far_vp[16] = {};
+  for (int r = 0; r < 3; ++r) {
+    far_vp[r * 4 + 0] = rows[0 + r];
+    far_vp[r * 4 + 1] = rows[4 + r];
+    far_vp[r * 4 + 2] = rows[8 + r];
+  }
+  far_vp[12] = rows[3];
+  far_vp[13] = rows[7];
+  far_vp[14] = rows[11];
+  far_vp[15] = 1.0f;
+  std::memcpy(vp[2], far_vp, sizeof(far_vp));
+  std::memcpy(vp[1], far_vp, sizeof(far_vp));
+  std::memcpy(vp[0], far_vp, sizeof(far_vp));
+  for (int r = 0; r < 4; ++r) {
+    vp[1][r * 4 + 0] *= kNsmRatioMid;
+    vp[1][r * 4 + 1] *= kNsmRatioMid;
+    vp[0][r * 4 + 0] *= kNsmRatioInner;
+    vp[0][r * 4 + 1] *= kNsmRatioInner;
+  }
+}
+
+// Continues the rebuild in g_r.nsm_build until it completes or the deadline
+// passes (has_deadline false = run to completion). On completion the map
+// it rendered becomes the served map, with its rows.
+void RunNsmBuild(nrhi::Cmd* cmd, uint32_t bone_region, uint64_t frame_number,
+                 bool has_deadline, PerfClock::time_point deadline) {
+  RendererState::NsmBuild& b = g_r.nsm_build;
+  const auto t0 = PerfClock::now();
+  nrhi::Texture* target = b.into_back ? g_r.static_sun_back : g_r.static_sun;
+  bool& target_in_srv = b.into_back ? g_r.static_sun_back_in_srv : g_r.static_sun_in_srv;
+  NsmBindTarget(cmd, target, target_in_srv, bone_region);
+  if (!b.cleared) {
+    const float clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+    cmd->ClearRenderTarget(target, clear);
+    b.cleared = true;
+  }
+  nrhi::Pipeline* bound_pipeline = nullptr;
+  // Always make some progress, even past the deadline.
+  constexpr uint32_t kMinCasters = 16;
+  uint32_t casters = 0;
+  int tile_bound = -1;
+  bool out_of_time = false;
+  while (b.tile < 3 && !out_of_time) {
+    const std::vector<uint32_t>& list = b.list[b.tile][b.phase];
+    while (b.cursor < list.size()) {
+      if (has_deadline && casters >= kMinCasters && (casters & 7u) == 0 &&
+          PerfClock::now() >= deadline) {
+        out_of_time = true;
+        break;
+      }
+      if (tile_bound != int(b.tile)) {
+        NsmSetTile(cmd, int(b.tile));
+        tile_bound = int(b.tile);
+      }
+      const uint32_t idx = list[b.cursor++];
+      ++casters;
+      const RendererState::StaticCaster& rec = g_r.static_casters[idx];
+      if (NsmDrawCaster(cmd, rec, b.vp[b.tile], int(b.tile), bone_region, frame_number,
+                        bound_pipeline)) {
+        b.far_drawn += b.tile == 2 ? 1u : 0u;
+        ++b.draws;
+      } else {
+        // Mesh not resident (or reused): retried into the served map once
+        // it decodes, which after the swap is this map.
+        b.far_skipped += b.tile == 2 ? 1u : 0u;
+        NsmQueueCaster(idx);
+      }
+    }
+    if (out_of_time) {
+      break;
+    }
+    b.cursor = 0;
+    if (++b.phase == 2) {
+      b.phase = 0;
+      ++b.tile;
+    }
+  }
+  if (!out_of_time) {
+    // Records appended or changed since the candidate pass, and casters
+    // the served map gained meanwhile: all their tiles.
+    for (const uint64_t key : b.late) {
+      const auto it = g_r.static_caster_index.find(key);
+      if (it == g_r.static_caster_index.end()) {
+        continue;
+      }
+      NsmDrawCasterAllTiles(cmd, it->second, b.rows, b.vp, bone_region, frame_number,
+                            bound_pipeline, &b.draws);
+    }
+    b.late.clear();
+  }
+  b.cpu_ms += std::chrono::duration<float, std::milli>(PerfClock::now() - t0).count();
+  if (out_of_time) {
+    return;
+  }
+  NsmReleaseTarget(cmd, target, target_in_srv);
+  if (b.into_back) {
+    std::swap(g_r.static_sun, g_r.static_sun_back);
+    std::swap(g_r.static_sun_srv, g_r.static_sun_back_srv);
+    std::swap(g_r.static_sun_in_srv, g_r.static_sun_back_in_srv);
+  }
+  // The rows this map was rendered with become the served rows.
+  std::memcpy(g_r.nsm_rows, b.rows, sizeof(g_r.nsm_rows));
+  std::memcpy(g_r.nsm_center, b.center, sizeof(g_r.nsm_center));
+  std::memcpy(g_r.nsm_sun, b.sun, sizeof(g_r.nsm_sun));
+  g_r.nsm_depth_range = b.depth_range;
+  g_r.nsm_radius = b.radius;
+  g_r.nsm_built_radius = b.radius;
+  g_r.nsm_frame_note |= kLightRebuilt;
+  g_r.nsm_rebuild_reason = b.reason;
+  b.active = false;
+  const uint64_t frames = frame_number - b.start_frame + 1;
+  ++g_r.nsm_stat_builds;
+  g_r.nsm_stat_build_frames += frames;
+  g_r.nsm_stat_build_draws += b.draws;
+  g_r.nsm_stat_build_ms_max = std::max(g_r.nsm_stat_build_ms_max, b.cpu_ms);
+  // A rebuild that rasterized far fewer casters than the last one (or had
+  // to skip cached casters) leaves static shade missing until they land;
+  // log it with the cache size so a dropout can be told apart from a gate
+  // flash.
+  const uint32_t prev_drawn = g_r.nsm_casters_drawn;
+  g_r.nsm_casters_drawn = b.far_drawn;
+  g_r.nsm_casters_skipped = b.far_skipped;
+  if (b.far_skipped > 0 || (prev_drawn >= 20 && b.far_drawn * 4 < prev_drawn * 3)) {
+    static std::atomic<uint32_t> s_rebuild_logs{0};
+    const uint32_t n = s_rebuild_logs.fetch_add(1, std::memory_order_relaxed);
+    if (n < 16 || (n & 127u) == 0) {
+      REXLOG_INFO(
+          "native-scene: static sun rebuild (reason {}) drew {} casters (previous {}), "
+          "skipped {} of {} cached (mesh not resident; queued to add) over {} frame(s), "
+          "{:.2f} ms frame={} (n={})",
+          b.reason, b.far_drawn, prev_drawn, b.far_skipped, g_r.static_casters.size(),
+          frames, b.cpu_ms, frame_number, n + 1);
+    }
+  }
+}
+
 static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
                                const FrameScene& scene, uint32_t bone_region,
                                int32_t debug_mode, uint64_t frame_number) {
   g_r.static_sun_valid = false;
+  g_r.nsm_frame_note = 0;
   if (g_r.static_sun == nullptr || g_r.pso_shadow_caster == nullptr ||
       g_r.pso_shadow_caster_clip == nullptr || debug_mode != 0 ||
       !scene.shadow_valid ||
@@ -6090,6 +7098,13 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
       !REXCVAR_GET(skate3_native_render_scene_shadow_static_casters)) {
     return;
   }
+  const auto work_t0 = PerfClock::now();
+  const double budget_ms = std::clamp(
+      REXCVAR_GET(skate3_native_render_scene_shadow_static_budget_ms), 0.0, 16.0);
+  const bool has_deadline = budget_ms > 0.0;
+  const auto deadline =
+      work_t0 + std::chrono::duration_cast<PerfClock::duration>(
+                    std::chrono::duration<double, std::milli>(budget_ms));
   // Sun axis = the material sun (c6). It is the only sun-like direction
   // in the captured data: the game's cascade transforms AND its baked
   // static-shade (world-shadow) projection are both the same stylized
@@ -6121,6 +7136,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   if (!sun_usable) {
     if (g_r.nsm_built_radius > 0.0f && ++s_unusable_run <= 30) {
       g_r.static_sun_valid = true;  // hold the cached map + stored rows
+      g_r.nsm_frame_note |= kLightSunHold;
       static std::atomic<uint32_t> s_hold_logs{0};
       const uint32_t n = s_hold_logs.fetch_add(1, std::memory_order_relaxed);
       if (n < 8 || (n & 255u) == 0) {
@@ -6155,6 +7171,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
               "native-scene: static sun axis jump held (dot={:.6f} n={})",
               held_dot, n + 1);
         }
+        g_r.nsm_frame_note |= kLightAxisHold;
         std::memcpy(sun, g_r.nsm_sun, sizeof(sun));
       }
     }
@@ -6180,16 +7197,22 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   const float depth_half = radius * 2.0f;
   const float texel_m = 2.0f * radius / float(g_r.static_sun_size);
   const float* cam = scene.cam_pos;
+  RendererState::NsmBuild& build = g_r.nsm_build;
   // Upsert this frame's visible statics into the persistent caster cache
   // (same static filter as the world-shadow map pass). scene.items is the
   // game's view-culled list; drawing the map from it directly popped
   // shadows with the camera; the cache keeps once-seen geometry casting
-  // from any direction. A new or content-changed record marks the map
-  // dirty for a rebuild.
+  // from any direction. A new or content-changed record is added to the
+  // served map (and to a rebuild in progress) as it arrives; a record
+  // changed in place also marks the map dirty, since its old shape stays
+  // in the map until a rebuild.
   for (const DrawItem& item : scene.items) {
+    // Skate 2 additive effects (glare sprites, godray cones, neon overlays)
+    // are light, not occluders.
     if (item.transparent || item.unlit || item.cloth_quads || item.water ||
         item.water_ocean != 0 || item.skinned || item.ropa ||
-        item.char_family != 0 || item.dynobj != 0) {
+        item.char_family != 0 || item.dynobj != 0 || item.s2_blend != 0 ||
+        item.indicator) {
       continue;
     }
     // Key: mesh + quantized world translation (placed instances of one
@@ -6202,41 +7225,103 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
     key ^= q(item.world[12]) * 0xC2B2AE3D27D4EB4Full;
     key ^= (q(item.world[13]) + 0x165667B19E3779F9ull) * 0x27D4EB2F165667C5ull;
     key ^= (q(item.world[14]) + 0x9E3779B97F4A7C15ull) * 0x85EBCA77C2B2AE63ull;
-    RendererState::StaticCaster& rec = g_r.static_casters[key];
-    if (rec.mesh == 0 || rec.fingerprint != item.fingerprint) {
+    const auto [it, inserted] =
+        g_r.static_caster_index.try_emplace(key, uint32_t(g_r.static_casters.size()));
+    if (inserted) {
+      g_r.static_casters.emplace_back();
+      g_r.static_caster_bounds.emplace_back();
+    }
+    const uint32_t idx = it->second;
+    RendererState::StaticCaster& rec = g_r.static_casters[idx];
+    const bool changed = !inserted && rec.fingerprint != item.fingerprint;
+    if (inserted || changed) {
+      rec.key = key;
       rec.mesh = item.mesh;
       rec.fingerprint = item.fingerprint;
       std::memcpy(rec.world, item.world, sizeof(rec.world));
       std::memcpy(rec.bbox_min, item.bbox_min, sizeof(rec.bbox_min));
       std::memcpy(rec.bbox_max, item.bbox_max, sizeof(rec.bbox_max));
       rec.diffuse_tex = item.diffuse_tex;
+      rec.diffuse_guid = item.diffuse_guid;
+      rec.env_family = item.env_family;
       rec.clip = item.env_family == 7 || item.env_family == 9 ||
                  item.env_family == 10;
       rec.draws.assign(item.draws.begin(), item.draws.end());
-      g_r.nsm_dirty = true;
+      g_r.static_caster_bounds[idx] = StaticCasterBounds(rec);
+      NsmQueueCaster(idx);
+      if (build.active) {
+        build.late.push_back(key);
+      }
+      if (changed) {
+        g_r.nsm_dirty = true;
+        ++g_r.nsm_stat_changed;
+      } else {
+        ++g_r.nsm_stat_new;
+      }
     }
     rec.last_seen_frame = frame_number;
   }
+  // Inherited backdrops never reach scene.items while they are hidden (the
+  // item build rejects them), so only casters cached before the hide took
+  // effect can hold one: sweep once when it turns on, not every frame (a
+  // per-frame pass over the whole cache cost ~5% of the render thread).
+  static bool s_backdrop_hidden = false;
+  const bool hide_backdrop = REXCVAR_GET(skate3_skate2_hide_inherited_backdrop) &&
+                             skate3::world_loading::IsSkate2Gameplay();
+  if (hide_backdrop && !s_backdrop_hidden) {
+    size_t removed = 0;
+    for (size_t i = 0; i < g_r.static_casters.size();) {
+      const RendererState::StaticCaster& rec = g_r.static_casters[i];
+      if (skate3::world_loading::IsInheritedBackdrop(rec.diffuse_guid, rec.env_family)) {
+        RemoveStaticCaster(i);
+        ++removed;
+      } else {
+        ++i;
+      }
+    }
+    if (removed != 0) {
+      g_r.nsm_dirty = true;
+      build.active = false;  // its candidate indices moved; restart below
+      build.late.clear();
+    }
+  }
+  s_backdrop_hidden = hide_backdrop;
   // Cache maintenance: distance eviction (region streamed away) plus a
   // long staleness timeout, which bounds ghost shadows from content the
   // game actually removed (deleted park-editor objects) at the cost of a
   // late pop for casters never re-viewed.
-  if (frame_number >= g_r.static_casters_sweep_frame) {
+  // Distance is measured from the caster's world-space BOUNDS, not its
+  // transform: world-space statics (Skate 2's BAM cells, and Skate 3's own
+  // pre-transformed scenery) carry an identity transform, so measuring the
+  // translation put every one of them at the world origin. With the camera
+  // more than 6r from the origin each 600-frame sweep evicted the whole
+  // city and the rebuild that followed drew an empty or partial map: static
+  // shade vanished for the ~0.5 s the rate-limited refill took (run 101:
+  // "static sun rebuild drew 0 casters (previous 224), skipped 0 of 0
+  // cached" 0.3 s before the user's flash marker, repeating every sweep).
+  // Casters this far out lie outside the map, so dropping them needs no
+  // rebuild; stale ones may sit inside it and do. A rebuild in progress
+  // holds record indices: the sweep waits for it.
+  if (frame_number >= g_r.static_casters_sweep_frame && !build.active) {
     g_r.static_casters_sweep_frame = frame_number + 600;
     const float evict_r = radius * 6.0f;
-    for (auto it = g_r.static_casters.begin();
-         it != g_r.static_casters.end();) {
-      const RendererState::StaticCaster& rec = it->second;
-      const float ex = rec.world[12] - cam[0];
-      const float ey = rec.world[13] - cam[1];
-      const float ez = rec.world[14] - cam[2];
-      const bool far_away = ex * ex + ey * ey + ez * ez > evict_r * evict_r;
-      const bool stale = frame_number > rec.last_seen_frame + 30000;
+    for (size_t i = 0; i < g_r.static_casters.size();) {
+      const RendererState::CasterBounds& b = g_r.static_caster_bounds[i];
+      float d2 = 0.0f;
+      for (int a = 0; a < 3; ++a) {
+        d2 += (b.c[a] - cam[a]) * (b.c[a] - cam[a]);
+      }
+      const float reach =
+          evict_r + std::sqrt(b.h[0] * b.h[0] + b.h[1] * b.h[1] + b.h[2] * b.h[2]);
+      const bool far_away = d2 > reach * reach;
+      const bool stale = frame_number > g_r.static_casters[i].last_seen_frame + 30000;
       if (far_away || stale) {
-        it = g_r.static_casters.erase(it);
-        g_r.nsm_dirty = true;
+        if (stale) {
+          g_r.nsm_dirty = true;
+        }
+        RemoveStaticCaster(i);
       } else {
-        ++it;
+        ++i;
       }
     }
   }
@@ -6244,18 +7329,22 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   // on changed. Between rebuilds the stored rows and the map contents are
   // served as-is; statics and the sun are near-constant, so this removes
   // almost the entire steady-state caster cost (and freezes the raster,
-  // so foliage dapple cannot shimmer frame to frame).
-  // Dirty (content changed) rebuilds are RATE-LIMITED: dense areas stream
-  // new casters near-continuously, and an unthrottled dirty flag degraded
-  // to a full map redraw every frame. A <=30-frame shadow latency for
-  // newly streamed geometry is invisible; drift/sun rebuilds stay
-  // immediate.
-  bool rebuild = g_r.nsm_built_radius <= 0.0f ||
-                 std::fabs(radius - g_r.nsm_built_radius) > 0.5f ||
-                 frame_number >= g_r.nsm_rebuild_frame ||
-                 (g_r.nsm_dirty &&
-                  frame_number >= g_r.nsm_last_build_frame + 30);
-  if (!rebuild) {
+  // so foliage dapple cannot shimmer frame to frame). Newly streamed
+  // geometry is added to the served map as it arrives (above), so content
+  // rebuilds are only for records changed in place or stale removals, and
+  // stay rate-limited.
+  // Reason codes feed the lighting history (1 new/radius, 2 periodic,
+  // 3 content, 4 drift, 5 sun).
+  uint8_t reason = 0;
+  if (g_r.nsm_built_radius <= 0.0f ||
+      std::fabs(radius - g_r.nsm_built_radius) > 0.5f) {
+    reason = 1;
+  } else if (frame_number >= g_r.nsm_rebuild_frame) {
+    reason = 2;
+  } else if (g_r.nsm_dirty && frame_number >= g_r.nsm_last_build_frame + 30) {
+    reason = 3;
+  }
+  if (reason == 0) {
     // Camera drift from the built center, measured in the map plane: the
     // INNER tile (radius/6) must keep covering the player's
     // surroundings, so the threshold rides its extent.
@@ -6264,197 +7353,474 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
     const float dcz = cam[2] - g_r.nsm_center[2];
     const float du = xl[0] * dcx + xl[1] * dcy + xl[2] * dcz;
     const float dv = yl[0] * dcx + yl[1] * dcy + yl[2] * dcz;
-    rebuild = std::max(std::fabs(du), std::fabs(dv)) > radius * 0.0667f;
+    if (std::max(std::fabs(du), std::fabs(dv)) > radius * 0.0667f) {
+      reason = 4;
+    }
   }
-  if (!rebuild) {
-    rebuild = sun[0] * g_r.nsm_sun[0] + sun[1] * g_r.nsm_sun[1] +
-                  sun[2] * g_r.nsm_sun[2] <
-              0.999995f;
+  if (reason == 0 && sun[0] * g_r.nsm_sun[0] + sun[1] * g_r.nsm_sun[1] +
+                             sun[2] * g_r.nsm_sun[2] <
+                         0.999995f) {
+    reason = 5;
   }
-  if (!rebuild) {
-    g_r.static_sun_valid = true;  // serve the cached map + stored rows
-    return;
+  if (build.active) {
+    // A radius change, or the camera running away from the center the
+    // rebuild was laid out at (a teleport, a long fall), restarts it.
+    const float dcx = cam[0] - build.center[0];
+    const float dcy = cam[1] - build.center[1];
+    const float dcz = cam[2] - build.center[2];
+    const float du = xl[0] * dcx + xl[1] * dcy + xl[2] * dcz;
+    const float dv = yl[0] * dcx + yl[1] * dcy + yl[2] * dcz;
+    if (std::fabs(radius - build.radius) > 0.5f ||
+        std::max(std::fabs(du), std::fabs(dv)) > radius * 0.25f) {
+      build.active = false;
+      build.late.clear();
+      if (reason == 0) {
+        reason = 4;
+      }
+    }
   }
-  g_r.nsm_dirty = false;
-  g_r.nsm_rebuild_frame = frame_number + 600;
-  g_r.nsm_last_build_frame = frame_number;
-  g_r.nsm_built_radius = radius;
-  std::memcpy(g_r.nsm_sun, sun, sizeof(g_r.nsm_sun));
-  float o[3] = {cam[0], cam[1], cam[2]};
-  const float cx = xl[0] * o[0] + xl[1] * o[1] + xl[2] * o[2];
-  const float cy = yl[0] * o[0] + yl[1] * o[1] + yl[2] * o[2];
-  const float dx = cx - std::round(cx / texel_m) * texel_m;
-  const float dy = cy - std::round(cy / texel_m) * texel_m;
-  for (int a = 0; a < 3; ++a) {
-    o[a] -= xl[a] * dx + yl[a] * dy;
-  }
-  std::memcpy(g_r.nsm_center, o, sizeof(g_r.nsm_center));
-  // world -> map rows, shared by this caster pass and the receivers
-  // (b1 nsm_x/y/z): uc = dot(row.xyz, wp) + row.w.
-  float rows[12];
-  for (int a = 0; a < 3; ++a) {
-    rows[0 + a] = xl[a] / radius;
-    rows[4 + a] = yl[a] / radius;
-    rows[8 + a] = zl[a] / (2.0f * depth_half);
-  }
-  rows[3] = -(rows[0] * o[0] + rows[1] * o[1] + rows[2] * o[2]);
-  rows[7] = -(rows[4] * o[0] + rows[5] * o[1] + rows[6] * o[2]);
-  rows[11] = 0.5f - (rows[8] * o[0] + rows[9] * o[1] + rows[10] * o[2]);
-  std::memcpy(g_r.nsm_rows, rows, sizeof(rows));
-  g_r.nsm_depth_range = 2.0f * depth_half;
-  g_r.nsm_radius = radius;
-  // View-proj columns from the rows (same construction as the CSM
-  // lightvp; clip.y lands in the sampler's v = -y/2 + 0.5 convention via
-  // the raster y-flip).
-  float vp[16] = {};
-  for (int r = 0; r < 3; ++r) {
-    vp[r * 4 + 0] = rows[0 + r];
-    vp[r * 4 + 1] = rows[4 + r];
-    vp[r * 4 + 2] = rows[8 + r];
-  }
-  vp[12] = rows[3];
-  vp[13] = rows[7];
-  vp[14] = rows[11];
-  vp[15] = 1.0f;
-  // Finer-tile view-projections: same origin, radius/2 and radius/6,
-  // exact rescales of the far transform's X/Y columns (the shader selects
-  // tiles by the same ratios; keep in sync with its
-  // kRatioInner/kRatioMid). Snapping used the FAR texel grid, whose
-  // multiples are also finer-texel multiples (integer 1:2:6 chain), so
-  // every tile stays swim-free.
-  constexpr float kRatioMid = 2.0f;
-  constexpr float kRatioInner = 6.0f;
-  float vp_mid[16];
-  float vp_inner[16];
-  std::memcpy(vp_mid, vp, sizeof(vp));
-  std::memcpy(vp_inner, vp, sizeof(vp));
-  for (int r = 0; r < 4; ++r) {
-    vp_mid[r * 4 + 0] *= kRatioMid;
-    vp_mid[r * 4 + 1] *= kRatioMid;
-    vp_inner[r * 4 + 0] *= kRatioInner;
-    vp_inner[r * 4 + 1] *= kRatioInner;
-  }
-  nrhi::Cmd* cmd = context.cmd;
-  if (g_r.static_sun_in_srv) {
-    cmd->Barrier(g_r.static_sun, nrhi::ResourceState::kPixelShaderResource,
-                 nrhi::ResourceState::kRenderTarget);
-    cmd->FlushBarriers();
-    g_r.static_sun_in_srv = false;
-  }
-  const float clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-  cmd->ClearRenderTarget(g_r.static_sun, clear);
-  cmd->SetRenderTargets(g_r.static_sun, nullptr);
-  cmd->SetBindingLayout(g_r.layout);
-  cmd->SetConstantBuffer(9, g_r.bone_ring, bone_region);
-  const float size = float(g_r.static_sun_size);
-  // Per tile (0 = inner r/6, 1 = mid r/2, 2 = far), two phases each:
-  // opaque statics, then the alpha-tested families (trees, alphatest
-  // fences/grates) with the clip PSO and their diffuse.
-  for (int tile = 0; tile < 3; ++tile) {
-    const float* tvp = tile == 0 ? vp_inner : (tile == 1 ? vp_mid : vp);
-    // Cull threshold in FAR uc units (finer tiles cover 1/ratio of the
-    // far extent).
-    const float cull = tile == 0   ? 1.05f / kRatioInner
-                       : tile == 1 ? 1.05f / kRatioMid
-                                   : 1.05f;
-    cmd->SetViewport(
-        nrhi::Viewport{size * tile, 0.0f, size, size, 0.0f, 1.0f});
-    cmd->SetScissor(nrhi::Rect{int32_t(g_r.static_sun_size) * tile, 0,
-                               int32_t(g_r.static_sun_size) * (tile + 1),
-                               int32_t(g_r.static_sun_size)});
-    for (int phase = 0; phase < 2; ++phase) {
-      cmd->SetPipeline(phase == 0 ? g_r.pso_shadow_caster
-                                  : g_r.pso_shadow_caster_clip);
-      for (const auto& [key, rec] : g_r.static_casters) {
-        if (rec.clip != (phase == 1)) {
-          continue;
+  if (!build.active && reason != 0) {
+    // Lay out a rebuild centered on the camera: rows, tile transforms and
+    // the candidate lists (one pass over the compact bounds).
+    build.active = true;
+    build.cleared = false;
+    build.reason = reason;
+    build.start_frame = frame_number;
+    build.tile = 0;
+    build.phase = 0;
+    build.cursor = 0;
+    build.far_drawn = 0;
+    build.far_skipped = 0;
+    build.draws = 0;
+    build.cpu_ms = 0.0f;
+    build.late.clear();
+    // Into the back atlas over several frames while the current map keeps
+    // serving; in one frame into the served atlas when there is nothing to
+    // serve yet, no back atlas, or no budget.
+    build.into_back = g_r.static_sun_back != nullptr && g_r.nsm_built_radius > 0.0f &&
+                      has_deadline;
+    if (!build.into_back) {
+      // Everything queued so far is in the cache, so the candidate pass
+      // covers it (casters it must skip are queued again).
+      for (const RendererState::PendingCaster& p : g_r.nsm_pending) {
+        const auto it = g_r.static_caster_index.find(p.key);
+        if (it != g_r.static_caster_index.end()) {
+          g_r.static_casters[it->second].queued = false;
         }
-        auto mit = g_r.meshes.find(rec.mesh);
-        // Fingerprint mismatch = the arena address was reused for
-        // different content; drawing it would raster a foreign mesh into
-        // the map. The record refreshes the next time the item is
-        // actually seen.
-        if (mit == g_r.meshes.end() ||
-            mit->second.fingerprint != rec.fingerprint) {
-          continue;
-        }
-        // NSM casters cover a wide radius the main pass never draws; touch
-        // the LRU clock so the cascades keep their meshes resident.
-        mit->second.last_used_frame = frame_number;
-        // Cull by the mesh bbox footprint in (far) map space.
-        float umin = std::numeric_limits<float>::max(), umax = -umin;
-        float vmin = umin, vmax = -umin;
-        for (int corner = 0; corner < 8; ++corner) {
-          const float px = (corner & 1) ? rec.bbox_max[0] : rec.bbox_min[0];
-          const float py = (corner & 2) ? rec.bbox_max[1] : rec.bbox_min[1];
-          const float pz = (corner & 4) ? rec.bbox_max[2] : rec.bbox_min[2];
-          float w[3];
-          for (int a = 0; a < 3; ++a) {
-            w[a] = px * rec.world[0 + a] + py * rec.world[4 + a] +
-                   pz * rec.world[8 + a] + rec.world[12 + a];
-          }
-          const float u = rows[0] * w[0] + rows[1] * w[1] + rows[2] * w[2] +
-                          rows[3];
-          const float v = rows[4] * w[0] + rows[5] * w[1] + rows[6] * w[2] +
-                          rows[7];
-          umin = std::min(umin, u);
-          umax = std::max(umax, u);
-          vmin = std::min(vmin, v);
-          vmax = std::max(vmax, v);
-        }
-        if (umax < -cull || umin > cull || vmax < -cull || vmin > cull) {
-          continue;
-        }
-        float constants[52] = {};
-        std::memcpy(constants, rec.world, sizeof(rec.world));
-        float* mvp = constants + 16;
-        for (int r = 0; r < 4; ++r) {
-          for (int col = 0; col < 4; ++col) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; ++k) {
-              sum += rec.world[r * 4 + k] * tvp[k * 4 + col];
-            }
-            mvp[r * 4 + col] = sum;
-          }
-        }
-        cmd->SetRootConstants(0, 52, constants, 0);
-        cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
-        if (phase == 1) {
-          nrhi::TextureView* srv = LookupResolvedTexture(rec.diffuse_tex);
-          cmd->SetTexture(1, srv != nullptr ? srv : g_r.white.srv);
-        }
-        cmd->SetVertexBuffer(mit->second.vb_view.buffer,
-                             mit->second.vb_view.offset,
-                             mit->second.vb_view.size_bytes,
-                             mit->second.vb_view.stride);
-        cmd->SetIndexBuffer(mit->second.ib_view.buffer,
-                            mit->second.ib_view.offset,
-                            mit->second.ib_view.size_bytes);
-        for (const DrawEntry& draw : rec.draws) {
-          if (draw.prim == 4) {
-            cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
-          } else if (draw.prim == 6) {
-            cmd->SetPrimitiveTopology(
-                nrhi::PrimitiveTopology::kTriangleStrip);
-          } else {
-            continue;
-          }
-          cmd->DrawIndexed(draw.index_count, draw.start_index,
-                           draw.base_vertex);
+      }
+      g_r.nsm_pending.clear();
+    }
+    g_r.nsm_dirty = false;
+    g_r.nsm_rebuild_frame = frame_number + 600;
+    g_r.nsm_last_build_frame = frame_number;
+    std::memcpy(build.sun, sun, sizeof(build.sun));
+    float o[3] = {cam[0], cam[1], cam[2]};
+    const float cx = xl[0] * o[0] + xl[1] * o[1] + xl[2] * o[2];
+    const float cy = yl[0] * o[0] + yl[1] * o[1] + yl[2] * o[2];
+    const float dx = cx - std::round(cx / texel_m) * texel_m;
+    const float dy = cy - std::round(cy / texel_m) * texel_m;
+    for (int a = 0; a < 3; ++a) {
+      o[a] -= xl[a] * dx + yl[a] * dy;
+    }
+    std::memcpy(build.center, o, sizeof(build.center));
+    // world -> map rows, shared by the caster passes and the receivers
+    // (b1 nsm_x/y/z): uc = dot(row.xyz, wp) + row.w.
+    float* rows = build.rows;
+    for (int a = 0; a < 3; ++a) {
+      rows[0 + a] = xl[a] / radius;
+      rows[4 + a] = yl[a] / radius;
+      rows[8 + a] = zl[a] / (2.0f * depth_half);
+    }
+    rows[3] = -(rows[0] * o[0] + rows[1] * o[1] + rows[2] * o[2]);
+    rows[7] = -(rows[4] * o[0] + rows[5] * o[1] + rows[6] * o[2]);
+    rows[11] = 0.5f - (rows[8] * o[0] + rows[9] * o[1] + rows[10] * o[2]);
+    build.depth_range = 2.0f * depth_half;
+    build.radius = radius;
+    NsmTileViewProj(rows, build.vp);
+    // Candidates per tile (inner, mid, far) and phase (opaque statics,
+    // then the alpha-tested families: trees, alphatest fences/grates, with
+    // the clip PSO and their diffuse). The far tile covers the whole map,
+    // so every candidate is in its list.
+    for (auto& per_tile : build.list) {
+      per_tile[0].clear();
+      per_tile[1].clear();
+    }
+    const uint32_t count = uint32_t(g_r.static_caster_bounds.size());
+    for (uint32_t i = 0; i < count; ++i) {
+      const RendererState::CasterBounds& cb = g_r.static_caster_bounds[i];
+      if (!NsmCasterInTile(cb, rows, 2)) {
+        continue;
+      }
+      const uint32_t phase = cb.clip;
+      build.list[2][phase].push_back(i);
+      if (NsmCasterInTile(cb, rows, 1)) {
+        build.list[1][phase].push_back(i);
+        if (NsmCasterInTile(cb, rows, 0)) {
+          build.list[0][phase].push_back(i);
         }
       }
     }
   }
-  cmd->Barrier(g_r.static_sun, nrhi::ResourceState::kRenderTarget,
-               nrhi::ResourceState::kPixelShaderResource);
-  cmd->FlushBarriers();
-  g_r.static_sun_in_srv = true;
-  g_r.static_sun_valid = true;
+  nrhi::Cmd* cmd = context.cmd;
+  // Newly seen casters into the served map: drawn now, so new geometry
+  // casts the frame it arrives. A rebuild in progress gets them too (late
+  // list) so the swap cannot drop them.
+  if (g_r.nsm_built_radius > 0.0f && !g_r.nsm_pending.empty() &&
+      !(build.active && !build.into_back)) {
+    float served_vp[3][16];
+    NsmTileViewProj(g_r.nsm_rows, served_vp);
+    NsmBindTarget(cmd, g_r.static_sun, g_r.static_sun_in_srv, bone_region);
+    nrhi::Pipeline* bound_pipeline = nullptr;
+    uint32_t draws = 0;
+    size_t keep = 0;
+    size_t done = 0;
+    bool out_of_time = false;
+    auto& pending = g_r.nsm_pending;
+    for (size_t i = 0; i < pending.size(); ++i) {
+      RendererState::PendingCaster p = pending[i];
+      if (!out_of_time && has_deadline && done >= 16 && (done & 7u) == 0) {
+        out_of_time = PerfClock::now() >= deadline;
+      }
+      if (out_of_time) {
+        pending[keep++] = p;  // the rest waits for the next frame
+        continue;
+      }
+      ++done;
+      const auto it = g_r.static_caster_index.find(p.key);
+      if (it == g_r.static_caster_index.end()) {
+        continue;  // evicted meanwhile
+      }
+      if (NsmDrawCasterAllTiles(cmd, it->second, g_r.nsm_rows, served_vp, bone_region,
+                                frame_number, bound_pipeline, &draws)) {
+        ++g_r.nsm_stat_appended;
+        g_r.static_casters[it->second].queued = false;
+        if (build.active) {
+          build.late.push_back(p.key);
+        }
+      } else if (++p.tries < 600) {
+        pending[keep++] = p;  // mesh still decoding: retry next frame
+      } else {
+        g_r.static_casters[it->second].queued = false;  // a later rebuild retries it
+      }
+    }
+    pending.resize(keep);
+    NsmReleaseTarget(cmd, g_r.static_sun, g_r.static_sun_in_srv);
+  }
+  if (build.active) {
+    // A rebuild still running after 90 frames finishes now whatever the
+    // budget, so it cannot keep restarting behind a moving camera.
+    RunNsmBuild(cmd, bone_region, frame_number,
+                build.into_back && frame_number < build.start_frame + 90, deadline);
+  }
+  if (g_r.nsm_built_radius > 0.0f && g_r.static_sun_in_srv) {
+    g_r.static_sun_valid = true;  // serve the current map + its rows
+  }
+}
+
+// Enclosed New San Van venues lit by their own lights, where the static
+// sun term stands down toward skate3_native_render_scene_shadow_static_venue
+// as the camera enters (a 40 m blend outside the box). The Stadium interior
+// is a separate building far south of the city (Skate 2 teleports into it:
+// c_2b_01_teleport_stadium_in_*); its geometry fills BAM cells x -200..200,
+// z -2200..-1800, with lighter shell content out to x +-400 (nothing else
+// shares that z band). Skate 3's own map uses the same coordinates, so this
+// only applies in New San Van.
+float StaticSunVenueFactor(const float* cam) {
+  if (!skate3::world_loading::IsSkate2Gameplay()) {
+    return 1.0f;
+  }
+  struct Venue {
+    float min[3];
+    float max[3];
+  };
+  static constexpr Venue kVenues[] = {
+      {{-420.0f, -120.0f, -2230.0f}, {420.0f, 320.0f, -1770.0f}},  // Stadium
+  };
+  const float venue_strength = std::clamp(
+      float(REXCVAR_GET(skate3_native_render_scene_shadow_static_venue)), 0.0f, 1.0f);
+  float factor = 1.0f;
+  for (const Venue& v : kVenues) {
+    float outside = 0.0f;
+    for (int a = 0; a < 3; ++a) {
+      const float d = std::max({v.min[a] - cam[a], 0.0f, cam[a] - v.max[a]});
+      outside = std::max(outside, d);
+    }
+    const float blend = std::clamp(outside / 40.0f, 0.0f, 1.0f);
+    factor = std::min(factor, venue_strength + (1.0f - venue_strength) * blend);
+  }
+  return factor;
+}
+
+// Static sun-shadow term, decided once per frame for every consumer (the
+// b1 nsm rows, t10, the volumetric march). The raw gate is a rendered or
+// served map (static_sun_valid) under fresh receiver rows (shadow_fresh,
+// the interior-venue guard). Either can lapse for a frame or two in
+// ordinary play, and each lapse dropped every static shadow for that frame:
+// the "enhanced shadows switch off and the original lighting shows for a
+// split second" flash. The term now holds through lapses while a built map
+// exists, and stands down after kNsmHoldFrames without the gate. The game's
+// own CSM pass drawing counts as live receiver state once a capture has
+// arrived since the last load: outdoors the game draws that pass every
+// frame; the sunless interiors the freshness guard exists for load behind a
+// loading screen (clearing the cache) and never produce a capture.
+constexpr uint64_t kNsmHoldFrames = 45;
+
+void UpdateStaticSunGate(const FrameScene& scene, bool shadow_ready,
+                         int32_t debug_mode, uint64_t frame_number) {
+  const bool enabled = debug_mode == 0 &&
+                       REXCVAR_GET(skate3_native_render_scene_shadows) &&
+                       REXCVAR_GET(skate3_native_render_scene_shadow_static_casters);
+  const bool servable = enabled && g_r.static_sun != nullptr &&
+                        g_r.static_sun_srv != nullptr && g_r.static_sun_in_srv &&
+                        g_r.nsm_built_radius > 0.0f;
+  if (scene.shadow_fresh && scene.shadow_age <= 1) {
+    g_r.nsm_capture_seen = true;
+  }
+  const bool raw = g_r.static_sun_valid && scene.shadow_fresh;
+  const bool live = g_r.static_sun_valid &&
+                    (scene.shadow_fresh || (shadow_ready && g_r.nsm_capture_seen));
+  if (live) {
+    g_r.nsm_live_frame = frame_number;
+  }
+  const bool held = !live && g_r.nsm_live_frame != 0 &&
+                    frame_number <= g_r.nsm_live_frame + kNsmHoldFrames;
+  const bool active = servable && (live || held);
+
+  // Diagnostics: transitions of the final decision, gate lapses the hold
+  // or the CSM rule bridged (each one a prevented flash), and a periodic
+  // summary with the receiver-capture outcomes.
+  static bool s_active = false;
+  static bool s_raw = true;
+  static uint64_t s_raw_off_since = 0;
+  static std::atomic<uint32_t> s_logs{0};
+  const auto log_budget = [&]() {
+    const uint32_t n = s_logs.fetch_add(1, std::memory_order_relaxed);
+    return n < 48 || (n & 255u) == 0;
+  };
+  if (active != s_active && enabled) {
+    if (log_budget()) {
+      REXLOG_INFO(
+          "native-scene: static sun term {} frame={} [map={} built={:.0f} "
+          "fresh={} age={} csm={} capture_seen={} held={}]",
+          active ? "ON" : "OFF", frame_number, g_r.static_sun_valid ? 1 : 0,
+          g_r.nsm_built_radius, scene.shadow_fresh ? 1 : 0, scene.shadow_age,
+          shadow_ready ? 1 : 0, g_r.nsm_capture_seen ? 1 : 0, held ? 1 : 0);
+    }
+  }
+  if (raw != s_raw) {
+    if (!raw) {
+      s_raw_off_since = frame_number;
+    } else if (s_raw_off_since != 0 && active && s_active && log_budget()) {
+      REXLOG_INFO(
+          "native-scene: static sun gate lapse bridged ({} frames; map={} "
+          "fresh={} age={} csm={}) frame={}",
+          frame_number - s_raw_off_since, g_r.static_sun_valid ? 1 : 0,
+          scene.shadow_fresh ? 1 : 0, scene.shadow_age, shadow_ready ? 1 : 0,
+          frame_number);
+    }
+    s_raw = raw;
+  }
+  s_active = active;
+  static uint64_t s_summary_frame = 0;
+  static uint64_t s_frames = 0, s_off = 0, s_lapsed = 0, s_bridged = 0;
+  static uint32_t s_max_age = 0;
+  ++s_frames;
+  s_off += (enabled && !active) ? 1 : 0;
+  s_lapsed += raw ? 0 : 1;
+  s_bridged += (!raw && active) ? 1 : 0;
+  s_max_age = std::max(s_max_age, scene.shadow_age);
+  if (frame_number >= s_summary_frame + 3600) {
+    static uint64_t s_prev[6] = {};
+    const uint64_t now[6] = {
+        g_rcv_capture_ok.load(std::memory_order_relaxed),
+        g_rcv_capture_geo.load(std::memory_order_relaxed),
+        g_rcv_capture_axis.load(std::memory_order_relaxed),
+        g_rcv_capture_cam.load(std::memory_order_relaxed),
+        g_rcv_capture_color.load(std::memory_order_relaxed),
+        g_rcv_capture_tone.load(std::memory_order_relaxed)};
+    REXLOG_INFO(
+        "native-scene: static sun gate summary frames={} off={} lapsed={} "
+        "bridged={} max_age={} casters={} drawn={} skipped={} rebuilds={} "
+        "frames/rebuild={:.1f} casters/rebuild={:.0f} rebuild_ms_max={:.2f} new={} "
+        "changed={} added={} pending={} capture[ok={} geo={} axis={} cam={} color={} "
+        "tone={}] venue={:.2f}",
+        s_frames, s_off, s_lapsed, s_bridged, s_max_age,
+        g_r.static_casters.size(), g_r.nsm_casters_drawn,
+        g_r.nsm_casters_skipped, g_r.nsm_stat_builds,
+        g_r.nsm_stat_builds ? double(g_r.nsm_stat_build_frames) / g_r.nsm_stat_builds : 0.0,
+        g_r.nsm_stat_builds ? double(g_r.nsm_stat_build_draws) / g_r.nsm_stat_builds : 0.0,
+        g_r.nsm_stat_build_ms_max, g_r.nsm_stat_new, g_r.nsm_stat_changed,
+        g_r.nsm_stat_appended, g_r.nsm_pending.size(),
+        now[0] - s_prev[0], now[1] - s_prev[1],
+        now[2] - s_prev[2], now[3] - s_prev[3], now[4] - s_prev[4],
+        now[5] - s_prev[5], StaticSunVenueFactor(scene.cam_pos));
+    g_r.nsm_stat_builds = 0;
+    g_r.nsm_stat_build_frames = 0;
+    g_r.nsm_stat_build_draws = 0;
+    g_r.nsm_stat_build_ms_max = 0.0f;
+    g_r.nsm_stat_appended = 0;
+    g_r.nsm_stat_new = 0;
+    g_r.nsm_stat_changed = 0;
+    std::memcpy(s_prev, now, sizeof(s_prev));
+    s_summary_frame = frame_number;
+    s_frames = s_off = s_lapsed = s_bridged = 0;
+    s_max_age = 0;
+  }
+  g_r.nsm_active = active;
+  if (g_light_cur != nullptr) {
+    LightFrame& lf = *g_light_cur;
+    lf.gate |= uint16_t((enabled ? kLightEnabled : 0) | (servable ? kLightServable : 0) |
+                        (g_r.static_sun_valid ? kLightMap : 0) |
+                        (scene.shadow_fresh ? kLightFresh : 0) |
+                        (shadow_ready ? kLightCsm : 0) |
+                        (g_r.nsm_capture_seen ? kLightSeen : 0) | (live ? kLightLive : 0) |
+                        (held ? kLightHeld : 0) | (active ? kLightActive : 0) |
+                        (scene.shadow_valid ? kLightShadowValid : 0) | g_r.nsm_frame_note);
+    lf.shadow_age = scene.shadow_age;
+    lf.casters = g_r.nsm_casters_drawn;
+    if ((g_r.nsm_frame_note & kLightRebuilt) != 0) {
+      lf.rebuild_reason = g_r.nsm_rebuild_reason;
+    }
+  }
+}
+
+// ROPA shape blend (see RendererState::ropa_shapes): combine the shape
+// generations with the kernel weights InterpolateDynamicItems computed (the
+// SAME 8-tap boxcar / pair-lerp the body bones and garment world took this
+// frame) into the per-frame ropa upload ring and draw from it; the stepped
+// cloth shape against the interpolated body was the tee jelly/clip-through,
+// and a filter-MISMATCHED blend (plain lerp vs boxcar body) kept a
+// period-scaled residue of it. Positions/normals (floats 0..6) blend; packed
+// attributes (blend words, uvs: floats 7..13) copy from the newest generation
+// present. Generations missing from the ring (evicted / decode in flight)
+// renormalize over what IS present when at least half the kernel's weight
+// survives. Non-ropa items (and a disabled blend) draw the resident VB.
+// Memoized per item for the frame (cleared with the upload ring): the CSM
+// caster pass casts the SAME shape the main pass draws. It used to cast the
+// raw newest decode, a sim step or more ahead of the play-clock drape it
+// lands on; while running, the tee's sleeves and folds shadowed the cloth
+// around them in shifting dark patches (worst under the arms; confirmed
+// fixed in New San Van, run 109, and present but subtler in Danny Way).
+static std::unordered_map<const DrawItem*, VbBinding> g_ropa_vb_memo;
+static VbBinding RopaDrawVb(const DrawItem& item, const MeshBuffers& buffers,
+                            uint64_t frame_number) {
+  VbBinding vbv = buffers.vb_view;
+  if (!item.ropa || item.shape_count <= 0 ||
+      !REXCVAR_GET(skate3_native_render_scene_ropa_blend)) {
+    return vbv;
+  }
+  const auto memo = g_ropa_vb_memo.find(&item);
+  if (memo != g_ropa_vb_memo.end()) {
+    return memo->second;
+  }
+  const std::vector<float>* gv[DrawItem::kShapeGens] = {};
+  float gw[DrawItem::kShapeGens] = {};
+  int ng = 0;
+  float total = 0.0f;
+  uint64_t newest_seq = 0;
+  const std::vector<float>* newest = nullptr;
+  // Generations must match the RESIDENT decode's extent exactly; the index
+  // buffer references that many vertices. After a re-stream/outfit swap the
+  // ring briefly holds stale-size generations; binding one against the
+  // current IB reads past the bound VB and collapses triangles (a momentary
+  // partial-invisible blink). Stale sizes drop out here; if too much kernel
+  // weight is stale, the raw resident VB draws instead (always
+  // self-consistent).
+  const size_t want_floats = size_t(buffers.vb_view.size_bytes) / sizeof(float);
+  const auto rit = g_r.ropa_shapes.find(item.mesh);
+  if (rit != g_r.ropa_shapes.end() && !rit->second.empty()) {
+    // Sim-sleep gate: generations grossly older than the ring's newest were
+    // recorded before a cloth-sim sleep (continuous streams span ~114 ms end
+    // to end). Blending one against the fresh drape draws the garment
+    // where/how the character USED to stand, the detached/perpendicular
+    // class. Dropped generations shed their kernel weight; if too much
+    // weight is stale the raw resident VB draws instead (self-consistent
+    // current shape).
+    const double ring_newest_t = rit->second.back().t;
+    for (int k = 0; k < item.shape_count; ++k) {
+      for (const RendererState::RopaGen& g : rit->second) {
+        if (g.seq != item.shape_seq[k]) {
+          continue;
+        }
+        if (g.verts.size() != want_floats) {
+          break;  // stale-size generation (re-stream/outfit swap)
+        }
+        if (ring_newest_t - g.t > 0.35) {
+          static std::atomic<uint32_t> s_stale{0};
+          const uint32_t ln = s_stale.fetch_add(1, std::memory_order_relaxed);
+          if (ln < 16 || (ln & 1023u) == 0) {
+            REXLOG_DEBUG(
+                "native-scene: ropa shape STALE gen dropped mesh={:08X} "
+                "age={:.2f}s seq_gap={} (n={})",
+                item.mesh, ring_newest_t - g.t, rit->second.back().seq - g.seq,
+                ln);
+          }
+          break;
+        }
+        gv[ng] = &g.verts;
+        gw[ng] = item.shape_w[k];
+        total += item.shape_w[k];
+        ++ng;
+        if (g.seq >= newest_seq) {
+          newest_seq = g.seq;
+          newest = &g.verts;
+        }
+        break;
+      }
+    }
+  }
+  const uint32_t region = uint32_t(frame_number % RendererState::kBoneRegions) *
+                          RendererState::kRopaRegionSize;
+  const uint32_t bytes = uint32_t(want_floats * sizeof(float));
+  if (ng > 0 && total >= 0.5f && newest != nullptr &&
+      buffers.vb_view.stride == 56 &&
+      g_r.ropa_ring_offset + bytes <= RendererState::kRopaRegionSize) {
+    float* dst = reinterpret_cast<float*>(g_r.ropa_ring_cpu + region +
+                                          g_r.ropa_ring_offset);
+    const float inv = 1.0f / total;
+    for (size_t v = 0; v + 14 <= want_floats; v += 14) {
+      float blend7[7] = {};
+      for (int k = 0; k < ng; ++k) {
+        const float* src = gv[k]->data() + v;
+        const float wk = gw[k] * inv;
+        for (int f = 0; f < 7; ++f) {
+          blend7[f] += src[f] * wk;
+        }
+      }
+      // One store per float: dst is write-combined upload memory.
+      std::memcpy(dst + v, blend7, sizeof(blend7));
+      std::memcpy(dst + v + 7, newest->data() + v + 7, 7 * sizeof(float));
+    }
+    vbv.buffer = g_r.ropa_ring;
+    vbv.offset = region + g_r.ropa_ring_offset;
+    vbv.size_bytes = bytes;
+    vbv.stride = buffers.vb_view.stride;
+    g_r.ropa_ring_offset += (bytes + 255u) & ~255u;
+    g_ropa_blend_drawn.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    // Fallback to the raw resident shape. Rate-limited detail log: an
+    // ALTERNATION of these with blended frames renders the garment hopping
+    // between the play-clock drape and the zero-lag drape.
+    g_ropa_blend_miss.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<uint32_t> s_blend_miss_log{0};
+    const uint32_t ln = s_blend_miss_log.fetch_add(1, std::memory_order_relaxed);
+    if (ln < 64 || (ln & 63u) == 0) {
+      REXLOG_DEBUG(
+          "native-scene: ropa blend MISS mesh={:08X} sc={} ng={} "
+          "total={:.2f} stride={} ring={} ring_off={} (n={})",
+          item.mesh, item.shape_count, ng, total, buffers.vb_view.stride,
+          rit != g_r.ropa_shapes.end() ? rit->second.size() : size_t(0),
+          g_r.ropa_ring_offset, ln);
+    }
+  }
+  g_ropa_vb_memo.emplace(&item, vbv);
+  return vbv;
 }
 
 bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
                        const FrameScene& scene, uint32_t bone_region,
-                       int32_t debug_mode, uint32_t* out_draws) {
+                       uint64_t frame_number, int32_t debug_mode,
+                       uint32_t* out_draws) {
   nrhi::Cmd* cmd = context.cmd;
   const float* sh = scene.shadow_rows;
   bool shadow_ready = false;
@@ -6635,16 +8001,8 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
             // behind the sim by design (dyn decode jobs).
             float constants[52] = {};
             std::memcpy(constants, c.item->world, sizeof(c.item->world));
-            float* mvp = constants + 16;
-            for (int r = 0; r < 4; ++r) {
-              for (int col = 0; col < 4; ++col) {
-                float sum = 0.0f;
-                for (int k = 0; k < 4; ++k) {
-                  sum += c.item->world[r * 4 + k] * lightvp[k * 4 + col];
-                }
-                mvp[r * 4 + col] = sum;
-              }
-            }
+            constexpr float kNoOrigin[3] = {0.0f, 0.0f, 0.0f};
+            RebasedViewProj(lightvp, kNoOrigin, constants + 16);
             constants[33] = c.bones ? 1.0f : 0.0f;  // tint.g = skinned branch
             cmd->SetRootConstants(0, 52, constants, 0);
             cmd->SetBufferSrv(3, g_r.bone_ring,
@@ -6653,10 +8011,10 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
               cmd->SetTexture(1, c.clip_srv != nullptr ? c.clip_srv
                                                        : g_r.white.srv);
             }
-            cmd->SetVertexBuffer(mit->second.vb_view.buffer,
-                                 mit->second.vb_view.offset,
-                                 mit->second.vb_view.size_bytes,
-                                 mit->second.vb_view.stride);
+            // ROPA garments cast the play-clock blend the main pass draws.
+            const VbBinding vbv = RopaDrawVb(*c.item, mit->second, frame_number);
+            cmd->SetVertexBuffer(vbv.buffer, vbv.offset, vbv.size_bytes,
+                                 vbv.stride);
             cmd->SetIndexBuffer(mit->second.ib_view.buffer,
                                 mit->second.ib_view.offset,
                                 mit->second.ib_view.size_bytes);
@@ -6779,61 +8137,104 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
     }
   }
   // ---- dynamicobject static world-shadow map ----
-  // The game's props sample a 512x512 baked-shade depth map (tf1) the guest
-  // never renders in native mode (its memory stays zeroed). Re-render it
-  // natively from the frame's STATIC world items with the captured c5/c6/c7
-  // projection, ps_shadow_caster convention (x = light-space depth, MIN
-  // blend). The map ACCUMULATES across frames without clearing: the item
-  // list is view-culled, and dropping off-screen casters would flicker
-  // props' shade with the camera; static geometry seen once stays in the
-  // map until the transform changes (streaming region switch), which
-  // re-primes it.
+  // The game's props sample a 512x512 baked-shade map (tf1): an oblique
+  // projection along the sun (rows c5/c6, a world-aligned texel grid) with
+  // depth = height (c7), which the guest never renders in native mode.
+  // Re-render it natively from STATIC world geometry, ps_shadow_caster
+  // convention (x = depth, MIN blend: each texel keeps the highest static
+  // point on its sun ray; a prop surface below that is in baked shade).
+  //
+  // The map runs on its OWN held rows, and the props sample with the same
+  // rows (cb dyn_ws*, see the frame cbuffer). The game's rows follow the
+  // camera: c5/c6 step a texel (~11 cm) with each horizontal move, and c7
+  // measures height relative to the CAMERA, ~6 km of height over [0,1]
+  // (run 110 probe). Following them cleared and refilled the map from the
+  // current view many times a second; sampling with this frame's rows
+  // against a map built with an older c7 shifted every comparison by the
+  // camera's height change since the rebuild, and 16-bit depth over 6 km
+  // quantized heights to 9.4 cm: the shade band that crept up prop feet
+  // (poles, barriers, ramps, rails) as the camera rose and vanished at the
+  // next rebuild. Held rows: the game's c5/c6 at a re-center (same sun
+  // axis, scale and texel grid) and depth = height over +-256 m around the
+  // camera height at that moment (7.8 mm per 16-bit step). A re-center
+  // clears and redraws from the persistent static caster cache (the static
+  // sun map's, RenderStaticSunMap), so geometry outside the current view
+  // stays in the map; it happens when the game's own map has moved ~3-4 m
+  // from the held rows, the camera leaves the depth window, or the game's
+  // axes/scale change.
   if (g_r.world_shadow != nullptr && g_r.pso_shadow_caster != nullptr &&
       debug_mode == 0 && scene.dynobj_ws_valid &&
       REXCVAR_GET(skate3_native_render_scene_shadows) &&
       REXCVAR_GET(skate3_native_render_scene_dynobj_v2)) {
-    bool changed = !g_r.world_shadow_primed;
-    for (int k = 0; k < 12 && !changed; ++k) {
-      changed = std::fabs(scene.dynobj_ws[k] - g_r.world_shadow_rows[k]) >
-                1e-4f * std::max(1.0f, std::fabs(g_r.world_shadow_rows[k]));
+    const float* gw = scene.dynobj_ws;
+    float* hw = g_r.world_shadow_rows;
+    const float* cam = scene.cam_pos;
+    constexpr float kWsDepthSpan = 512.0f;  // meters of height over [0,1]
+    bool recenter = !g_r.world_shadow_primed;
+    for (int r = 0; r < 2 && !recenter; ++r) {
+      for (int a = 0; a < 3 && !recenter; ++a) {
+        recenter = std::fabs(gw[r * 4 + a] - hw[r * 4 + a]) >
+                   1e-4f * std::max(std::fabs(hw[r * 4 + a]), 1e-3f);
+      }
+    }
+    if (!recenter) {
+      // Follow the GAME's map once it has moved 0.1 of its half extent
+      // (~3-4 m) from the held rows. The game holds its rows fixed in some
+      // areas and steps them a texel at a time in others, and the camera
+      // need not sit at its center: judging the camera's own position
+      // re-centered onto the same rows every frame wherever the game's map
+      // sat off-center (run 112: 34 re-centers per second).
+      const float ref_y = (hw[11] - 0.5f) * kWsDepthSpan;
+      recenter = std::fabs(gw[3] - hw[3]) > 0.1f || std::fabs(gw[7] - hw[7]) > 0.1f ||
+                 std::fabs(cam[1] - ref_y) > 64.0f;
     }
     static uint64_t ws_pass_counter = 0;
     ++ws_pass_counter;
-    // Accumulation cadence: a full static-item pass every 4th frame keeps
-    // newly streamed / newly visible geometry flowing into the map at
-    // negligible steady-state cost; a transform change renders immediately.
-    if (changed || (ws_pass_counter & 3u) == 0) {
+    // Accumulation cadence: newly streamed / newly visible statics flow in
+    // every 4th frame (each lands once per map generation); a re-center
+    // renders immediately.
+    if (recenter || (ws_pass_counter & 3u) == 0) {
       if (g_r.world_shadow_in_srv) {
         cmd->Barrier(g_r.world_shadow, nrhi::ResourceState::kPixelShaderResource,
                      nrhi::ResourceState::kRenderTarget);
         cmd->FlushBarriers();
         g_r.world_shadow_in_srv = false;
       }
-      if (changed) {
+      if (recenter) {
+        if (g_r.world_shadow_primed && g_light_cur != nullptr) {
+          g_light_cur->ws_reprime = 1;
+        }
+        std::memcpy(hw, gw, 8 * sizeof(float));
+        hw[8] = 0.0f;
+        hw[9] = -1.0f / kWsDepthSpan;
+        hw[10] = 0.0f;
+        hw[11] = 0.5f + cam[1] / kWsDepthSpan;
+        static std::atomic<uint32_t> s_recenters{0};
+        const uint32_t n = s_recenters.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8 || (n & 63u) == 0) {
+          REXLOG_INFO(
+              "native-scene: world-shadow map {} (n={}) x=({:.6f},{:.6f},{:.6f},{:.4f}) "
+              "y=({:.6f},{:.6f},{:.6f},{:.4f}) ref_y={:.2f} cam=({:.2f},{:.2f},{:.2f})",
+              g_r.world_shadow_primed ? "re-centered" : "primed", n + 1, hw[0], hw[1], hw[2],
+              hw[3], hw[4], hw[5], hw[6], hw[7], cam[1], cam[0], cam[1], cam[2]);
+        }
         const float ws_clear[4] = {1.0f, 1.0f, 0.0f, 0.0f};
         cmd->ClearRenderTarget(g_r.world_shadow, ws_clear);
-        std::memcpy(g_r.world_shadow_rows, scene.dynobj_ws,
-                    sizeof(g_r.world_shadow_rows));
         g_r.world_shadow_drawn.clear();
-        if (!g_r.world_shadow_primed) {
-          REXLOG_INFO(
-              "native-scene: world-shadow map primed (dynobj c5/c6/c7 rows)");
-        }
         g_r.world_shadow_primed = true;
       }
-      // View-proj columns = the game's own projection rows: clip.x/y/z =
-      // dot(wp4, c5/c6/c7), clip.w = 1 (same construction as the CSM
-      // lightvp above).
+      // View-proj columns = the held rows: clip.x/y/z = dot(wp4, row),
+      // clip.w = 1 (same construction as the CSM lightvp above).
       float wsvp[16];
       for (int r = 0; r < 3; ++r) {
-        wsvp[r * 4 + 0] = scene.dynobj_ws[r];
-        wsvp[r * 4 + 1] = scene.dynobj_ws[4 + r];
-        wsvp[r * 4 + 2] = scene.dynobj_ws[8 + r];
+        wsvp[r * 4 + 0] = hw[r];
+        wsvp[r * 4 + 1] = hw[4 + r];
+        wsvp[r * 4 + 2] = hw[8 + r];
         wsvp[r * 4 + 3] = 0.0f;
       }
-      wsvp[12] = scene.dynobj_ws[3];
-      wsvp[13] = scene.dynobj_ws[7];
-      wsvp[14] = scene.dynobj_ws[11];
+      wsvp[12] = hw[3];
+      wsvp[13] = hw[7];
+      wsvp[14] = hw[11];
       wsvp[15] = 1.0f;
       cmd->SetRenderTargets(g_r.world_shadow, nullptr);
       cmd->SetBindingLayout(g_r.layout);
@@ -6843,57 +8244,38 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
       cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, ws_size, ws_size, 0.0f, 1.0f});
       cmd->SetScissor(nrhi::Rect{0, 0, int32_t(RendererState::kWorldShadowSize),
                                  int32_t(RendererState::kWorldShadowSize)});
-      for (const DrawItem& item : scene.items) {
-        // STATIC world geometry only: the game's map bakes buildings/trees/
-        // ground. Dynamic content (characters, vehicles, cloth, movable
-        // props) casts through the CSM instead, accumulating a movable
-        // prop here would freeze its shade at a stale position.
-        if (item.transparent || item.unlit || item.cloth_quads || item.water ||
-            item.skinned || item.ropa || item.char_family != 0 ||
-            item.dynobj != 0) {
-          continue;
+      // One static caster into the map, once per map generation: MIN-blend
+      // re-draws are idempotent, so anything already in it is redundant work.
+      // Keyed on mesh + content fingerprint + world transform; an in-place
+      // content swap or a moved instance reads as new and lands as well.
+      const auto draw_static = [&](uint32_t mesh, const float world[16],
+                                   const std::vector<DrawEntry>& draws,
+                                   uint64_t want_fingerprint, bool check_fingerprint) {
+        auto mit = g_r.meshes.find(mesh);
+        if (mit == g_r.meshes.end() ||
+            (check_fingerprint && mit->second.fingerprint != want_fingerprint)) {
+          return;
         }
-        auto mit = g_r.meshes.find(item.mesh);
-        if (mit == g_r.meshes.end()) {
-          continue;
-        }
-        // Accumulate each item exactly once per map generation: MIN-blend
-        // re-draws are idempotent, so anything already in the map is pure
-        // redundant work (the whole static item list re-rendered every 4th
-        // frame paced this pass). Keyed on mesh + content fingerprint +
-        // world transform; an in-place content swap or a moved instance
-        // reads as new and lands on the next accumulation frame.
-        uint64_t ws_key = 1469598103934665603ull ^ item.mesh;
+        uint64_t ws_key = 1469598103934665603ull ^ mesh;
         ws_key = (ws_key ^ mit->second.fingerprint) * 1099511628211ull;
-        const uint8_t* wb = reinterpret_cast<const uint8_t*>(item.world);
-        for (size_t bi = 0; bi < sizeof(item.world); ++bi) {
+        const uint8_t* wb = reinterpret_cast<const uint8_t*>(world);
+        for (size_t bi = 0; bi < 16 * sizeof(float); ++bi) {
           ws_key = (ws_key ^ wb[bi]) * 1099511628211ull;
         }
         if (!g_r.world_shadow_drawn.insert(ws_key).second) {
-          continue;
+          return;
         }
         float constants[52] = {};
-        std::memcpy(constants, item.world, sizeof(item.world));
-        float* mvp = constants + 16;
-        for (int r = 0; r < 4; ++r) {
-          for (int col = 0; col < 4; ++col) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; ++k) {
-              sum += item.world[r * 4 + k] * wsvp[k * 4 + col];
-            }
-            mvp[r * 4 + col] = sum;
-          }
-        }
+        std::memcpy(constants, world, 16 * sizeof(float));
+        constexpr float kNoOrigin[3] = {0.0f, 0.0f, 0.0f};
+        RebasedViewProj(wsvp, kNoOrigin, constants + 16);
         cmd->SetRootConstants(0, 52, constants, 0);
         cmd->SetBufferSrv(3, g_r.bone_ring, bone_region);
-        cmd->SetVertexBuffer(mit->second.vb_view.buffer,
-                             mit->second.vb_view.offset,
-                             mit->second.vb_view.size_bytes,
-                             mit->second.vb_view.stride);
-        cmd->SetIndexBuffer(mit->second.ib_view.buffer,
-                            mit->second.ib_view.offset,
+        cmd->SetVertexBuffer(mit->second.vb_view.buffer, mit->second.vb_view.offset,
+                             mit->second.vb_view.size_bytes, mit->second.vb_view.stride);
+        cmd->SetIndexBuffer(mit->second.ib_view.buffer, mit->second.ib_view.offset,
                             mit->second.ib_view.size_bytes);
-        for (const DrawEntry& draw : item.draws) {
+        for (const DrawEntry& draw : draws) {
           if (draw.prim == 4) {
             cmd->SetPrimitiveTopology(nrhi::PrimitiveTopology::kTriangleList);
           } else if (draw.prim == 6) {
@@ -6903,6 +8285,38 @@ bool RenderShadowAtlas(const NativeGuestOutputRenderContext& context,
           }
           cmd->DrawIndexed(draw.index_count, draw.start_index, draw.base_vertex);
         }
+      };
+      if (recenter) {
+        // Everything the static sun map's caster cache holds inside the new
+        // footprint, seen this frame or not (culled on the compact world
+        // bounds before any record is touched).
+        const size_t count = g_r.static_casters.size();
+        for (size_t i = 0; i < count; ++i) {
+          const RendererState::CasterBounds& b = g_r.static_caster_bounds[i];
+          const float u = hw[0] * b.c[0] + hw[1] * b.c[1] + hw[2] * b.c[2] + hw[3];
+          const float eu = std::fabs(hw[0]) * b.h[0] + std::fabs(hw[1]) * b.h[1] +
+                           std::fabs(hw[2]) * b.h[2];
+          const float v = hw[4] * b.c[0] + hw[5] * b.c[1] + hw[6] * b.c[2] + hw[7];
+          const float ev = std::fabs(hw[4]) * b.h[0] + std::fabs(hw[5]) * b.h[1] +
+                           std::fabs(hw[6]) * b.h[2];
+          if (u - eu > 1.0f || u + eu < -1.0f || v - ev > 1.0f || v + ev < -1.0f) {
+            continue;
+          }
+          const RendererState::StaticCaster& rec = g_r.static_casters[i];
+          draw_static(rec.mesh, rec.world, rec.draws, rec.fingerprint, true);
+        }
+      }
+      for (const DrawItem& item : scene.items) {
+        // STATIC world geometry only: the game's map bakes buildings/trees/
+        // ground. Dynamic content (characters, vehicles, cloth, movable
+        // props) casts through the CSM instead, accumulating a movable
+        // prop here would freeze its shade at a stale position.
+        if (item.transparent || item.unlit || item.cloth_quads || item.water ||
+            item.skinned || item.ropa || item.char_family != 0 ||
+            item.dynobj != 0 || item.s2_blend != 0 || item.indicator) {
+          continue;
+        }
+        draw_static(item.mesh, item.world, item.draws, 0, false);
       }
       cmd->Barrier(g_r.world_shadow, nrhi::ResourceState::kRenderTarget,
                    nrhi::ResourceState::kPixelShaderResource);
@@ -6954,16 +8368,8 @@ bool RenderOutlineMask(const NativeGuestOutputRenderContext& context,
         }
         float constants[52] = {};
         std::memcpy(constants, item->world, sizeof(item->world));
-        float* mvp = constants + 16;
-        for (int r = 0; r < 4; ++r) {
-          for (int c = 0; c < 4; ++c) {
-            float sum = 0.0f;
-            for (int k = 0; k < 4; ++k) {
-              sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
-            }
-            mvp[r * 4 + c] = sum;
-          }
-        }
+        constexpr float kNoOrigin[3] = {0.0f, 0.0f, 0.0f};
+        RebasedViewProj(scene.view_proj, kNoOrigin, constants + 16);
         // tint = (1, 0, 0, 1): the scene PS's solid-color early-out
         // (tint.a > 0) writes 1.0 into the R8 mask; tint.g = 0 keeps the VS
         // skinning branch off.
@@ -7164,7 +8570,9 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         "rej[dyn={} range={} chain={} geom={} draws={} bbox={}] "
         "rr[decode_fail={} no_bones={} mesh_deferred={} tex_deferred={}] "
         "store[n={} routes={} evict={}] "
-        "heal[vfail={} demote={}] serve[sticky={} skipnew={} adstale={} adnone={}] "
+        "heal[vfail={} demote={}] serve[sticky={} skipnew={} skiplit={} expired={} "
+        "chroma0={} placeholder={} reused={} stale={} rebind={} unreg={} "
+        "adstale={} adnone={}] "
         "shadow[valid={} ready={} draws={}] char[attempt={} valid={} drawn={} "
         "reused={}] dynobj[valid={} drawn={}] water[valid={} drawn={}] "
         "lw[ctxs={} ents={} stamp={} fade0={} resc={} fill={} pal={} rows={}] "
@@ -7191,7 +8599,10 @@ void LogFrameStats(const FrameScene& scene, uint64_t frames, uint32_t drawn,
         g_rr_tex_deferred.load(), g_r.tex_store.size(), g_r.tex_routes.size(),
         g_store_evicted.load(), g_heal_verify_fail.load(),
         g_demote_hold.load(),
-        g_tex_sticky_served.load(), g_skip_new.load(), g_ad_stale_served.load(),
+        g_tex_sticky_served.load(), g_skip_new.load(), g_skip_new_lighting.load(),
+        g_hold_expired.load(), g_chroma_neutral_draws.load(), g_placeholder_slots.load(),
+        g_mesh_identity_resets.load(), g_tex_stale_refused.load(),
+        g_item_rebinds.load(), g_tex_unregistered.load(), g_ad_stale_served.load(),
         g_ad_placeholder.load(), scene.shadow_valid,
         shadow_ready, shadow_draws,
         g_char_attempts.load(), g_char_valid.load(), g_char_drawn.load(),
@@ -7534,12 +8945,531 @@ void AddGuestOcclSkipped(uint32_t n) {
 
 namespace {
 
+// ---- New San Van jumbotrons ---------------------------------------------------
+// Skate 2's Stadium screens (incandescent.videoscreen) show the jumbotron clip
+// (skate3_jumbotron.cpp, tools/build_jumbotron_video.py) in their diffuse
+// slot: one BC1 texture with the clip's mips, rewritten whenever the playback
+// clock reaches a new clip frame while a screen was drawn recently. Until the
+// clip has loaded (or for good when it is missing) the texture is one black
+// block, so the screens read as switched off instead of the placeholder art.
+void DestroyJumbotron() {
+  g_r.device->DestroyDeferred(g_r.jumbo_srv);
+  g_r.device->DestroyDeferred(g_r.jumbo_tex);
+  for (nrhi::Buffer*& up : g_r.jumbo_up) {
+    g_r.device->DestroyDeferred(up);
+    up = nullptr;
+  }
+  g_r.jumbo_srv = nullptr;
+  g_r.jumbo_tex = nullptr;
+  g_r.jumbo_width = g_r.jumbo_height = g_r.jumbo_mips = 0;
+  g_r.jumbo_serial = 0;
+  g_r.jumbo_fresh = false;
+  g_r.jumbo_shown = -1;
+  std::fill(std::begin(g_r.jumbo_up_sub), std::end(g_r.jumbo_up_sub), uint64_t(0));
+  g_r.jumbo_up_next = 0;
+}
+
+bool CreateJumbotronTexture(nrhi::Device* device, uint32_t width, uint32_t height,
+                            uint32_t mips) {
+  DestroyJumbotron();
+  nrhi::TextureDesc desc;
+  desc.width = width;
+  desc.height = height;
+  desc.mip_levels = mips;
+  desc.format = nrhi::Format::kBC1_UNORM;
+  desc.initial_state = nrhi::ResourceState::kCopyDest;
+  nrhi::Texture* tex = device->CreateTexture(desc);
+  if (tex == nullptr) {
+    return false;
+  }
+  nrhi::TextureViewDesc vd;
+  vd.mip_levels = mips;
+  nrhi::TextureView* srv = device->CreateTextureView(tex, vd);
+  if (srv == nullptr) {
+    device->DestroyDeferred(tex);
+    return false;
+  }
+  g_r.jumbo_tex = tex;
+  g_r.jumbo_srv = srv;
+  g_r.jumbo_width = width;
+  g_r.jumbo_height = height;
+  g_r.jumbo_mips = mips;
+  g_r.jumbo_fresh = true;
+  return true;
+}
+
+// Copies one clip frame (all mips; black when src is null) into the texture
+// through a free upload-ring buffer. False while the GPU still reads all
+// three (the frame is simply retried next time).
+bool UploadJumbotronFrame(const NativeGuestOutputRenderContext& context,
+                          const uint8_t* src) {
+  nrhi::Device* device = context.device;
+  const uint64_t completed = device->CompletedSubmission();
+  int slot = -1;
+  for (uint32_t k = 0; k < 3; ++k) {
+    const uint32_t s = (g_r.jumbo_up_next + k) % 3;
+    if (g_r.jumbo_up[s] == nullptr || g_r.jumbo_up_sub[s] < completed) {
+      slot = int(s);
+      break;
+    }
+  }
+  if (slot < 0) {
+    return false;
+  }
+  constexpr uint32_t kMaxMips = 16;
+  uint32_t cols[kMaxMips], rows[kMaxMips], pitch[kMaxMips];
+  uint64_t offset[kMaxMips];
+  uint64_t total = 0;
+  const uint32_t mips = std::min(g_r.jumbo_mips, kMaxMips);
+  for (uint32_t m = 0; m < mips; ++m) {
+    cols[m] = (std::max(g_r.jumbo_width >> m, 1u) + 3) / 4;
+    rows[m] = (std::max(g_r.jumbo_height >> m, 1u) + 3) / 4;
+    pitch[m] = (cols[m] * 8 + (nrhi::kRowPitchAlignment - 1u)) &
+               ~(nrhi::kRowPitchAlignment - 1u);
+    total = (total + (kUploadPlacementAlignment - 1u)) &
+            ~uint64_t(kUploadPlacementAlignment - 1u);
+    offset[m] = total;
+    total += uint64_t(pitch[m]) * rows[m];
+  }
+  nrhi::Buffer*& up = g_r.jumbo_up[slot];
+  if (up != nullptr && up->size() < total) {
+    device->DestroyDeferred(up);
+    up = nullptr;
+  }
+  if (up == nullptr) {
+    up = CreateUploadBuffer(device, size_t(total), nrhi::BufferBindClass::kCopySrc);
+    if (up == nullptr) {
+      return false;
+    }
+  }
+  uint8_t* mapping = static_cast<uint8_t*>(device->Map(up));
+  if (mapping == nullptr) {
+    return false;
+  }
+  const uint8_t* s = src;
+  for (uint32_t m = 0; m < mips; ++m) {
+    const uint32_t row_bytes = cols[m] * 8;
+    for (uint32_t r = 0; r < rows[m]; ++r) {
+      uint8_t* dst = mapping + offset[m] + size_t(r) * pitch[m];
+      if (s != nullptr) {
+        std::memcpy(dst, s, row_bytes);
+        s += row_bytes;
+      } else {
+        std::memset(dst, 0, row_bytes);  // color0 = color1 = 0, index 0: black
+      }
+    }
+  }
+  device->Unmap(up);
+  nrhi::Cmd* cmd = context.cmd;
+  if (!g_r.jumbo_fresh) {
+    cmd->Barrier(g_r.jumbo_tex, nrhi::ResourceState::kPixelShaderResource,
+                 nrhi::ResourceState::kCopyDest);
+  }
+  cmd->FlushBarriers();
+  for (uint32_t m = 0; m < mips; ++m) {
+    cmd->CopyBufferToTexture(g_r.jumbo_tex, m, 0, up, offset[m], pitch[m], cols[m] * 4,
+                             rows[m] * 4, 1);
+  }
+  cmd->Barrier(g_r.jumbo_tex, nrhi::ResourceState::kCopyDest,
+               nrhi::ResourceState::kPixelShaderResource);
+  cmd->FlushBarriers();
+  g_r.jumbo_fresh = false;
+  g_r.jumbo_up_sub[slot] = device->CurrentSubmission();
+  g_r.jumbo_up_next = uint32_t(slot + 1) % 3;
+  return true;
+}
+
+void UpdateJumbotron(const NativeGuestOutputRenderContext& context, uint64_t frame_number) {
+  if (!REXCVAR_GET(skate3_skate2_jumbotron) || !skate3::world_loading::IsSkate2Gameplay()) {
+    if (g_r.jumbo_tex != nullptr) {
+      DestroyJumbotron();
+      skate3::jumbotron::Release();  // left New San Van: free the clip
+    }
+    return;
+  }
+  const skate3::jumbotron::Clip* clip = skate3::jumbotron::Acquire();
+  const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  if (clip != nullptr && g_r.jumbo_serial != clip->serial) {
+    if (!CreateJumbotronTexture(context.device, clip->width, clip->height, clip->mips)) {
+      static std::atomic<uint32_t> s_fail_logs{0};
+      if (s_fail_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        REXLOG_WARN("jumbotron: texture creation failed ({}x{} x{} mips)", clip->width,
+                    clip->height, clip->mips);
+      }
+      return;
+    }
+    g_r.jumbo_serial = clip->serial;
+    g_r.jumbo_t0_us = now_us;
+  } else if (g_r.jumbo_tex == nullptr) {
+    if (!CreateJumbotronTexture(context.device, 4, 4, 1)) {
+      return;
+    }
+  }
+  if (g_r.jumbo_serial == 0) {
+    if (g_r.jumbo_fresh) {
+      UploadJumbotronFrame(context, nullptr);  // black stand-in
+    }
+    return;
+  }
+  if (clip == nullptr) {
+    return;
+  }
+  // Upload only while a screen was drawn recently; the clock keeps running.
+  if (!g_r.jumbo_fresh && frame_number > g_r.jumbo_seen_frame + 30) {
+    return;
+  }
+  const int64_t index =
+      int64_t(double(now_us - g_r.jumbo_t0_us) * 1e-6 * clip->fps) % int64_t(clip->frames);
+  if (index == g_r.jumbo_shown && !g_r.jumbo_fresh) {
+    return;
+  }
+  if (UploadJumbotronFrame(context, clip->Frame(uint32_t(index)))) {
+    g_r.jumbo_shown = index;
+  }
+}
+
+// User-marker lighting history (RequestLightHistory): the ~10 s before the
+// press go to the log as runs of frames that share one lighting state (a
+// one- or two-frame flash stands out as a short run between long ones); the
+// whole ring goes to logs/light_history_<marker>_<unix time>.csv.
+void MaybeDumpLightHistory() {
+  const uint32_t marker = g_light_history_marker.exchange(0, std::memory_order_acq_rel);
+  if (marker == 0) {
+    return;
+  }
+  const uint64_t count = std::min<uint64_t>(g_light_ring_count, kLightRingFrames);
+  if (count == 0) {
+    REXLOG_WARN("native-scene light history #{}: no frames recorded", marker);
+    return;
+  }
+  const uint64_t first = g_light_ring_count - count;
+  const auto at = [&](uint64_t i) -> const LightFrame& {
+    return g_light_ring[(first + i) % kLightRingFrames];
+  };
+  static constexpr const char* kPathNames[] = {
+      "native", "menus", "no-base", "photo", "photo-editor", "cas-editor",
+      "no-scene", "pipeline", "movie", "takeover"};
+  const auto path_name = [](uint8_t path) {
+    return path < std::size(kPathNames) ? kPathNames[path] : "other";
+  };
+  static constexpr const char* kReasonNames[] = {"", "new", "periodic", "content",
+                                                 "drift", "sun"};
+  const int64_t t_end = at(count - 1).t_us;
+  uint64_t begin = count;
+  while (begin > 0 && t_end - at(begin - 1).t_us <= 10'000'000) {
+    --begin;
+  }
+
+  // Totals over the logged window.
+  uint32_t calls = 0, native = 0, term_on = 0, term_held = 0, term_off = 0, loading = 0;
+  uint32_t yields[std::size(kPathNames) + 1] = {};
+  uint32_t rebuilds = 0, rebuild_by[6] = {};
+  for (uint64_t i = begin; i < count; ++i) {
+    const LightFrame& f = at(i);
+    ++calls;
+    if (f.path != kLightNative) {
+      ++yields[std::min<size_t>(f.path, std::size(kPathNames))];
+      continue;
+    }
+    ++native;
+    loading += (f.gate & kLightLoading) ? 1 : 0;
+    if ((f.gate & kLightActive) != 0) {
+      ++term_on;
+      term_held += (f.gate & kLightHeld) ? 1 : 0;
+    } else if ((f.gate & kLightEnabled) != 0 && (f.gate & kLightLoading) == 0) {
+      ++term_off;
+    }
+    if ((f.gate & kLightRebuilt) != 0) {
+      ++rebuilds;
+      ++rebuild_by[std::min<uint8_t>(f.rebuild_reason, 5)];
+    }
+  }
+  std::string yield_text;
+  for (size_t p = 1; p <= std::size(kPathNames); ++p) {
+    if (yields[p] != 0) {
+      yield_text += ' ';
+      yield_text += p < std::size(kPathNames) ? kPathNames[p] : "other";
+      yield_text += '=';
+      yield_text += std::to_string(yields[p]);
+    }
+  }
+  REXLOG_WARN(
+      "native-scene light history #{}: {:.1f} s before the press, {} frames: {} native "
+      "(static shadow term on {}, of those held {}; off {}; loading {}), yielded to the "
+      "emulated output:{}; static map rebuilds {} (new {} periodic {} content {} drift {} "
+      "sun {})",
+      marker, double(t_end - at(begin).t_us) / 1e6, calls, native, term_on, term_held,
+      term_off, loading, yield_text.empty() ? " none" : yield_text, rebuilds,
+      rebuild_by[1], rebuild_by[2], rebuild_by[3], rebuild_by[4], rebuild_by[5]);
+
+  // Runs of one lighting state. The CSM-drew bit and the rebuild/hold
+  // events are counted per run instead of splitting it.
+  const auto state_of = [](const LightFrame& f) -> uint64_t {
+    const uint16_t gate_bits =
+        f.gate & (kLightEnabled | kLightServable | kLightMap | kLightFresh | kLightLive |
+                  kLightHeld | kLightActive | kLightLoading | kLightSkate2);
+    return uint64_t(f.path) | (uint64_t(gate_bits) << 8) |
+           (uint64_t(std::lround(f.strength * 20.0f)) << 24) |
+           (uint64_t(std::lround(f.venue * 20.0f)) << 32);
+  };
+  struct Run {
+    uint64_t begin, end;  // ring indices, inclusive
+    uint32_t csm_off = 0, rebuilds = 0, holds = 0, max_age = 0;
+    uint8_t reasons = 0;
+  };
+  std::vector<Run> runs;
+  for (uint64_t i = begin; i < count; ++i) {
+    const LightFrame& f = at(i);
+    if (runs.empty() || state_of(at(runs.back().end)) != state_of(f)) {
+      runs.push_back({i, i});
+    }
+    Run& r = runs.back();
+    r.end = i;
+    if (f.path == kLightNative) {
+      r.csm_off += (f.gate & kLightCsm) ? 0 : 1;
+      r.holds += (f.gate & (kLightSunHold | kLightAxisHold)) ? 1 : 0;
+      r.max_age = std::max(r.max_age, f.shadow_age);
+      if ((f.gate & kLightRebuilt) != 0) {
+        ++r.rebuilds;
+        r.reasons |= uint8_t(1u << std::min<uint8_t>(f.rebuild_reason, 7));
+      }
+    }
+  }
+  constexpr size_t kMaxRuns = 48;
+  if (runs.size() > kMaxRuns) {
+    REXLOG_WARN("  ({} earlier runs omitted; the CSV has every frame)",
+                runs.size() - kMaxRuns);
+  }
+  for (size_t k = runs.size() > kMaxRuns ? runs.size() - kMaxRuns : 0; k < runs.size(); ++k) {
+    const Run& r = runs[k];
+    const LightFrame& f = at(r.begin);
+    const double t0 = double(f.t_us - t_end) / 1e6;
+    const double t1 = double(at(r.end).t_us - t_end) / 1e6;
+    const uint64_t frames = r.end - r.begin + 1;
+    if (f.path != kLightNative) {
+      REXLOG_WARN("  {:+.2f}s..{:+.2f}s {:4} fr  YIELDED ({}): the emulated output showed",
+                  t0, t1, frames, path_name(f.path));
+      continue;
+    }
+    std::string reasons;
+    for (int b = 1; b <= 5; ++b) {
+      if (r.reasons & (1u << b)) {
+        reasons += reasons.empty() ? "" : "+";
+        reasons += kReasonNames[b];
+      }
+    }
+    const bool on = (f.gate & kLightActive) != 0;
+    REXLOG_WARN(
+        "  {:+.2f}s..{:+.2f}s {:4} fr  native{}  static shadows {}{} str={:.2f} venue={:.2f} "
+        "[map={} fresh={} live={} held={} servable={} enabled={}] max_age={} csm_off={} "
+        "rebuilds={}{}{} sun_holds={} cam=({:.0f},{:.0f},{:.0f}) items={}",
+        t0, t1, frames, (f.gate & kLightLoading) ? " LOADING" : "", on ? "ON" : "OFF",
+        (on && (f.gate & kLightHeld)) ? " (held)" : "", f.strength, f.venue,
+        (f.gate & kLightMap) ? 1 : 0, (f.gate & kLightFresh) ? 1 : 0,
+        (f.gate & kLightLive) ? 1 : 0, (f.gate & kLightHeld) ? 1 : 0,
+        (f.gate & kLightServable) ? 1 : 0, (f.gate & kLightEnabled) ? 1 : 0, r.max_age,
+        r.csm_off, r.rebuilds, reasons.empty() ? "" : " ", reasons, r.holds, f.cam[0],
+        f.cam[1], f.cam[2], f.items);
+  }
+
+  char path[160];
+  std::snprintf(path, sizeof(path), "logs/light_history_%u_%lld.csv", marker,
+                static_cast<long long>(std::time(nullptr)));
+  std::ofstream csv(path);
+  if (!csv) {
+    REXLOG_WARN("native-scene light history: cannot open {}", path);
+    return;
+  }
+  csv << "t_ms,frame,path,loading,skate2,enabled,servable,map,fresh,csm,capture_seen,live,"
+         "held,active,shadow_valid,sun_hold,axis_hold,rebuilt,rebuild_reason,shadow_age,"
+         "shadow_draws,strength,venue,items,casters,generation,cam_x,cam_y,cam_z,"
+         "csm_bot,csm_top,csm_r0,csm_s1,csm_s2,ws_reprime\n";
+  char line[512];
+  for (uint64_t i = 0; i < count; ++i) {
+    const LightFrame& f = at(i);
+    const auto bit = [&](uint16_t b) { return (f.gate & b) ? 1 : 0; };
+    std::snprintf(line, sizeof(line),
+                  "%.1f,%llu,%s,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%u,%u,%.3f,"
+                  "%.3f,%u,%u,%llu,%.2f,%.2f,%.2f,%.3f,%.3f,%.2f,%.5f,%.5f,%u\n",
+                  double(f.t_us - t_end) / 1e3, static_cast<unsigned long long>(f.frame),
+                  path_name(f.path), bit(kLightLoading), bit(kLightSkate2), bit(kLightEnabled),
+                  bit(kLightServable), bit(kLightMap), bit(kLightFresh), bit(kLightCsm),
+                  bit(kLightSeen), bit(kLightLive), bit(kLightHeld), bit(kLightActive),
+                  bit(kLightShadowValid), bit(kLightSunHold), bit(kLightAxisHold),
+                  bit(kLightRebuilt),
+                  (f.gate & kLightRebuilt) ? kReasonNames[std::min<uint8_t>(f.rebuild_reason, 5)]
+                                           : "",
+                  f.shadow_age, unsigned(f.shadow_draws), double(f.strength), double(f.venue),
+                  f.items, f.casters, static_cast<unsigned long long>(f.generation),
+                  double(f.cam[0]), double(f.cam[1]), double(f.cam[2]), double(f.csm_bot),
+                  double(f.csm_top), double(f.csm_r0), double(f.csm_s1), double(f.csm_s2),
+                  unsigned(f.ws_reprime));
+    csv << line;
+  }
+  REXLOG_WARN("native-scene light history #{}: {} frames ({:.1f} s) -> {}", marker, count,
+              double(t_end - at(0).t_us) / 1e6, path);
+}
+
+// One-shot shadow probe on the frame a lighting-history marker (Insert/F10)
+// is pending: the dynamic-shadow receiver rows and every movable prop within
+// 15 m of the camera, with where its lowest point falls in each shadow map
+// (CSM height window + cascade, the props' world-shadow map). For prop feet
+// that change shade as the camera moves.
+static void LogShadowProbe(const FrameScene& scene) {
+  const float* sh = scene.shadow_rows;
+  const float* cam = scene.cam_pos;
+  const float zy = std::fabs(sh[17]);
+  REXLOG_WARN(
+      "shadow-probe: cam=({:.2f},{:.2f},{:.2f}) valid={} c0=({:.5f},{:.5f},{:.5f},{:.3f}) "
+      "c1=({:.4f},{:.4f},{:.4f},{:.4f}) c2=({:.4f},{:.4f},{:.4f},{:.4f}) "
+      "c3=({:.5f},{:.5f},{:.5f},{:.3f}) c4=({:.6f},{:.6f},{:.6f},{:.4f}) "
+      "prop_bias_m=({:.3f},{:.3f}) pcss={}",
+      cam[0], cam[1], cam[2], scene.shadow_valid ? 1 : 0, sh[0], sh[1], sh[2], sh[3],
+      sh[4], sh[5], sh[6], sh[7], sh[8], sh[9], sh[10], sh[11], sh[12], sh[13], sh[14],
+      sh[15], sh[16], sh[17], sh[18], sh[19], zy > 1e-6f ? 0.007f / zy : 0.0f,
+      zy > 1e-6f ? 0.015f / zy : 0.0f,
+      REXCVAR_GET(skate3_native_render_scene_shadow_pcss) ? 1 : 0);
+  const float* wb = g_r.world_shadow_rows;
+  const float* wc = scene.dynobj_ws;
+  REXLOG_WARN(
+      "shadow-probe: world-shadow primed={} valid={} built_z=({:.6f},{:.6f},{:.6f},{:.5f}) "
+      "live_z=({:.6f},{:.6f},{:.6f},{:.5f}) built_x=({:.6f},{:.6f},{:.6f},{:.4f}) "
+      "live_x=({:.6f},{:.6f},{:.6f},{:.4f})",
+      g_r.world_shadow_primed ? 1 : 0, scene.dynobj_ws_valid ? 1 : 0, wb[8], wb[9], wb[10],
+      wb[11], wc[8], wc[9], wc[10], wc[11], wb[0], wb[1], wb[2], wb[3], wc[0], wc[1], wc[2],
+      wc[3]);
+  struct Near {
+    float dist;
+    const DrawItem* item;
+    float lo[3], hi[3];
+  };
+  std::vector<Near> props;
+  for (const DrawItem& item : scene.items) {
+    if (item.dynobj == 0) {
+      continue;
+    }
+    Near n{0.0f, &item, {1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
+    for (int corner = 0; corner < 8; ++corner) {
+      const float p[3] = {(corner & 1) ? item.bbox_max[0] : item.bbox_min[0],
+                          (corner & 2) ? item.bbox_max[1] : item.bbox_min[1],
+                          (corner & 4) ? item.bbox_max[2] : item.bbox_min[2]};
+      for (int a = 0; a < 3; ++a) {
+        const float w = p[0] * item.world[0 + a] + p[1] * item.world[4 + a] +
+                        p[2] * item.world[8 + a] + item.world[12 + a];
+        n.lo[a] = std::min(n.lo[a], w);
+        n.hi[a] = std::max(n.hi[a], w);
+      }
+    }
+    const float dx = 0.5f * (n.lo[0] + n.hi[0]) - cam[0];
+    const float dz = 0.5f * (n.lo[2] + n.hi[2]) - cam[2];
+    n.dist = std::sqrt(dx * dx + dz * dz);
+    if (n.dist <= 15.0f) {
+      props.push_back(n);
+    }
+  }
+  std::sort(props.begin(), props.end(),
+            [](const Near& a, const Near& b) { return a.dist < b.dist; });
+  if (props.size() > 24) {
+    props.resize(24);
+  }
+  for (const Near& n : props) {
+    // The prop's lowest point under its bbox center.
+    const float p[3] = {0.5f * (n.lo[0] + n.hi[0]), n.lo[1], 0.5f * (n.lo[2] + n.hi[2])};
+    const float csm_d = sh[16] * p[0] + sh[17] * p[1] + sh[18] * p[2] + sh[19];
+    const float lx = sh[0] * p[0] + sh[1] * p[1] + sh[2] * p[2] + sh[3];
+    const float ly = sh[12] * p[0] + sh[13] * p[1] + sh[14] * p[2] + sh[15];
+    int casc = 0;
+    if (std::max(std::fabs(lx), std::fabs(ly)) < 0.99f) {
+      casc = 1;
+    } else if (std::max(std::fabs(lx * sh[4] + sh[6]), std::fabs(ly * sh[5] + sh[7])) < 0.99f) {
+      casc = 2;
+    } else if (std::max(std::fabs(lx * sh[8] + sh[10]), std::fabs(ly * sh[9] + sh[11])) < 0.99f) {
+      casc = 3;
+    }
+    const float ws_d = wb[8] * p[0] + wb[9] * p[1] + wb[10] * p[2] + wb[11];
+    const float ws_u = (wb[0] * p[0] + wb[1] * p[1] + wb[2] * p[2] + wb[3]) * 256.0f + 256.0f;
+    const float ws_v = -(wb[4] * p[0] + wb[5] * p[1] + wb[6] * p[2] + wb[7]) * 256.0f + 256.0f;
+    REXLOG_WARN(
+        "shadow-probe: prop mesh={:08X} {} dist={:.1f} xz=({:.2f},{:.2f}) y=[{:.3f},{:.3f}] "
+        "csm_depth_bottom={:.4f} cascade={} ls=({:.3f},{:.3f}) ws_depth_bottom={:.5f} "
+        "ws_texel=({:.2f},{:.2f}) world_rot_y=({:.3f},{:.3f},{:.3f})",
+        n.item->mesh, n.item->material_name, n.dist, p[0], p[2], n.lo[1], n.hi[1], csm_d,
+        casc, lx, ly, ws_d, ws_u, ws_v, n.item->world[4], n.item->world[5],
+        n.item->world[6]);
+  }
+  REXLOG_WARN("shadow-probe: {} movable props within 15 m", props.size());
+}
+
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
   if (!SceneEnabled() ||
       (context.backend != NativeGuestOutputBackend::kD3D12 &&
        context.backend != NativeGuestOutputBackend::kVulkan)) {
     return false;
   }
+  // Lighting history (RequestLightHistory): one record per call, pushed on
+  // every return; each yield below names itself.
+  struct LightRecord {
+    LightFrame f;
+    LightRecord() {
+      f.t_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count();
+      f.frame = g_frames_rendered.load(std::memory_order_relaxed);
+      if (skate3::world_loading::IsSkate2Gameplay()) {
+        f.gate |= kLightSkate2;
+      }
+      g_light_cur = &f;
+    }
+    ~LightRecord() {
+      g_light_cur = nullptr;
+      g_light_ring[g_light_ring_count++ % kLightRingFrames] = f;
+      MaybeDumpLightHistory();
+    }
+    LightRecord(const LightRecord&) = delete;
+    LightRecord& operator=(const LightRecord&) = delete;
+  } light;
+  // Perf recorder (skate3_perf_recorder.h): one record per call, pushed on
+  // every return like the lighting history (destroyed first, so light.f is
+  // complete). The phase split is filled on the fully rendered path from
+  // this call's PerfWindow deltas (perf_pw0).
+  struct PerfRecord {
+    skate3::perf_recorder::RenderRecord r;
+    PerfClock::time_point t0 = PerfClock::now();
+    uint64_t cycles0 = skate3::perf_recorder::ThreadCycles();
+    const LightFrame* light = nullptr;
+    PerfRecord() = default;
+    PerfRecord(const PerfRecord&) = delete;
+    PerfRecord& operator=(const PerfRecord&) = delete;
+    ~PerfRecord() {
+      r.total_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                PerfClock::now() - t0)
+                                .count());
+      r.cpu_cycles = skate3::perf_recorder::ThreadCycles() - cycles0;
+      if (light != nullptr) {
+        r.path = light->path;
+        r.nsm_rebuild = (light->gate & kLightRebuilt) != 0 ? light->rebuild_reason : 0;
+        r.ws_recenter = light->ws_reprime;
+        r.items = light->items;
+      }
+      skate3::perf_recorder::OnRenderFrame(r);
+    }
+  } perf_rec;
+  perf_rec.light = &light.f;
+  const PerfWindow* const perf_pw[] = {&g_pw_pre,    &g_pw_items, &g_pw_shadow,
+                                       &g_pw_settle, &g_pw_commit, &g_pw_2d,
+                                       &g_pw_tail,   &g_pw_mesh_decode, &g_pw_tex_decode};
+  uint64_t perf_pw0_ns[std::size(perf_pw)];
+  uint64_t perf_pw0_count[std::size(perf_pw)];
+  for (size_t i = 0; i < std::size(perf_pw); ++i) {
+    perf_pw0_ns[i] = perf_pw[i]->ns.load(std::memory_order_relaxed);
+    perf_pw0_count[i] = perf_pw[i]->count.load(std::memory_order_relaxed);
+  }
+  const auto light_yield = [&light](uint8_t path) {
+    light.f.path = path;
+    return false;
+  };
   {
     // Debug stress driver (skate3_native_render_scene_maxq_cycle): cycles
     // the max-quality toggle to exercise the hot rebuild path.
@@ -7566,19 +9496,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     UpdatePhotoGrabWindow(base);
   }
   if (YieldForMenus(context)) {
-    return false;
+    return light_yield(kLightYieldMenus);
   }
   if (base == nullptr) {
-    return false;
+    return light_yield(kLightYieldNoBase);
   }
   if (YieldForPhotoDisplay()) {
-    return false;
+    return light_yield(kLightYieldPhoto);
   }
   if (YieldForPhotoEditor(base)) {
-    return false;
+    return light_yield(kLightYieldPhotoEditor);
   }
   if (YieldForCasEditor(base)) {
-    return false;
+    return light_yield(kLightYieldCasEditor);
   }
 
   const auto render_t0 = PerfClock::now();
@@ -7614,9 +9544,26 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         fresh && (g_scene->items.size() >=
                       size_t(REXCVAR_GET(skate3_native_render_scene_warmup_min_items)) ||
                   (!g_scene->items.empty() && CasEditorActive(base)));
+    if (REXCVAR_GET(skate3_native_render_scene_capture_log)) {
+      static auto last = std::chrono::steady_clock::time_point{};
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last >= std::chrono::seconds(1)) {
+        last = now;
+        REXLOG_INFO("native-scene gate: ready={} fresh={} generation={} required={} items={} minimum={} camera=({:.3f},{:.3f},{:.3f})",
+                    ready, fresh, g_scene ? g_scene->generation : 0,
+                    g_warmup_fresh_generation, g_scene ? g_scene->items.size() : 0,
+                    REXCVAR_GET(skate3_native_render_scene_warmup_min_items),
+                    g_scene ? g_scene->cam_pos[0] : 0.f,
+                    g_scene ? g_scene->cam_pos[1] : 0.f,
+                    g_scene ? g_scene->cam_pos[2] : 0.f);
+      }
+    }
     loading_native = !ready;
   }
   g_loading_hold = loading_native;
+  if (loading_native) {
+    light.f.gate |= kLightLoading;
+  }
   std::shared_ptr<const FrameScene> scene_ptr;
   if (loading_native) {
     // Native loading screen: there is no current world scene (g_scene holds
@@ -7630,14 +9577,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   } else {
     std::lock_guard<std::mutex> lock(g_scene_mutex);
     if (!g_scene || g_scene->items.empty()) {
-      return false;
+      return light_yield(kLightYieldNoScene);
     }
     scene_ptr = g_scene;
   }
   const FrameScene& scene = *scene_ptr;
 
   if (!EnsurePipeline(context)) {
-    return false;
+    return light_yield(kLightYieldPipeline);
   }
   // Flush any barriers pushed by lazy resource creation (white texture).
   context.cmd->FlushBarriers();
@@ -7684,7 +9631,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                          REXCVAR_GET(skate3_native_render_scene_fmv_native) &&
                          g_r.pso_yuv2d != nullptr;
   if (!movie_sub && YieldForMovie()) {
-    return false;
+    return light_yield(kLightYieldMovie);
   }
 
   nrhi::Cmd* cmd = context.cmd;
@@ -7699,6 +9646,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       RendererState::kBoneRegionSize;
   g_r.bone_ring_offset = 0;
   g_r.ropa_ring_offset = 0;
+  g_ropa_vb_memo.clear();
 
   {
     const std::string tm(REXCVAR_GET(skate3_native_render_scene_trace_mesh));
@@ -7756,7 +9704,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // committing worker results meanwhile; every pre-takeover frame
         // counts on map changes.
         PrewarmCommit(context, frame_number);
-        return false;
+        return light_yield(kLightYieldTakeover);
       }
       if (!small_or_stale) {
         g_warmup_armed.store(false, std::memory_order_relaxed);
@@ -7839,6 +9787,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   EvictTexStore(frame_number, context.device->CurrentSubmission());
   EvictMeshStore(frame_number);
   EvictCubeStore(frame_number, context.device->CurrentSubmission());
+  // New San Van jumbotrons: stream this frame's clip image (copies stay
+  // outside the render passes).
+  UpdateJumbotron(context, frame_number);
 
   bool shadow_ready = false;
   uint32_t shadow_draws = 0;
@@ -7847,9 +9798,30 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   const int32_t debug_mode = REXCVAR_GET(skate3_native_render_scene_debug);
   cmd->ProfileRegion(nrhi::ProfileStage::kShadow);
   shadow_ready =
-      RenderShadowAtlas(context, scene, bone_region, debug_mode, &shadow_draws);
+      RenderShadowAtlas(context, scene, bone_region, frame_number, debug_mode,
+                        &shadow_draws);
   cmd->ProfileRegion(nrhi::ProfileStage::kStaticSun);
   RenderStaticSunMap(context, scene, bone_region, debug_mode, frame_number);
+  UpdateStaticSunGate(scene, shadow_ready, debug_mode, frame_number);
+  light.f.path = kLightNative;
+  light.f.generation = scene.generation;
+  light.f.items = uint32_t(scene.items.size());
+  light.f.shadow_draws = uint16_t(std::min<uint32_t>(shadow_draws, 0xFFFFu));
+  std::memcpy(light.f.cam, scene.cam_pos, sizeof(light.f.cam));
+  // Lighting history: the dynamic-shadow height window (the c4 depth row is
+  // a pure height ramp) at the camera's x/z, and the cascade extents.
+  if (scene.shadow_valid && std::fabs(sh[17]) > 1e-6f) {
+    const float d0 = sh[19] + sh[16] * scene.cam_pos[0] + sh[18] * scene.cam_pos[2];
+    light.f.csm_bot = (1.0f - d0) / sh[17];
+    light.f.csm_top = -d0 / sh[17];
+    const float xl = std::sqrt(sh[0] * sh[0] + sh[1] * sh[1] + sh[2] * sh[2]);
+    light.f.csm_r0 = xl > 1e-8f ? 1.0f / xl : 0.0f;
+    light.f.csm_s1 = sh[4];
+    light.f.csm_s2 = sh[8];
+  }
+  if (g_light_history_marker.load(std::memory_order_relaxed) != 0) {
+    LogShadowProbe(scene);
+  }
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
   cmd->ProfileRegion(nrhi::ProfileStage::kMain);
   // Scene-level flicker probe: the shadow cascade rows (or validity/readiness)
@@ -7917,7 +9889,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
   cmd->ClearRenderTarget(scene_color, clear_color);
   if (use_depth) {
-    cmd->ClearDepth(g_r.depth, 1.0f);
+    cmd->ClearDepth(g_r.depth, kReversedZ ? 0.0f : 1.0f);
     cmd->SetRenderTargets(scene_color, g_r.depth);
   } else {
     cmd->SetRenderTargets(scene_color, nullptr);
@@ -7945,12 +9917,49 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // per-frame CBV ring: the 52-float root-constant block is full) and the
   // blurred atlas at t5 (white when no atlas was rendered this frame; the
   // shader is also gated by sh_misc.y).
+  // One clock for authored S2 PCA frames and UV scrolling (seconds).
+  static const auto water_t0 = std::chrono::steady_clock::now();
+  const float water_time = float(std::fmod(std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - water_t0).count(), 3600.0));
   if (g_r.shadow_cb != nullptr) {
     const uint32_t cb_offset =
         uint32_t(frame_number % RendererState::kShadowCbRegions) *
         RendererState::kShadowCbSlice;
     float* cb = reinterpret_cast<float*>(g_r.shadow_cb_cpu + cb_offset);
     std::memset(cb, 0, RendererState::kShadowCbSlice);
+    // Dedicated rows keep the S2 30-Hz PCA table independent of S3 ocean
+    // captures, including during transitions between the two worlds.
+    static_assert(RendererState::kShadowCbSlice >= (164 + 28) * sizeof(float));
+    const unsigned water_frame = unsigned(water_time * 30.0f) % 30;
+    std::memcpy(cb + 164, skate3::skate2_water::kPcaFrames[water_frame],
+                28 * sizeof(float));
+    static_assert(RendererState::kShadowCbSlice >= (196 + 24) * sizeof(float));
+    if (skate3::world_loading::IsSkate2Gameplay()) {
+      // Original Skate 2 m_params (skater.vlt/bin, material_animated
+      // collections `flag` and `tree`; out/research/log081/
+      // s2_material_params.py). Same clock as the S2 water animation.
+      static constexpr float kS2AnimRows[24] = {
+          0.0f, 1.0f, 0.0f, 0.1f, 10.0f, 9.0f, 5.0f, 0.1f, 1.0f, 6.0f, 5.0f, 0.2f,   // flag
+          0.0f, 1.0f, 0.0f, 0.2f, 2.0f, 3.0f, 5.0f, 0.1f, 1.0f, 2.0f, 4.0f, 0.2f};  // tree
+      cb[192] = water_time;
+      cb[193] = 1.0f;
+      std::memcpy(cb + 196, kS2AnimRows, sizeof(kS2AnimRows));
+    }
+    // scene_opts (cb[220..223]): x = smooth lightmap reconstruction, y = the
+    // cube LOD bias log2(render height / 640) for the Skate 2 reflection
+    // term (the console fetches at its 640p gradients; see fams 5/6).
+    static_assert(RendererState::kShadowCbSlice >= 224 * sizeof(float));
+    cb[220] = REXCVAR_GET(skate3_native_render_scene_lightmap_smooth) ? 1.0f : 0.0f;
+    cb[221] = log2f(std::max(1.0f, float(context.guest_output_height) / 640.0f));
+    // w: the Skate 2 ocean's (family 35) low-angle Fresnel rise kept.
+    cb[223] = float(std::clamp(REXCVAR_GET(skate3_skate2_ocean_glare), 0.0, 1.0));
+    // night_grade (cb[224..227]): New San Vanelona at night scales the world's
+    // baked light (lightmapped and pre-lit families, after the shadow clamp)
+    // by kNightGrade; w = 1 enables. Zero (the memset) = off.
+    static_assert(RendererState::kShadowCbSlice >= 228 * sizeof(float));
+    if (NightGrade(cb + 224)) {
+      cb[227] = 1.0f;
+    }
     if (shadow_ready) {
       std::memcpy(cb + 0, sh + 0, 4 * sizeof(float));    // sh_x   = PS c0
       std::memcpy(cb + 4, sh + 12, 4 * sizeof(float));   // sh_y   = PS c3
@@ -7976,6 +9985,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cb[58] = scene.char_shadow_bias[2];
         cb[59] = 1.0f;
       }
+    } else if (scene.shadow_valid) {
+      // No dynamic caster drew this frame (shadow_ready is per-frame: e.g.
+      // the skater's pieces missed the game's ortho bank): the CSM stays
+      // off (sh_misc.y = 0), but the shadow COLOR is part of the frame's
+      // world rows and the static sun-shadow term still applies. Leaving it
+      // zero flashed every static shadow toward black on the exact
+      // families (min(lm, s + 0)) and dropped the legacy-path receive
+      // entirely (its gate), the one-frame "shadows switch off / lit-up
+      // doors" flashes.
+      cb[20] = sh[32];
+      cb[21] = sh[33];
+      cb[22] = sh[34];
+      cb[23] = 0.299f * sh[32] + 0.587f * sh[33] + 0.114f * sh[34];
     }
     // PCSS soft-shadow rows (sh_pcss / sh_pcss2, cb[136..143]). Filled
     // whenever the light rows are valid; the static sun-shadow sampler
@@ -8010,12 +10032,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // pass this frame sh_color is zero, so the exact env families clamp
     // min(lm^2, s + sh_color) to pure black - the missing walls/floor.
     // The game itself never sun-shadows static world geometry indoors;
-    // standing the map down restores its exact lm^2 shading.
-    if (g_r.static_sun_valid && scene.shadow_fresh) {
+    // standing the map down restores its exact lm^2 shading. The decision
+    // (g_r.nsm_active) holds through one-frame gate lapses, see
+    // UpdateStaticSunGate; enclosed New San Van venues scale the strength
+    // (StaticSunVenueFactor), 0 standing the term down there.
+    if (g_r.nsm_active) {
       std::memcpy(cb + 144, g_r.nsm_rows, sizeof(g_r.nsm_rows));
+      const float venue = StaticSunVenueFactor(scene.cam_pos);
       cb[156] = std::clamp(
           float(REXCVAR_GET(skate3_native_render_scene_shadow_static_strength)),
+          0.0f, 1.0f) * venue;
+      // scene_opts.z: the same strength without the venue factor, for the
+      // Stadium crowd seating (misc.y = -1, see IsSkate2StadiumCrowd).
+      cb[222] = std::clamp(
+          float(REXCVAR_GET(skate3_native_render_scene_shadow_static_strength)),
           0.0f, 1.0f);
+      if (g_light_cur != nullptr) {
+        g_light_cur->strength = cb[156];
+        g_light_cur->venue = venue;
+      }
       cb[157] = 1.0f / g_r.nsm_radius;  // far-tile uc units per meter
       cb[158] = g_r.nsm_depth_range;    // meters per depth unit
       // Filter floor: 2 physical texels (uc spans [-1,1] over one tile);
@@ -8082,9 +10117,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[53] = scene.dynobj_rows[9];  // static world-shadow floor (c8.w)
       // Static world-shadow transform rows (dyn_wsx/dyn_wsy/dyn_wsz,
       // cb[64..75]): consumed only when a draw carries the misc.z world-
-      // shadow bind flag (the map primed and bound at t4).
+      // shadow bind flag (the map primed and bound at t4). Always the HELD
+      // rows the map was rendered with, never this frame's capture (see the
+      // world-shadow pass in RenderShadowAtlas).
       if (scene.dynobj_ws_valid) {
-        std::memcpy(cb + 64, scene.dynobj_ws, sizeof(scene.dynobj_ws));
+        std::memcpy(cb + 64,
+                    g_r.world_shadow_primed ? g_r.world_shadow_rows : scene.dynobj_ws,
+                    12 * sizeof(float));
       }
     }
     // flowingwateralpha m_params rows (wat_p0..wat_p3 at cb[76..91]):
@@ -8119,13 +10158,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // v2 material table default (t8/t9 white) + the static sun-shadow map
     // at its third entry (t10); every lit branch samples it, so the table
     // must be bound for all draws, not only the v2/ocean re-binds.
-    nrhi::TextureView* t8_default[3] = {
+    nrhi::TextureView* t8_default[4] = {
         g_r.white.srv, g_r.white.srv,
-        g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv};
-    cmd->SetTextures(8, t8_default, 3);
+        g_r.nsm_active ? g_r.static_sun_srv : g_r.white.srv, g_r.white.srv};
+    cmd->SetTextures(8, t8_default, 4);
   }
   nrhi::TextureView* const nsm_view =
-      g_r.static_sun_valid ? g_r.static_sun_srv : g_r.white.srv;
+      g_r.nsm_active ? g_r.static_sun_srv : g_r.white.srv;
 
   uint32_t drawn = 0;
   uint32_t item_index = 0;
@@ -8165,6 +10204,69 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     ring_frame->items.reserve(scene.items.size());
     ring_map.reserve(scene.items.size());
   }
+  // Surface probe (Insert / F10): every static item whose bounds the
+  // screen-centre ray crosses, nearest first, so one key press while looking
+  // at a wrong surface names it. draw_item logs each on entry and at
+  // submission; the summary after the passes names any that never drew.
+  struct PickState {
+    int rank = 0;
+    bool entered = false;
+    uint32_t submitted = 0;
+  };
+  std::unordered_map<const DrawItem*, PickState> pick_map;
+  if (g_pick_request.exchange(false, std::memory_order_acq_rel)) {
+    // The centre ray is clip x = y = 0: perpendicular to view_proj's x and y
+    // columns, oriented along +w.
+    const float* vp = scene.view_proj;
+    const float c0[3] = {vp[0], vp[4], vp[8]};
+    const float c1[3] = {vp[1], vp[5], vp[9]};
+    const float c3[3] = {vp[3], vp[7], vp[11]};
+    float dir[3] = {c0[1] * c1[2] - c0[2] * c1[1], c0[2] * c1[0] - c0[0] * c1[2],
+                    c0[0] * c1[1] - c0[1] * c1[0]};
+    const float len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    std::vector<std::pair<float, const DrawItem*>> hits;
+    if (len > 0.0f) {
+      const float s = (dir[0] * c3[0] + dir[1] * c3[1] + dir[2] * c3[2] >= 0.0f ? 1.0f : -1.0f) / len;
+      for (float& d : dir) {
+        d *= s;
+      }
+      for (const DrawItem& item : scene.items) {
+        if (item.skinned || item.ropa || item.cloth_quads || !item.bones.empty()) {
+          continue;
+        }
+        const float t = PickRayHit(item, scene.cam_pos, dir);
+        if (t >= 0.0f && t < 1000.0f) {
+          hits.emplace_back(t, &item);
+        }
+      }
+    }
+    std::sort(hits.begin(), hits.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (hits.size() > 16) {
+      hits.resize(16);
+    }
+    REXLOG_INFO("pick: frame={} cam=({:.2f},{:.2f},{:.2f}) dir=({:.3f},{:.3f},{:.3f}) items={} "
+                "on_ray={} debug={} shadow_valid={} shadow_ready={} static_sun={}",
+                frame_number, scene.cam_pos[0], scene.cam_pos[1], scene.cam_pos[2], dir[0], dir[1],
+                dir[2], scene.items.size(), hits.size(), debug_mode, scene.shadow_valid,
+                shadow_ready, g_r.nsm_active);
+    for (size_t i = 0; i < hits.size(); ++i) {
+      const DrawItem& item = *hits[i].second;
+      pick_map[&item].rank = int(i);
+      REXLOG_INFO("pick-ray: #{} t={:.2f} mesh={:08X} ctx={:08X} material={} fam={} water={} "
+                  "flowing={} ocean={} packed={} transparent={} decal={} unlit={} retained={} "
+                  "s2_blend={} draws={} bbox=({:.1f},{:.1f},{:.1f})..({:.1f},{:.1f},{:.1f}) "
+                  "world_t=({:.1f},{:.1f},{:.1f}) guid={:016X} diffuse={:08X} lm={:08X} "
+                  "chroma={:08X}",
+                  i, hits[i].first, item.mesh, item.ctx, item.material_name, item.env_family,
+                  item.water, item.water_flowing, item.water_ocean, item.packed_lightmap,
+                  item.transparent, item.decal, item.unlit, item.retained, item.s2_blend,
+                  item.draws.size(), item.bbox_min[0], item.bbox_min[1], item.bbox_min[2],
+                  item.bbox_max[0], item.bbox_max[1], item.bbox_max[2], item.world[12],
+                  item.world[13], item.world[14], item.diffuse_guid, item.diffuse_tex,
+                  item.lightmap_tex, item.chromaticity_tex);
+    }
+  }
   // Inline decode budget for DYNAMIC payloads only (skinned/cloth/ropa
   // buffers that change every frame). Static meshes and all textures route
   // to the decode workers on miss; the render thread never pays their
@@ -8180,16 +10282,6 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // they ARE the wall/ground sections they cover, with the art composited
   // in-shader (alpha-blending them as separate overlay geometry punched
   // holes in the world).
-  // Ripple scroll clock for the water branch (seconds; wraps every hour to
-  // keep float precision on the scrolled UVs).
-  static const std::chrono::steady_clock::time_point water_t0 =
-      std::chrono::steady_clock::now();
-  const float water_time = float(
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - water_t0).count() -
-      std::floor(
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - water_t0).count() /
-          3600.0) *
-          3600.0);
 
   // Words-keyed texture lookup with payload revalidation, shared by the
   // streamed-artwork diffuse override and the 2D pass. The event-ad system
@@ -8302,6 +10394,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // cost. Sampled once per RenderScene call; the per-item clock reads only
   // happen while the cvar is on.
   const bool prof_items = REXCVAR_GET(skate3_native_render_scene_perf_items);
+  // Blended sub-pass state for the zbias matrix offset (draw_item): in that
+  // pass scene_pso_bound still holds the last OPAQUE pipeline, so the
+  // offset follows the pass's own zbias flag instead.
+  bool in_blend_pass = false;
+  bool blend_zbias = false;
+  // Hall of Meat bone depth mask drawn this frame (see after the blended
+  // sub-pass); ps_depthpack turns it into the chain's stencil byte.
+  bool hom_mask_ready = false;
   const auto draw_item = [&](const DrawItem& item) {
     // Stage split points (profiling only): t0..t1 mesh serve, t1..t2 texture
     // serve, t2..t3 constants assembly, t3..end binds + draw recording.
@@ -8310,6 +10410,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     PerfClock::time_point di_t0{}, di_t1{}, di_t2{}, di_t3{};
     if (prof_items) {
       di_t0 = PerfClock::now();
+    }
+    PickState* pick = nullptr;  // surface probe (see pick_map)
+    if (!pick_map.empty()) {
+      const auto pit = pick_map.find(&item);
+      if (pit != pick_map.end()) {
+        pick = &pit->second;
+        pick->entered = true;
+      }
     }
     // NO per-frame inline decodes here. Static content (world geometry,
     // props) loads/heals on the decode workers via the miss queue; a
@@ -8340,17 +10448,31 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // guest reads, no heals, no miss enqueues from here.
       return;
     }
+    // Sticky texture sites outlive an inline re-decode (MeshBuffers::sticky).
+    std::array<TexStickySite, kTexStickySlots> carried_sticky{};
     if (it != g_r.meshes.end() && it->second.fingerprint != item.fingerprint &&
         REXCVAR_GET(skate3_native_render_scene_mesh_revalidate)) {
+      const bool same_mesh =
+          it->second.identity == 0 || it->second.identity == MeshIdentity(item);
       if (item.cloth_quads || ropa_inline) {
+        if (same_mesh) {
+          carried_sticky = it->second.sticky;
+        }
         PoolMeshBuffer(g_r.device, it->second.vb);
         PoolMeshBuffer(g_r.device, it->second.ib);
         g_r.meshes.erase(it);
         it = g_r.meshes.end();
       } else if (!dynamic_payload) {
         // Streaming heal: keep drawing the old decode this frame; the
-        // workers decode the new payload and the commit swaps it in.
+        // workers decode the new payload and the commit swaps it in. A
+        // DIFFERENT mesh at this address (the area loaded where another
+        // one lived) must not draw the old geometry and art: it waits for
+        // its own decode, as first-sight content does.
         EnqueueMeshMiss(item.mesh);
+        if (!same_mesh) {
+          g_rr_mesh_deferred.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
       }
     }
     if (it == g_r.meshes.end()) {
@@ -8382,10 +10504,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         return;
       }
       buffers.fingerprint = item.fingerprint;
+      buffers.sticky = carried_sticky;
+      buffers.identity = MeshIdentity(item);
       it = g_r.meshes.emplace(item.mesh, buffers).first;
     }
     it->second.last_used_frame = frame_number;
-    const MeshBuffers& buffers = it->second;
+    MeshBuffers& mesh_record = it->second;  // sticky sites update in place
+    const MeshBuffers& buffers = mesh_record;
     if (prof_items) {
       di_t1 = PerfClock::now();
     }
@@ -8410,8 +10535,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
          item.char_family == 3 || item.char_family == 6) &&
         debug_mode == 0 && CharFadeAlpha(item) < 0.999f &&
         REXCVAR_GET(skate3_native_render_scene_entity_fade);
-    if (use_depth && !item.transparent && !item.water && !hair_pass &&
-        !refl_trans_pass && !char_fade_pass && g_r.pso_cullback != nullptr) {
+    // Skate 2 additive effects draw in the blended sub-pass under their own
+    // PSOs (s2_blend, set there); the opaque cull-PSO reset must not fire.
+    if (use_depth && ((!item.transparent && !item.water) || IsSkate2Water(item) || IsSkate2Ocean(item)) && !hair_pass &&
+        !refl_trans_pass && !char_fade_pass && item.s2_blend == 0 &&
+        !item.indicator && item.char_family != 8 &&
+        g_r.pso_cullback != nullptr) {
       const float* w = item.world;
       const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
                          w[1] * (w[4] * w[10] - w[6] * w[8]) +
@@ -8426,13 +10555,27 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // uncull(ed), matching the two-sided-sheet rules.
       const bool cull_family =
           REXCVAR_GET(skate3_native_render_scene_backface_cull) &&
-          item.env_family != 0 && item.env_family != 7 &&
+          (item.env_family != 0 || IsSkate2Water(item) || IsSkate2Ocean(item)) && item.env_family != 7 &&
           item.env_family != 9 && item.env_family != 10 &&
-          item.env_family != 13;
+          item.env_family != 13 && item.env_family != 15;
+      // Skate 2 alphatestdefaultenvironment.xml explicitly specifies FRONT,
+      // depth writes, and alpha >= 30/255. Restore the material-family state;
+      // texture identity is only a diagnostic selector, never a render rule.
+      // Native Skate 3 and separate tree/animated.tree families stay unchanged.
+      const bool bam_alphatest_cull =
+          REXCVAR_GET(skate3_native_render_scene_backface_cull) &&
+          skate3::world_loading::IsSkate2Gameplay() && item.env_family == 7;
       nrhi::Pipeline* want =
-          ((buffers.two_sided_sheet || cull_family) && det3 >= 0.0f)
+          ((buffers.two_sided_sheet || cull_family || bam_alphatest_cull) && det3 >= 0.0f)
               ? g_r.pso_cullback
               : g_r.pso;
+      const bool bam_zbias = REXCVAR_GET(skate3_skate2_material_depth_bias) &&
+          skate3::world_loading::IsSkate2Gameplay() &&
+          (std::strcmp(item.material_name, "incandescent.incandescentzbias") == 0 ||
+           std::strcmp(item.material_name, "incandescent.backlitzbias") == 0 ||
+           std::strcmp(item.material_name, "decal.default") == 0);
+      if (bam_zbias && det3 >= 0.0f && g_r.pso_bam_zbias)
+        want = g_r.pso_bam_zbias;
       if (want != scene_pso_bound) {
         cmd->SetPipeline(want);
         scene_pso_bound = want;
@@ -8451,6 +10594,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // decode is in flight (first-sight miss or a still-failing heal); the
     // sticky wrapper below then serves the item's last-good texture instead.
     bool tex_pending = false;
+    // Set with tex_pending when the texture's decode keeps failing (three or
+    // more attempts): new content waits only briefly for it.
+    bool tex_failing = false;
+    // Set when resolve_texture_raw serves a demote-held route's pre-demote
+    // decode: its own pool range is already reused, so the guest payload
+    // cannot confirm it (resolve_texture's content check skips it).
+    bool tex_demote_held = false;
+    // New San Van / Skate 2 DLC maps: the content check and the waits below.
+    const bool s2_world = skate3::world_loading::IsSkate2Gameplay();
     const auto resolve_texture_raw = [&](uint32_t tex_ptr) -> const GuestTexture* {
       if (tex_ptr == 0) {
         return &g_r.white;
@@ -8558,6 +10710,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                       frame_number, tex_ptr, route.key, e.retry_after_frame);
         }
         tex_pending = true;
+        tex_failing = e.fail_count >= 3;
         return &g_r.white;
       }
       // Payload revalidation, the one irreducible heuristic: the game
@@ -8622,6 +10775,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           EnqueueWordsMiss(route.key, e.fetch_words);
         }
       }
+      tex_demote_held = route.demoted;
       return &e;
     };
     // Sticky serving: streaming rotates content onto NEW texture objects (a
@@ -8635,6 +10789,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     const auto resolve_texture = [&](uint32_t tex_ptr,
                                      uint32_t slot) -> const GuestTexture* {
       tex_pending = false;
+      tex_failing = false;
+      tex_demote_held = false;
       const GuestTexture* t = resolve_texture_raw(tex_ptr);
       // Near-uniform-black decodes on the WHITE-NEUTRAL slots (1 lightmap,
       // 2 macro) serve the white fallback until a heal lands real content.
@@ -8666,9 +10822,45 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       if (item.retained || tex_ptr == 0) {
         return t;
       }
-      const uint64_t skey = (uint64_t(item.mesh) << 3) | slot;
+      TexStickySite& site = mesh_record.sticky[slot];
+      // New San Van: the store is keyed by fetch words, and streaming loads
+      // the next texture into a freed pool slot with the same words, so an
+      // entry can still hold the previous occupant's decode until its
+      // payload poll and re-decode land (after a far teleport, hundreds at
+      // once: other areas' lighting pages drew as colours). A slot showing
+      // these words for the first time, or after their content changed
+      // while it was away, serves the decode only once the guest payload
+      // confirms it; otherwise it waits for the re-decode like any decode
+      // in flight (its own previous decode, else the new-content wait).
+      if (t != &g_r.white && s2_world && !tex_demote_held && t->payload_fp != 0) {
+        const uint64_t bound_key = FetchWordsKey(t->fetch_words);
+        const bool known =
+            site.words_key == bound_key &&
+            (site.content_fp == t->payload_fp || frame_number <= site.last_frame + 2);
+        if (!known) {
+          bool stale = t->stale_frame != 0 && frame_number < t->stale_frame + 8;
+          if (!stale) {
+            const uint64_t now_fp = SampleProbeFingerprint(base, *t);
+            stale = now_fp != 0 && now_fp != t->payload_fp;
+            if (stale) {
+              t->stale_frame = frame_number;
+              EnqueueWordsMiss(bound_key, t->fetch_words);
+              if (trm) {
+                REXLOG_INFO("tex-trace: f{} slot={} obj={:08X} STALE key={:016X} "
+                            "cached={:016X} now={:016X} (waits for re-decode)",
+                            frame_number, slot, tex_ptr, bound_key, t->payload_fp,
+                            now_fp);
+              }
+            }
+          }
+          if (stale) {
+            g_tex_stale_refused.fetch_add(1, std::memory_order_relaxed);
+            tex_pending = true;
+            t = &g_r.white;
+          }
+        }
+      }
       if (t != &g_r.white) {
-        RendererState::TexStickySite& site = g_r.tex_sticky[skey];
         // Material-detail downgrade hold: the game's streaming demotes a
         // nearby mesh to its UN (undetailed) material for a fraction of a
         // second and back, the visible flash to completely different/
@@ -8682,9 +10874,13 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         const uint64_t cur_area = FetchWordsArea(t->fetch_words);
         if (hold > 0 && site.area > cur_area && site.words_key != 0) {
           const auto hit = g_r.tex_store.find(site.words_key);
+          // New San Van: only the decode this site showed (its words may
+          // hold another texture's decode since).
           const GuestTexture* held =
-              hit != g_r.tex_store.end() && hit->second.valid ? &hit->second
-                                                              : nullptr;
+              hit != g_r.tex_store.end() && hit->second.valid &&
+                      (!s2_world || hit->second.payload_fp == site.content_fp)
+                  ? &hit->second
+                  : nullptr;
           if (held != nullptr) {
             // The held entry may no longer be polled by any live route;
             // re-probe its payload on its own recheck clock so a reused
@@ -8719,6 +10915,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                     frame_number, slot, held->payload_fp, cur_area,
                     site.area);
               }
+              site.last_frame = frame_number;
               return held;
             }
           }
@@ -8733,6 +10930,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         site.words_key = cur_key;
         site.area = cur_area;
         site.downgrade_since = 0;
+        site.content_fp = t->payload_fp;
+        site.last_frame = frame_number;
         if (!g_r.tex_pending_first.empty()) {
           g_r.tex_pending_first.erase(tex_ptr);
         }
@@ -8742,16 +10941,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         // The current binding's decode is in flight: serve the site's
         // previous art from the store, the console's own mip-transition
         // look instead of a white flash.
-        const auto sit = g_r.tex_sticky.find(skey);
-        if (sit != g_r.tex_sticky.end() && sit->second.words_key != 0) {
-          const auto old = g_r.tex_store.find(sit->second.words_key);
-          if (old != g_r.tex_store.end() && old->second.valid) {
+        if (site.words_key != 0) {
+          const auto old = g_r.tex_store.find(site.words_key);
+          if (old != g_r.tex_store.end() && old->second.valid &&
+              (!s2_world || old->second.payload_fp == site.content_fp)) {
             old->second.last_used_frame = frame_number;
+            site.last_frame = frame_number;
             g_tex_sticky_served.fetch_add(1, std::memory_order_relaxed);
             if (trm) {
               REXLOG_INFO("tex-trace: f{} slot={} STICKY serving key={:016X} "
                           "(pending {:08X})",
-                          frame_number, slot, sit->second.words_key, tex_ptr);
+                          frame_number, slot, site.words_key, tex_ptr);
             }
             return &old->second;
           }
@@ -8772,20 +10972,53 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             ? resolve_fetch_words(item.diffuse_fetch, uint64_t(item.mesh) << 1,
                                   item.retained)
             : nullptr;
+    // New content (no earlier texture this slot can serve) is drawn only
+    // once the textures its shading needs are resolved: the emulated pop-in
+    // semantics, since the game shows streamed content only once its data
+    // is ready. The diffuse, and for packed-lightmap materials the lightmap
+    // and chroma pages, are all requested this frame; the wait lasts while
+    // their decodes are in flight (a far teleport queues hundreds on the
+    // workers), bounded so a texture that keeps failing still falls back
+    // to visible white.
+    // New San Van also waits for textures the game has not bound yet
+    // (DrawItem::tex_missing), keyed by the mesh, serving this mesh's
+    // previous texture for the slot when it had one. Skate 3 maps keep the
+    // 20-frame decode wait.
+    const auto sticky_texture = [&](uint32_t slot) -> const GuestTexture* {
+      TexStickySite& site = mesh_record.sticky[slot];
+      if (site.words_key == 0) {
+        return nullptr;
+      }
+      const auto old = g_r.tex_store.find(site.words_key);
+      // Only the decode this slot showed (the words may hold another
+      // texture's decode since).
+      if (old == g_r.tex_store.end() || !old->second.valid ||
+          (s2_world && old->second.payload_fp != site.content_fp)) {
+        return nullptr;
+      }
+      old->second.last_used_frame = frame_number;
+      site.last_frame = frame_number;
+      return &old->second;
+    };
+    uint32_t hold_tex = 0;
+    bool hold_failing = false;
+    bool hold_lighting = false;
+    // Not bound yet (the placeholder, or no registration): the game is
+    // still streaming the texture, so the wait is longer than for a decode.
+    bool hold_unbound = false;
     if (diffuse == nullptr) {
       diffuse = resolve_texture(item.diffuse_tex, 0);
       if (diffuse == &g_r.white && tex_pending && item.diffuse_tex != 0 &&
           !item.retained) {
-        // Brand-new content, first decode in flight, and no previous mip
-        // cached to serve: draw NOTHING for a short window instead of a
-        // white flash: the emulated pop-in semantics (the game shows
-        // streamed content only once its data is ready). Bounded so a
-        // permanently failing texture still falls back to visible white.
-        const auto [pit, fresh] =
-            g_r.tex_pending_first.try_emplace(item.diffuse_tex, frame_number);
-        if (frame_number - pit->second < 20) {
-          g_skip_new.fetch_add(1, std::memory_order_relaxed);
-          return;
+        hold_tex = item.diffuse_tex;
+        hold_failing = tex_failing;
+      } else if (item.diffuse_tex == 0 && (item.tex_missing & 1u) != 0 && s2_world &&
+                 !item.retained) {
+        if (const GuestTexture* old = sticky_texture(0)) {
+          diffuse = old;
+        } else {
+          hold_tex = item.mesh;
+          hold_unbound = true;
         }
       }
     }
@@ -8793,8 +11026,82 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.lightmap_tex != 0 && REXCVAR_GET(skate3_native_render_scene_lightmaps)
             ? resolve_texture(item.lightmap_tex, 1)
             : nullptr;
+    const bool lightmap_pending = lightmap == &g_r.white && tex_pending;
+    const bool lightmap_failing = tex_failing;
     if (lightmap == &g_r.white) {
       lightmap = nullptr;
+    }
+    bool lightmap_unbound = false;
+    if (item.packed_lightmap && item.lightmap_tex == 0 && (item.tex_missing & 2u) != 0 &&
+        !item.retained && REXCVAR_GET(skate3_native_render_scene_lightmaps)) {
+      if (const GuestTexture* old = sticky_texture(1)) {
+        lightmap = old;
+      } else {
+        lightmap_unbound = true;
+      }
+    }
+    if (lightmap && REXCVAR_GET(skate3_native_render_scene_lm_dump)) {
+      // Identify sampled lightmaps in the texture dumps, rather than guessing
+      // which generated texture belongs to the world lighting atlas.
+      static std::unordered_set<uint64_t> logged;
+      const uint64_t key = (uint64_t(item.lightmap_tex) << 32) ^ lightmap->fetch_words[1];
+      if (logged.size() < 256 && logged.insert(key).second) {
+        const auto* w = lightmap->fetch_words;
+        REXLOG_INFO("lightmap-sample: mesh={:08X} texture={:08X} fetch={:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                    item.mesh, item.lightmap_tex, w[0], w[1], w[2], w[3], w[4], w[5]);
+      }
+    }
+
+
+    const GuestTexture* chromaticity = nullptr;
+    bool chroma_pending = false, chroma_failing = false, chroma_unbound = false;
+    if (item.packed_lightmap) {
+      if (item.chromaticity_tex != 0) {
+        chromaticity = resolve_texture(item.chromaticity_tex, 8);
+        chroma_pending = chromaticity == &g_r.white && tex_pending;
+        chroma_failing = tex_failing;
+      } else if (!item.retained && (item.tex_missing & 4u) != 0) {
+        chromaticity = sticky_texture(8);
+        chroma_unbound = chromaticity == nullptr;
+      }
+    }
+    if (item.packed_lightmap && !item.retained && hold_tex == 0) {
+      // A packed atlas without its chroma (or the atlas itself) would light
+      // the surface wrongly: wait for both pages as for the diffuse.
+      if (lightmap_pending) {
+        hold_tex = item.lightmap_tex;
+        hold_failing = lightmap_failing;
+        hold_lighting = true;
+      } else if (lightmap_unbound) {
+        hold_tex = item.mesh;
+        hold_lighting = true;
+        hold_unbound = true;
+      } else if (chroma_pending) {
+        hold_tex = item.chromaticity_tex;
+        hold_failing = chroma_failing;
+        hold_lighting = true;
+      } else if (chroma_unbound) {
+        hold_tex = item.mesh;
+        hold_lighting = true;
+        hold_unbound = true;
+      }
+    }
+    if (hold_tex != 0) {
+      RendererState::PendingSince& wait = g_r.tex_pending_first[hold_tex];
+      if (wait.first == 0 || frame_number > wait.last + 30) {
+        wait.first = frame_number;  // first request, or back after a gap
+      }
+      wait.last = frame_number;
+      const uint64_t window =
+          hold_failing || !s2_world ? 20 : hold_unbound ? 600 : 150;
+      if (frame_number - wait.first < window) {
+        g_skip_new.fetch_add(1, std::memory_order_relaxed);
+        if (hold_lighting) {
+          g_skip_new_lighting.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+      }
+      g_hold_expired.fetch_add(1, std::memory_order_relaxed);
     }
 
     // constants = world + mvp (world * view_proj, row-vector) + tint + cam
@@ -8818,14 +11125,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[13] += scene.sky_height;
       constants[14] += scene.cam_pos[2];
     }
-    float* mvp = constants + 16;
-    for (int r = 0; r < 4; ++r) {
-      for (int c = 0; c < 4; ++c) {
-        float sum = 0.0f;
-        for (int k = 0; k < 4; ++k) {
-          sum += constants[r * 4 + k] * scene.view_proj[k * 4 + c];
-        }
-        mvp[r * 4 + c] = sum;
+    // mvp = view_proj re-based on cam_pos.xyz (constants[36..38], set below)
+    // so vs_main projects camera-relative positions; see RebasedViewProj.
+    // Skate 2 zbias overlays (pso_bam_zbias): their authored constant depth
+    // offset (-0.0001, applied as 1678 ULP of standard D32 near 1.0) moves
+    // into the matrix as +1678 * 2^-24 of reversed depth, which a float-depth
+    // integer bias cannot express near 0; the PSO keeps the slope term.
+    const bool zbias_item =
+        kReversedZ && (in_blend_pass ? blend_zbias
+                                     : (scene_pso_bound == g_r.pso_bam_zbias &&
+                                        g_r.pso_bam_zbias != nullptr));
+    RebasedViewProj(scene.view_proj, scene.cam_pos, constants + 16, kReversedZ,
+                    zbias_item ? 1678.0 / 16777216.0 : 0.0);
+    // Coplanar-overlap yield (IsSkate2StadiumCrowd): scale the stored depth
+    // by 1 - 2^-15, ~250 float ulps at any distance (the interpolation
+    // rounding it must beat is a few), i.e. 1.5 mm farther at 50 m.
+    // Reversed depth: smaller = farther.
+    if (kReversedZ && IsSkate2StadiumCrowd(item)) {
+      for (int r = 0; r < 4; ++r) {
+        constants[16 + r * 4 + 2] *= 1.0f - 1.0f / 32768.0f;
       }
     }
     // Bone palette upload for skinned items; tint.g flags skinning.
@@ -8900,12 +11218,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // the frame rows being captured (scene.shadow_valid carries the scene
     // exposure / material multiplier at b1); without them the tone chain
     // would multiply by zero and render black.
-    if (debug_mode == 0 && item.env_family != 0 && scene.shadow_valid &&
+    // Skate 2 glare / godray (fams 17/18) output their texture directly
+    // (no fog / exposure / tone), so they need no frame rows; the S2
+    // scrollincandescent variant (s2_mult > 0) carries its own multiplier
+    // and runs on the renderer clock.
+    const bool s2_fx = item.env_family == 17 || item.env_family == 18;
+    const bool s2_scroll = item.env_family == 14 && item.s2_mult > 0.0f;
+    if (debug_mode == 0 && item.env_family != 0 && (scene.shadow_valid || s2_fx) &&
         !item.water && !item.transparent &&
         // Fam 14 needs the frame's scroll rows (time + multiplier); the
         // tone chain would multiply by zero without them; the legacy
         // shading covers the capture-less frames.
-        (item.env_family != 14 || scene.scroll_valid)) {
+        (item.env_family != 14 || scene.scroll_valid || s2_scroll) &&
+        // Fam 19 (visualindicator) needs its own captured PS rows.
+        (item.env_family != 19 || item.ind_valid) &&
+        // Fam 20 (traffic light lamps) needs its family's captured lamp rows.
+        (item.env_family != 20 ||
+         (item.traffic_light != 0 && scene.traffic_valid[item.traffic_light - 1]))) {
       constants[39] = -float(item.env_family);
     }
     // cam_pos.w = -(20 + variant) selects the exact dynamicobject branch
@@ -8927,7 +11256,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
             ? resolve_texture(item.macro_tex, 2)
             : &g_r.white;
     if ((item.water || item.char_family >= 6 ||
-         (item.char_family >= 1 && item.char_family <= 2)) &&
+         (item.char_family >= 1 && item.char_family <= 2) ||
+         item.char_family == 4) &&
         item.water_normal != 0) {
       // Water rides its ripple normal map in the macro slot (water never
       // carries a macro overlay; overlay.z stays 0 below so the macro
@@ -8950,10 +11280,19 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // largest remaining traversal hitch when a vehicle / reflective area
     // streamed in); flat-gray reflections for the 1-3 frames in flight are
     // invisible.
+    // Skate 2 GetSpecularTerm port (DrawItem::s2_env): the material's
+    // `environment` cube (reflection_crisp_waterfront, default_cubemap, ...)
+    // joins the t6 bind, and environment.transparent takes the exact
+    // transparentenvironment branch (fam 36) while the frame rows are live.
+    const bool s2_env_spec =
+        item.s2_env && debug_mode == 0 && REXCVAR_GET(skate3_skate2_env_specular);
+    const bool s2_trans_exact = s2_env_spec && item.transparent && !item.water &&
+                                scene.shadow_valid && lightmap != nullptr &&
+                                lightmap != &g_r.white;
     const GuestTexture* cube_tex = &g_r.white_cube;
     if ((item.water || item.char_family >= 6 ||
          (item.env_family >= 5 && item.env_family <= 6) ||
-         item.env_family == 13) &&
+         item.env_family == 13 || s2_env_spec) &&
         item.water_env != 0) {
       auto cit = g_r.cube_textures.find(item.water_env);
       if (cit == g_r.cube_textures.end()) {
@@ -9042,7 +11381,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // overlay.w == 3 tells the shader the masks are live.
     bool spec_bound = false;
     if (((item.env_family != 0 && !item.decal && item.env_family != 10) ||
-         item.water_flowing) &&
+         item.water_flowing || IsSkate2Water(item) || s2_trans_exact) &&
         item.spec_tex != 0) {
       const GuestTexture* spec = resolve_texture(item.spec_tex, 6);
       if (spec != &g_r.white) {
@@ -9194,8 +11533,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // white fallback on dynobj draws. Without it the PS world term is 1
       // and props inside baked building shade light at full key.
       if (g_r.world_shadow_srv != nullptr && g_r.world_shadow_in_srv &&
-          scene.dynobj_ws_valid) {
+          scene.dynobj_ws_valid &&
+          REXCVAR_GET(skate3_native_render_scene_prop_world_shade)) {
         v2_flags |= 8;
+      }
+    }
+    // Skate 2 sky clouds: S2 sky_defaultPS adds the material's `detail`
+    // texture to the gradient (skycolour = gradient + detail - 0.5, then
+    // linearized); Skate 3's transcribed dome shader has no such term. The
+    // cloud layer rides the free t8 slot. Gated to the S2 texture namespace
+    // so native Skate 3 skies are unchanged.
+    bool sky_clouds = false;
+    if (sky_sun_bound && item.detail_tex != 0 &&
+        skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
+      const GuestTexture* det = resolve_texture(item.detail_tex, 7);
+      if (det != &g_r.white && det->valid && det->srv_mips != 0) {
+        v2_detail = det;
+        sky_clouds = true;
       }
     }
     // Exact ocean (fam 31): the second PCA normal component rides the free
@@ -9204,8 +11558,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // through the overlay row.
     bool ocean_n2 = false;
     bool ocean_ov = false;
-    if (item.water_ocean == 1 && debug_mode == 0 && scene.shadow_valid &&
-        scene.ocean_valid) {
+    if (debug_mode == 0 && scene.shadow_valid &&
+        ((item.water_ocean == 1 && scene.ocean_valid) || IsSkate2Water(item) || IsSkate2Ocean(item))) {
       if (item.water_normal2 != 0) {
         const GuestTexture* n2 = resolve_texture(item.water_normal2, 7);
         if (n2 != &g_r.white && n2->valid && n2->srv_mips != 0) {
@@ -9213,7 +11567,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           ocean_n2 = true;
         }
       }
-      if (item.macro_tex != 0) {
+      if (item.water_ocean == 1 && item.macro_tex != 0) {
         const GuestTexture* mo = resolve_texture(item.macro_tex, 6);
         if (mo != &g_r.white && mo->valid && mo->srv_mips != 0) {
           v2_spec2 = mo;
@@ -9221,9 +11575,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         }
       }
     }
-    constants[44] = item.macro_scale;
+    // Skate 2 building_ceiling_worldspace (building.default on fam 1): the
+    // interior-ceiling "diffuse2" texture rides the free t9 slot (buildings
+    // are never decals, so the decal spec2 bind never claims it). The
+    // shader's building flag (misc.y = floorHeightMeters, staged below) is
+    // only raised once the texture is live; until then the item shades as
+    // plain environment.default.
+    bool s2_building = false;
+    if (item.env_family == 1 && item.floor_height > 0.0f &&
+        item.diffuse2_tex != 0 && debug_mode == 0 && scene.shadow_valid &&
+        !item.decal) {
+      const GuestTexture* d2 = resolve_texture(item.diffuse2_tex, 4);
+      if (d2 != &g_r.white && d2->valid && d2->srv_mips != 0) {
+        v2_spec2 = d2;
+        s2_building = true;
+      }
+    }
+    constants[44] = s2_building ? item.floor_count : item.macro_scale;
     constants[45] = item.macro_opacity;
-    constants[46] = macro_tex != &g_r.white ? 1.0f : 0.0f;
+    constants[46] = macro_tex != &g_r.white && !s2_building ? 1.0f : 0.0f;
     // overlay.w: 1 = single-placement decal (art clamps), 2 = tileable
     // decal (art wraps; clamping a many-period uv range stretched the
     // border texels into the giant cliff-face streaks), 3 = spec masks
@@ -9241,7 +11611,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // never take the is_decal/spec_bound paths, so the slot is theirs.
       constants[47] = char_spec;
     }
-    if (item.char_family == 1 || item.char_family == 2) {
+    if (item.char_family == 1 || item.char_family == 2 || item.char_family == 4) {
       // misc.y = normal/spec-map LOD bias to the console's 640p-gradient
       // mip (the fam 5/6 cube-bias rationale): at 4K the shader's UV
       // gradients pick ~1.75 mips finer than the game's own render, and
@@ -9257,21 +11627,45 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // world frame rows (exposure/sun/fog at b1, scene.shadow_valid) and the
     // ripple normal map resolved in the macro slot; the legacy water
     // shading covers every gap (and every non-flowing water material).
-    const bool water_exact = item.water && item.water_flowing &&
+    const bool skate2_water = IsSkate2Water(item);
+    const bool skate2_ocean = IsSkate2Ocean(item);
+    const bool skate2_ocean_exact = skate2_ocean && debug_mode == 0 &&
+        scene.shadow_valid && macro_tex != &g_r.white && ocean_n2 &&
+        lightmap && lightmap != &g_r.white && chromaticity && chromaticity != &g_r.white;
+    const bool skate2_water_exact = skate2_water && debug_mode == 0 &&
+        scene.shadow_valid && macro_tex != &g_r.white &&
+        (item.water_flowing || ocean_n2) && lightmap && lightmap != &g_r.white &&
+        chromaticity && chromaticity != &g_r.white;
+    const bool water_exact = item.water && item.water_flowing && !skate2_water &&
                              debug_mode == 0 && scene.shadow_valid &&
                              scene.water_valid && macro_tex != &g_r.white;
     // Exact ocean surface (fam 31): both PCA component maps must resolve
     // (t3 = comp 0 via the water_normal macro-slot bind, t8 = comp 1); the
     // legacy water shading covers every gap. The horizon sheet (fam 32)
     // needs only its baked texture (t0) and the captured fade row.
-    const bool ocean_exact = item.water && item.water_ocean == 1 &&
+    const bool ocean_exact = item.water && item.water_ocean == 1 && !skate2_ocean &&
                              debug_mode == 0 && scene.shadow_valid &&
                              scene.ocean_valid && macro_tex != &g_r.white &&
                              ocean_n2;
     const bool oceanrefl_exact = item.water && item.water_ocean == 2 &&
                                  debug_mode == 0 && scene.shadow_valid &&
                                  scene.oceanrefl_valid;
-    if (water_exact) {
+    if (skate2_ocean_exact) {
+      constants[39] = -35.0f;
+      constants[44] = 1.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = ocean_ov ? 1.0f : 0.0f;
+      constants[47] = item.macro_scale;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (skate2_water_exact) {
+      // S2 flowingwater is opaque, distinct from S3 flowingwateralpha.
+      constants[39] = item.water_flowing ? -33.0f : -34.0f;
+      constants[44] = spec_bound ? 1.0f : 0.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = water_time;
+      constants[47] = 0.0f;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (water_exact) {
       // overlay.x = spec/reflection masks bound at t4, overlay.y = real
       // environment cube at t6, overlay.z = ripple resolved (gate above).
       constants[39] = -30.0f;
@@ -9315,13 +11709,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // defaults staged above are inert, but overlay.y must not inherit
       // macro_opacity's 1.0 default when no cube resolved.
       constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      // Original vehicle normals are DXT5nm (AG), native traffic uses
+      // DXN (RG). Gate original shadow reception on the same source data.
+      xenos::xe_gpu_texture_fetch_t normal_fetch = {};
+      normal_fetch.dword_1 = macro_tex->fetch_words[1];
+      const bool original_vehicle = item.char_family <= 7 &&
+          skate3::world_loading::IsSkate2Gameplay() &&
+          macro_tex != &g_r.white &&
+          rex::graphics::GetBaseFormat(normal_fetch.format) == xenos::TextureFormat::k_DXT4_5;
+      constants[47] = original_vehicle ? 1.0f : 0.0f;
     }
     // misc.x: alpha-blended sub-pass item (1 = transparentenvironment
     // shading, 2 = water branch); fog rides in misc.yzw (ramp) and the
     // mat_tint row (color), unused by these items otherwise
     // (root-signature DWORD budget).
     constants[48] = item.water ? 2.0f : (item.transparent ? 1.0f : 0.0f);
-    if (water_exact || ocean_exact || oceanrefl_exact) {
+    // -1 = Skate 2 decalzbias overlay (s2_blend 5): the opaque lit path with
+    // shadow receive, alpha-tested at 16/255 and returning the diffuse alpha
+    // for the straight blend.
+    if (item.s2_blend == 5) {
+      constants[48] = -1.0f;
+    }
+    if (water_exact || ocean_exact || oceanrefl_exact || skate2_water_exact || skate2_ocean_exact) {
       // misc.y = cube LOD bias (same 640p-gradient rationale as fams 5/6);
       // fog comes from the shared b1 rows; misc.zw stay free. misc.x keeps
       // the water marker for the SSR G-buffer restage.
@@ -9340,12 +11749,47 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // wrapped to one texture period here; the shader adds a small
       // bounded offset instead of losing uv precision to a large raw
       // time x speed product), misc.z = the material multiplier
-      // m_params[0].y.
-      const float ou = scene.scroll_rows[0] * item.scroll_u;
-      const float ov = scene.scroll_rows[0] * item.scroll_v;
+      // m_params[0].y, misc.w = the lightmap lerp weight m_params[0].x
+      // (0 on native Skate 3 items: lerp(1, LM, 0) = 1).
+      // Skate 2 items (s2_mult > 0) use their original m_params and the
+      // renderer clock (g_fAnimationTime is seconds as well).
+      const bool s2 = item.s2_mult > 0.0f;
+      const float t = s2 ? water_time : scene.scroll_rows[0];
+      const float ou = t * item.scroll_u;
+      const float ov = t * item.scroll_v;
       constants[48] = ou - std::floor(ou);
       constants[49] = ov - std::floor(ov);
-      constants[50] = scene.scroll_rows[1];
+      constants[50] = s2 ? item.s2_mult : scene.scroll_rows[1];
+      constants[51] = s2 ? item.s2_lm_weight : 0.0f;
+    } else if (item.env_family == 19 && constants[39] < -18.5f) {
+      // visualindicator (fam 19): mat_tint = i_colortint (rgba), misc.z =
+      // m_params[0].y, misc.w = its exposure g_envattributes[2].x.
+      std::memcpy(constants + 40, item.ind_tint, 4 * sizeof(float));
+      constants[48] = 0.0f;
+      constants[49] = 0.0f;
+      constants[50] = item.ind_mult;
+      constants[51] = item.ind_expo;
+    } else if (item.env_family == 20 && constants[39] < -19.5f) {
+      // Traffic light lamps (fam 20): mat_tint = the game's lamp state for
+      // this lamp's family (vs_main picks the lit or unlit UV from it),
+      // misc.x = -2 (the technique never alpha-tests), misc.z = m_params[0].y,
+      // misc.w = the exposure g_envattributes[2].x.
+      const float* rows = scene.traffic_rows[item.traffic_light - 1];
+      std::memcpy(constants + 40, rows, 4 * sizeof(float));
+      constants[48] = -2.0f;
+      constants[49] = 0.0f;
+      constants[50] = rows[4];
+      constants[51] = rows[5];
+    } else if (item.env_family >= 16 && item.env_family <= 18 &&
+               constants[39] < -15.5f) {
+      // Skate 2 incandescent / glare / godray (fams 16-18): misc.y = the
+      // technique's alpha-test reference (0 = none), misc.z = the lightmap
+      // lerp weight m_params[0].x, misc.w = the multiplier m_params[0].y
+      // (fam 16) or the glareScale sprite size (fam 17, read by vs_main).
+      constants[48] = 0.0f;
+      constants[49] = item.s2_alpha_ref;
+      constants[50] = item.s2_lm_weight;
+      constants[51] = item.env_family == 17 ? item.glare_scale : item.s2_mult;
     } else if (v2_flags != 0) {
       // misc.z = the v2 material bind flags, misc.w = detailNormalUVScale
       // (opaque fams 1-4 and the dynobj families; see the v2 blocks above).
@@ -9429,6 +11873,122 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         constants[48] = float(pack_trim(bx) + 1000 * pack_trim(by));
       }
     }
+    // Skate 2 building interior strip (see the t9 bind above): misc.y =
+    // floorHeightMeters marks it (spare on fam 1), overlay.x = floorCount.
+    // Only on the exact branch; the legacy fallback never sees the flag.
+    if (s2_building && constants[39] < -0.5f && constants[39] > -1.5f) {
+      constants[49] = item.floor_height;
+    }
+    // Stadium crowd seating (IsSkate2StadiumCrowd): misc.y = -1 asks the
+    // fam 2 branch for the static sun term at its full strength
+    // (scene_opts.z) so the stands stay in the roof shade that the venue
+    // factor lifts from the floodlit floor. misc.y is spare on fam 2.
+    if (constants[39] == -2.0f && IsSkate2StadiumCrowd(item) &&
+        REXCVAR_GET(skate3_skate2_stadium_crowd_shade)) {
+      constants[49] = -1.0f;
+    }
+    // Skate 2 transparentenvironment (fam 36, see s2_trans_exact): the exact
+    // family chain (frame fog / exposure / tone, CSM receive) with its
+    // GetSpecularTerm. overlay.x = spec/ecc/refmask masks at t4, overlay.y
+    // = a real environment cube at t6. misc.x keeps the transparent marker.
+    if (s2_trans_exact) {
+      constants[39] = -36.0f;
+      constants[44] = spec_bound ? 1.0f : 0.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = 0.0f;
+      constants[47] = 0.0f;
+    }
+    // CAC player skin stamps (cacstamp_skin_defaultPS, ucode in
+    // out/research/log084/s3_disasm): the composed tattoo texture ("decal",
+    // at the SECOND texcoord) multiplies the tinted diffuse by
+    // lerp(1, rgb, a); the "decal2" overlay (first texcoord) then blends
+    // over by its alpha x i_params.z. Both ride the t8/t9 pair (character
+    // draws never use the v2 material maps); misc.z = bind flags (1 tattoo,
+    // 2 overlay), misc.w = the overlay opacity (char_rows[2].x). Only on
+    // the exact cacstamp layout (captured family 2), never the NPC
+    // character_skin that shares the material name.
+    if (debug_mode == 0 && item.char_family == 2 && constants[39] > 1.5f &&
+        constants[39] < 2.5f && REXCVAR_GET(skate3_native_render_scene_cac_stamps) &&
+        std::strcmp(item.material_name, "character.skin") == 0) {
+      uint32_t stamp_flags = 0;
+      // The draw's own bound texture (stamp_fetch, words-keyed) wins over
+      // the material channel; its clamp fields pick the address mode
+      // (clamp_x bits 10-12, clamp_y 13-15; nonzero = a clamp/mirror
+      // mode). The atlas covers only part of the uv range (run 085 rows
+      // (1,0,-1) (0,2,-2.5)); wrap tiled stray tattoos across the body, so
+      // without draw words the tattoo clamps.
+      // Address mode from the fetch words' clamp_x field (xenos
+      // ClampMode): 0/1 repeat -> wrap, 2-5 clamp/mirror-clamp to edge or
+      // halfway -> edge clamp, 6/7 clamp to border -> masked outside [0,1]
+      // (a transparent border is the multiply's neutral). No draw words:
+      // border for the tattoo (no smear, no tiling), wrap for the overlay.
+      // mode: 0 wrap, 1 edge, 2 border.
+      const auto stamp_tex = [&](int s, uint32_t chan, int* mode) -> const GuestTexture* {
+        const uint32_t* w = item.stamp_fetch + s * 6;
+        const GuestTexture* t = nullptr;
+        if (w[1] != 0 && (w[0] & 3u) == 2u) {
+          t = resolve_fetch_words(w, (uint64_t(item.mesh) << 3) | uint64_t(5 + s),
+                                  item.retained);
+          const uint32_t cm = (w[0] >> 10) & 7u;
+          *mode = cm <= 1 ? 0 : (cm >= 6 ? 2 : 1);
+        } else {
+          *mode = s == 0 ? 2 : 0;
+        }
+        if (t == nullptr && chan != 0) {
+          t = resolve_texture(chan, 4);
+        }
+        return t != nullptr && t != &g_r.white && t->valid && t->srv_mips != 0 ? t
+                                                                                 : nullptr;
+      };
+      // misc.z bits: 1 tattoo, 2 overlay, 4/16 tattoo edge/border,
+      // 8/32 overlay edge/border.
+      int mode0 = 2, mode1 = 0;
+      if (item.stamp_uv_valid) {
+        if (const GuestTexture* t = stamp_tex(0, item.decal_art, &mode0)) {
+          v2_detail = t;
+          stamp_flags |= 1u | (mode0 == 1 ? 4u : 0u) | (mode0 == 2 ? 16u : 0u);
+        }
+      }
+      if (item.char_rows[2 * 4 + 0] > 0.0f &&
+          REXCVAR_GET(skate3_native_render_scene_cac_stamp_overlay)) {
+        if (const GuestTexture* t = stamp_tex(1, item.decal2_art, &mode1)) {
+          v2_spec2 = t;
+          stamp_flags |= 2u | (mode1 == 1 ? 8u : 0u) | (mode1 == 2 ? 32u : 0u);
+        }
+      }
+      if (stamp_flags != 0) {
+        constants[50] = float(stamp_flags);
+        constants[51] = item.char_rows[2 * 4 + 0];
+        // Tattoo-UV rows (DrawItem::stamp_uv): mat_tint = row 0 xyz + row 1
+        // z, overlay.xy = row 1 xy (both spare on the CAC branch).
+        constants[40] = item.stamp_uv[0];
+        constants[41] = item.stamp_uv[1];
+        constants[42] = item.stamp_uv[2];
+        constants[43] = item.stamp_uv[5];
+        constants[44] = item.stamp_uv[3];
+        constants[45] = item.stamp_uv[4];
+      }
+    }
+    // Clothing dirt (cac_cloth_defaultPS, out/research/log084/s3_disasm):
+    // base = D^2 x c23; out = lerp(base, lerp(base, dirt.rgb, dirt.a),
+    // i_params.y) = lerp(base, dirt.rgb, dirt.a x level), the skin overlay's
+    // exact form: the same t9 slot, flag 2 and misc.w. dirt = the material's
+    // decal2 channel at the first texcoord (the draw-bound tf5 in every run
+    // 090 capture, wrap addressing); level = char_rows[2].y.
+    if (debug_mode == 0 && item.char_family == 2 && constants[39] > 1.5f &&
+        constants[39] < 2.5f && item.decal2_art != 0 &&
+        item.char_rows[2 * 4 + 1] > 0.0f &&
+        REXCVAR_GET(skate3_native_render_scene_cac_cloth_dirt) &&
+        (std::strcmp(item.material_name, "character.cloth") == 0 ||
+         std::strcmp(item.material_name, "character.leather") == 0 ||
+         std::strcmp(item.material_name, "character.cloth_ropa") == 0)) {
+      const GuestTexture* t = resolve_texture(item.decal2_art, 4);
+      if (t != nullptr && t != &g_r.white && t->valid && t->srv_mips != 0) {
+        v2_spec2 = t;
+        constants[50] = 2.0f;
+        constants[51] = item.char_rows[2 * 4 + 1];
+      }
+    }
     // cam_pos.w = -40 selects the exact sky branch: the game computes the
     // sun glow inside the dome shader (see the PS sky branch). Needs the
     // frame's captured sky sun rows AND the 1D gradient bound above; falls
@@ -9442,14 +12002,14 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[43] = scene.sky_height;  // mat_tint.w = dome viewpos Y
       constants[44] = scene.sky_sun[3];  // overlay.x = sun angular scale
       constants[45] = scene.sky_sun[4];  // overlay.y = pre-tone multiplier
-      constants[46] = 0.0f;
+      constants[46] = sky_clouds ? 1.0f : 0.0f;  // overlay.z = S2 cloud layer at t8
       constants[47] = 0.0f;
       constants[49] = scene.sky_sun[5];  // misc.y = scene exposure
     }
     // SSR: record reflective items, env fams 5/6/13 on their exact branch
     // with live spec masks (the reflection mask rides t4.z), plus water,
     // for the reflection G-buffer pass after the scene pass.
-    if (ssr_on && !item.skinned &&
+    if (ssr_on && !item.skinned && !skate2_water && !skate2_ocean &&
         (item.water ||
          ((item.env_family == 5 || item.env_family == 6 ||
            item.env_family == 13) &&
@@ -9467,9 +12027,189 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (prof_items) {
       di_t3 = PerfClock::now();
     }
+    // A packed atlas always lights in packed mode: its R/G/B channels are
+    // different meshes' mono lightmaps, so reading them as RGB light drew
+    // purple and green while a chroma page was still decoding. Without a
+    // chroma page the draw binds New San Van's mean chromaticity
+    // (g_r.chroma_neutral, t11 below).
+    if (debug_mode == 0 && lightmap && item.packed_lightmap &&
+        !item.skinned && !item.unlit &&
+        (!item.water || skate2_water_exact || skate2_ocean_exact)) {
+      // Keep the fog color row intact on transparent world materials.
+      const uint32_t channel = item.mono_lightmap_dot[0] == 1.0f ? 0u :
+          item.mono_lightmap_dot[1] == 1.0f ? 1u :
+          item.mono_lightmap_dot[2] == 1.0f ? 2u : 3u;
+      constants[32] = 2.0f + float(channel);
+    }
+    if (REXCVAR_GET(skate3_skate2_texture_probe) &&
+        skate3::world_loading::IsSkate2Gameplay() && IsBamVisualCandidate(item)) {
+      struct VisualDrawState { uint64_t frame = 0, signature = 0; };
+      static std::unordered_map<uint32_t, VisualDrawState> visual_draws;
+      static uint64_t visual_window = 0;
+      static unsigned visual_count = 0;
+      if (frame_number - visual_window >= 120) { visual_window = frame_number; visual_count = 0; }
+      if (visual_draws.size() >= 2048 && !visual_draws.contains(item.mesh)) visual_draws.clear();
+      auto& state = visual_draws[item.mesh];
+      uint64_t signature = item.fingerprint ^ DrawRangesHash(item.draws);
+      for (unsigned k = 0; k < 6; ++k)
+        signature = (signature ^ diffuse->fetch_words[k] ^ (uint64_t(decal_tex->fetch_words[k]) << 17)) * 1099511628211ull;
+      if (visual_count < 64 && (state.signature != signature || frame_number - state.frame >= 600)) {
+        ++visual_count;
+        state = {frame_number, signature};
+        REXLOG_INFO("world-visual-draw: frame={} mesh={:08X} ctx={:08X} guid={:016X} retained={} family={} depth={} transparent={} sheet={} diffuse_gpu=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] decal_gpu=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] overrides=({:08X},{:08X}) world=({},{},{}) draws={} material={} ranges=[{}] cull={} zbias={} vp_depth=({},{},{},{})",
+            frame_number, item.mesh, item.ctx, item.diffuse_guid, item.retained, item.env_family,
+            use_depth, item.transparent, buffers.two_sided_sheet,
+            diffuse->fetch_words[0], diffuse->fetch_words[1], diffuse->fetch_words[2],
+            diffuse->fetch_words[3], diffuse->fetch_words[4], diffuse->fetch_words[5],
+            decal_tex->fetch_words[0], decal_tex->fetch_words[1], decal_tex->fetch_words[2],
+            decal_tex->fetch_words[3], decal_tex->fetch_words[4], decal_tex->fetch_words[5],
+            item.diffuse_fetch[1], item.decal_fetch[1], constants[12], constants[13], constants[14], item.draws.size(),
+            item.material_name, DescribeDrawRanges(item.draws), (scene_pso_bound == g_r.pso_cullback || scene_pso_bound == g_r.pso_bam_zbias),
+            scene_pso_bound == g_r.pso_bam_zbias, scene.view_proj[2], scene.view_proj[6], scene.view_proj[10], scene.view_proj[14]);
+      }
+    }
+    TraceBamLighting(base, scene, frame_number, item, lightmap, chromaticity,
+                     constants[32], debug_mode);
+    if (REXCVAR_GET(skate3_skate2_texture_probe) &&
+        skate3::world_loading::IsSkate2Gameplay() &&
+        (item.water || BamGeometryProbeGroup(item) == 6) && !item.retained) {
+      // Bounded read-only evidence for S2 water: distinguish wrong shading,
+      // unresolved channels and stale object-keyed cube entries. Ordinary
+      // texture probes excluded water, and old spatial capture regions missed it.
+      static std::array<std::unordered_set<uint64_t>, 2> water_signatures;
+      auto& seen_water = water_signatures[BamGeometryProbeGroup(item) == 6 ? 1 : 0];
+      uint64_t signature = item.fingerprint ^ (uint64_t(item.mesh) << 32);
+      uint32_t cube_live[6]{};
+      if (item.water_env && GuestTryCopy(cube_live, base + item.water_env + 28, sizeof(cube_live)))
+        for (auto& w : cube_live) w = SwapU32(w);
+      const GuestTexture* textures[] = {diffuse, lightmap, chromaticity, macro_tex, decal_tex, cube_tex};
+      for (const auto* texture : textures) {
+        if (!texture) continue;
+        for (uint32_t w : texture->fetch_words) signature = (signature ^ w) * 1099511628211ull;
+      }
+      for (uint32_t w : cube_live) signature = (signature ^ w) * 1099511628211ull;
+      signature ^= uint64_t(water_exact) | (uint64_t(ocean_exact) << 1) |
+                   (uint64_t(scene.water_valid) << 2) | (uint64_t(skate2_water_exact) << 3) |
+                   (uint64_t(skate2_ocean_exact) << 4);
+      if (seen_water.size() < 256 && seen_water.insert(signature).second) {
+        REXLOG_INFO("bam-water: frame={} mesh={:08X} guid={:016X} material={} cam=({},{},{}) flowing={} exact={} ocean_exact={} params_valid={} packed={} mode={} normal2={:08X} cube_match={} bounds=({},{},{})..({},{},{}) s2_authored={} shader_family={} normal2_bound={}",
+            frame_number, item.mesh, item.diffuse_guid, item.material_name,
+            scene.cam_pos[0], scene.cam_pos[1], scene.cam_pos[2], item.water_flowing,
+            water_exact, ocean_exact, scene.water_valid, item.packed_lightmap, constants[32],
+            item.water_normal2, cube_tex != &g_r.white_cube &&
+                std::memcmp(cube_live, cube_tex->fetch_words, sizeof(cube_live)) == 0,
+            item.bbox_min[0], item.bbox_min[1], item.bbox_min[2],
+            item.bbox_max[0], item.bbox_max[1], item.bbox_max[2],
+            skate2_water_exact || skate2_ocean_exact, -constants[39], ocean_n2);
+        const char* roles[] = {"diffuse", "lightmap", "chroma", "normal", "spec", "cube"};
+        const uint32_t objects[] = {item.diffuse_tex, item.lightmap_tex, item.chromaticity_tex,
+                                   item.water_normal, item.spec_tex, item.water_env};
+        for (unsigned k = 0; k < 6; ++k) {
+          const auto* texture = textures[k];
+          if (!texture) continue;
+          const auto* w = texture->fetch_words;
+          REXLOG_INFO("bam-water-texture: mesh={:08X} role={} object={:08X} resolved={} words=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+              item.mesh, roles[k], objects[k], texture != &g_r.white && texture != &g_r.white_cube && texture->valid,
+              w[0], w[1], w[2], w[3], w[4], w[5]);
+        }
+        REXLOG_INFO("bam-water-cube-live: mesh={:08X} words=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] spec_bound={} shader_family={}",
+            item.mesh, cube_live[0], cube_live[1], cube_live[2], cube_live[3], cube_live[4], cube_live[5], spec_bound, constants[39]);
+      }
+    }
+    if (item.chromaticity_tex || item.packed_lightmap) {
+      static std::unordered_set<uint64_t> packed_logged;
+      const bool active = constants[32] >= 2.0f && debug_mode == 0;
+      const uint64_t key = (uint64_t(item.mesh) << 1) | active;
+      if (REXCVAR_GET(skate3_skate2_texture_probe) && packed_logged.size() < 128 && packed_logged.insert(key).second) {
+        REXLOG_INFO("packed-lightmap: mesh={:08X} valid={} active={} lightmap={:08X} chromaticity={:08X} dot=({},{},{},{})",
+                    item.mesh, item.packed_lightmap, active, item.lightmap_tex,
+                    item.chromaticity_tex, item.mono_lightmap_dot[0],
+                    item.mono_lightmap_dot[1], item.mono_lightmap_dot[2], item.mono_lightmap_dot[3]);
+      }
+    }
+    // Skate 2 effects without an alpha test (ApplySkate2Material): misc.x =
+    // -2 skips the shader's world alpha test. misc.x is 0 on these opaque
+    // items unless a family branch above claimed it.
+    if (item.s2_no_alpha_test && constants[48] == 0.0f) {
+      constants[48] = -2.0f;
+    }
+    // Skate 2 GetSpecularTerm on fams 1/3 (exact branch): -3 = with the
+    // material's environment cube at t6, -4 = cube unresolved (no
+    // reflection addend). Both keep the no-alpha-test behavior of -2.
+    if (s2_env_spec && constants[48] == -2.0f &&
+        (constants[39] == -1.0f || constants[39] == -3.0f)) {
+      constants[48] = cube_tex != &g_r.white_cube ? -3.0f : -4.0f;
+    }
+    // One-shot diagnostics for the Stadium's BLACK BOX banners (diffuse
+    // obj_sign_sponsblackboxhoriz_01_ot_d): the static-like strips along
+    // their long edges survived both an alpha-test and a decal-state fix;
+    // log every bound texture (fetch words 1/2 = format + base, size;
+    // mip count) and the per-draw constants the shader sees.
+    if ((item.diffuse_guid & 0x0000FFFFFFFFFFFEull) == 0x0000730C03E3870Aull) {
+      static std::unordered_set<uint32_t> s_banner_logged;
+      if (s_banner_logged.size() < 6 && s_banner_logged.insert(item.mesh).second) {
+        const auto tex = [&](const GuestTexture* t) {
+          char buf[112];
+          if (t == nullptr) {
+            return std::string("none");
+          }
+          std::snprintf(buf, sizeof(buf), "%s[%08X %08X mips=%u valid=%d]",
+                        t == &g_r.white ? "white" : (t == &g_r.white_cube ? "white_cube" : ""),
+                        t->fetch_words[1], t->fetch_words[2], t->srv_mips, t->valid ? 1 : 0);
+          return std::string(buf);
+        };
+        std::string cs;
+        for (int k = 32; k < 52; ++k) {
+          char buf[24];
+          std::snprintf(buf, sizeof(buf), "%s%.4g", k == 32 ? "" : ",", double(constants[k]));
+          cs += buf;
+        }
+        REXLOG_INFO(
+            "diag-banner: mesh={:08X} material={} env_family={} s2_no_at={} s2_blend={} "
+            "packed_lm={} lm_dot=({},{},{},{}) v2_flags={:#x} detail_scale={} normal_paired={} "
+            "decal={} transparent={} cull_pso={} diffuse={} lightmap={} chroma={} macro={} "
+            "t4={} cube={} v2_detail={} v2_spec2={} pair_normal={} constants32..51=[{}]",
+            item.mesh, item.material_name, item.env_family, item.s2_no_alpha_test ? 1 : 0,
+            item.s2_blend, item.packed_lightmap ? 1 : 0, item.mono_lightmap_dot[0],
+            item.mono_lightmap_dot[1], item.mono_lightmap_dot[2], item.mono_lightmap_dot[3],
+            v2_flags, item.detail_scale, normal_paired ? 1 : 0, item.decal ? 1 : 0,
+            item.transparent ? 1 : 0, scene_pso_bound == g_r.pso_cullback ? "cullback" : "other",
+            tex(diffuse), tex(lightmap), tex(chromaticity), tex(macro_tex), tex(decal_tex),
+            tex(cube_tex), tex(v2_detail), tex(v2_spec2), tex(pair_normal), cs);
+      }
+    }
+    if (pick != nullptr) {
+      ++pick->submitted;
+      std::string cs;
+      for (int k = 32; k < 52; ++k) {
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%s%.4g", k == 32 ? "" : ",", double(constants[k]));
+        cs += buf;
+      }
+      REXLOG_INFO("pick-draw: #{} mesh={:08X} pass={} diffuse={} lightmap={} chroma={} macro={} "
+                  "t4={} cube={} detail={} spec2={} pair_normal={} lm_dot=({},{},{},{}) "
+                  "v2_flags={:#x} spec_bound={} constants32..51=[{}]",
+                  pick->rank, item.mesh, in_blend_pass ? "blend" : "opaque",
+                  PickTextureDesc(diffuse), PickTextureDesc(lightmap),
+                  PickTextureDesc(chromaticity), PickTextureDesc(macro_tex),
+                  PickTextureDesc(decal_tex), PickTextureDesc(cube_tex),
+                  PickTextureDesc(v2_detail), PickTextureDesc(v2_spec2),
+                  PickTextureDesc(pair_normal), item.mono_lightmap_dot[0],
+                  item.mono_lightmap_dot[1], item.mono_lightmap_dot[2],
+                  item.mono_lightmap_dot[3], v2_flags, spec_bound, cs);
+    }
     cmd->SetRootConstants(0, 52, constants, 0);
 
-    cmd->SetTexture(1, diffuse->srv);
+    // Stadium video screens: the looped jumbotron clip (UpdateJumbotron)
+    // replaces the "JUMBO TRON TEMP" placeholder diffuse.
+    nrhi::TextureView* diffuse_view = diffuse->srv;
+    if (item.s2_video && REXCVAR_GET(skate3_skate2_jumbotron)) {
+      g_r.jumbo_seen_frame = frame_number;
+      if (g_r.jumbo_srv != nullptr && !g_r.jumbo_fresh) {
+        diffuse_view = g_r.jumbo_srv;
+      }
+    }
+    cmd->SetTexture(1, diffuse_view);
     cmd->SetTexture(2, (lightmap != nullptr ? lightmap : &g_r.white)->srv);
     cmd->SetTexture(4, macro_tex->srv);
     // t4 override: the dynobj world-shadow map rides the free first entry
@@ -9488,133 +12228,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                         shadow_ready ? g_r.shadow_srv_final : g_r.white.srv);
     // World-shading v2 material pair (t8 detail + t9 decal spec); the exact
     // ocean rides the same pair (t8 = second PCA component, t9 = overlay).
-    if (v2_flags != 0 || ocean_n2 || ocean_ov) {
+    { // Bind every draw so packed-lightmap chromaticity cannot leak.
       // Three-entry bind: re-pairing only t8/t9 would reset the t10 static
       // sun-shadow map to the backend fallback.
-      nrhi::TextureView* t8_views[3] = {
+      nrhi::TextureView* t8_views[4] = {
           (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
-          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv, nsm_view};
-      cmd->SetTextures(8, t8_views, 3);
-    }
-    // ROPA shape blend (see RendererState::ropa_shapes): combine the shape
-    // generations with the kernel weights InterpolateDynamicItems computed
-    // (the SAME 8-tap boxcar / pair-lerp the body bones and garment world
-    // took this frame) into the per-frame ropa upload ring and draw from
-    // it; the stepped cloth shape against the interpolated body was the
-    // tee jelly/clip-through, and a filter-MISMATCHED blend (plain lerp vs
-    // boxcar body) kept a period-scaled residue of it. Positions/normals
-    // (floats 0..6) blend; packed attributes (blend words, uvs: floats
-    // 7..13) copy from the newest generation present. Generations missing
-    // from the ring (evicted / decode in flight) renormalize over what IS
-    // present when at least half the kernel's weight survives.
-    VbBinding item_vbv = buffers.vb_view;
-    if (item.ropa && item.shape_count > 0 &&
-        REXCVAR_GET(skate3_native_render_scene_ropa_blend)) {
-      const std::vector<float>* gv[DrawItem::kShapeGens] = {};
-      float gw[DrawItem::kShapeGens] = {};
-      int ng = 0;
-      float total = 0.0f;
-      uint64_t newest_seq = 0;
-      const std::vector<float>* newest = nullptr;
-      // Generations must match the RESIDENT decode's extent exactly; the
-      // index buffer references that many vertices. After a re-stream/
-      // outfit swap the ring briefly holds stale-size generations; binding
-      // one against the current IB reads past the bound VB and collapses
-      // triangles (a momentary partial-invisible blink). Stale sizes drop
-      // out here; if too much kernel weight is stale, the raw resident VB
-      // draws instead (always self-consistent).
-      const size_t want_floats =
-          size_t(buffers.vb_view.size_bytes) / sizeof(float);
-      const auto rit = g_r.ropa_shapes.find(item.mesh);
-      if (rit != g_r.ropa_shapes.end() && !rit->second.empty()) {
-        // Sim-sleep gate: generations grossly older than the ring's newest
-        // were recorded before a cloth-sim sleep (continuous streams span
-        // ~114 ms end to end). Blending one against the fresh drape draws
-        // the garment where/how the character USED to stand, the
-        // detached/perpendicular class. Dropped generations shed their
-        // kernel weight; if too much weight is stale the raw resident VB
-        // draws instead (self-consistent current shape).
-        const double ring_newest_t = rit->second.back().t;
-        for (int k = 0; k < item.shape_count; ++k) {
-          for (const RendererState::RopaGen& g : rit->second) {
-            if (g.seq != item.shape_seq[k]) {
-              continue;
-            }
-            if (g.verts.size() != want_floats) {
-              break;  // stale-size generation (re-stream/outfit swap)
-            }
-            if (ring_newest_t - g.t > 0.35) {
-              static std::atomic<uint32_t> s_stale{0};
-              const uint32_t ln =
-                  s_stale.fetch_add(1, std::memory_order_relaxed);
-              if (ln < 16 || (ln & 1023u) == 0) {
-                REXLOG_DEBUG(
-                    "native-scene: ropa shape STALE gen dropped mesh={:08X} "
-                    "age={:.2f}s seq_gap={} (n={})",
-                    item.mesh, ring_newest_t - g.t,
-                    rit->second.back().seq - g.seq, ln);
-              }
-              break;
-            }
-            gv[ng] = &g.verts;
-            gw[ng] = item.shape_w[k];
-            total += item.shape_w[k];
-            ++ng;
-            if (g.seq >= newest_seq) {
-              newest_seq = g.seq;
-              newest = &g.verts;
-            }
-            break;
-          }
-        }
+          (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv, nsm_view,
+          (chromaticity && chromaticity != &g_r.white
+               ? chromaticity
+               : item.packed_lightmap ? &g_r.chroma_neutral : &g_r.white)
+              ->srv};
+      if (item.packed_lightmap && lightmap && (!chromaticity || chromaticity == &g_r.white)) {
+        g_chroma_neutral_draws.fetch_add(1, std::memory_order_relaxed);
       }
-      const uint32_t region =
-          uint32_t(frame_number % RendererState::kBoneRegions) *
-          RendererState::kRopaRegionSize;
-      const uint32_t bytes = uint32_t(want_floats * sizeof(float));
-      if (ng > 0 && total >= 0.5f && newest != nullptr &&
-          buffers.vb_view.stride == 56 &&
-          g_r.ropa_ring_offset + bytes <= RendererState::kRopaRegionSize) {
-        float* dst = reinterpret_cast<float*>(g_r.ropa_ring_cpu + region +
-                                              g_r.ropa_ring_offset);
-        const float inv = 1.0f / total;
-        for (size_t v = 0; v + 14 <= want_floats; v += 14) {
-          float blend7[7] = {};
-          for (int k = 0; k < ng; ++k) {
-            const float* src = gv[k]->data() + v;
-            const float wk = gw[k] * inv;
-            for (int f = 0; f < 7; ++f) {
-              blend7[f] += src[f] * wk;
-            }
-          }
-          // One store per float: dst is write-combined upload memory.
-          std::memcpy(dst + v, blend7, sizeof(blend7));
-          std::memcpy(dst + v + 7, newest->data() + v + 7, 7 * sizeof(float));
-        }
-        item_vbv.buffer = g_r.ropa_ring;
-        item_vbv.offset = region + g_r.ropa_ring_offset;
-        item_vbv.size_bytes = bytes;
-        item_vbv.stride = buffers.vb_view.stride;
-        g_r.ropa_ring_offset += (bytes + 255u) & ~255u;
-        g_ropa_blend_drawn.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        // Fallback to the raw resident shape. Rate-limited detail log: an
-        // ALTERNATION of these with blended frames renders the garment
-        // hopping between the play-clock drape and the zero-lag drape.
-        g_ropa_blend_miss.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<uint32_t> s_blend_miss_log{0};
-        const uint32_t ln =
-            s_blend_miss_log.fetch_add(1, std::memory_order_relaxed);
-        if (ln < 64 || (ln & 63u) == 0) {
-          REXLOG_DEBUG(
-              "native-scene: ropa blend MISS mesh={:08X} sc={} ng={} "
-              "total={:.2f} stride={} ring={} ring_off={} (n={})",
-              item.mesh, item.shape_count, ng, total, buffers.vb_view.stride,
-              rit != g_r.ropa_shapes.end() ? rit->second.size() : size_t(0),
-              g_r.ropa_ring_offset, ln);
-        }
-      }
+      cmd->SetTextures(8, t8_views, 4);
     }
+    // ROPA garments draw the play-clock shape blend (RopaDrawVb; the CSM
+    // caster pass binds the same memoized blend).
+    const VbBinding item_vbv = RopaDrawVb(item, buffers, frame_number);
     cmd->SetVertexBuffer(item_vbv.buffer, item_vbv.offset, item_vbv.size_bytes,
                          item_vbv.stride);
     cmd->SetIndexBuffer(buffers.ib_view.buffer, buffers.ib_view.offset,
@@ -9656,8 +12287,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // completed slot wins, every completed slot retires. A grid that stops
   // refreshing (AO off, loading flows) goes invalid instead of classifying
   // against ancient depth.
+  const bool bam_occlusion_allowed = !skate3::world_loading::IsSkate2Gameplay() ||
+      REXCVAR_GET(skate3_skate2_native_occlusion);
   const bool occl_cull_wanted =
-      REXCVAR_GET(skate3_native_render_scene_occlusion_cull);
+      REXCVAR_GET(skate3_native_render_scene_occlusion_cull) && bam_occlusion_allowed;
+  // The existing empty-set publication below drains build/guest skips too.
+  static bool last_bam_occlusion_allowed = true;
+  if (last_bam_occlusion_allowed != bam_occlusion_allowed) {
+    last_bam_occlusion_allowed = bam_occlusion_allowed;
+    REXLOG_INFO("world-native-occlusion: allowed={} bam={}", bam_occlusion_allowed,
+                skate3::world_loading::IsSkate2Gameplay());
+  }
   if ((prof_items || occl_cull_wanted) && !g_r.occl_failed &&
       g_r.occl_readback_ptr[1] != nullptr) {
     const uint64_t occl_done = context.device->CompletedSubmission();
@@ -9738,6 +12378,106 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   };
 
+  // Detached-piece detector (diagnostic, bounded log): each skinned
+  // character piece's anchor = the mean translation of the palette bones
+  // its vertices reference (MeshBuffers::bone_lo..hi). A piece whose anchor
+  // sits far from every other piece while another piece is near (the shoe
+  // left lying behind a running skater) is logged with its capture source,
+  // so the failing palette path can be named from a normal log.
+  if (debug_mode == 0) {
+    const bool detached_log = REXCVAR_GET(skate3_native_render_scene_capture_log);
+    struct Anchor {
+      const DrawItem* item;
+      float p[3];
+    };
+    std::vector<Anchor> anchors;
+    for (const DrawItem& item : scene.items) {
+      if (!detached_log || !item.skinned || item.bones.size() < 12 ||
+          item.char_family == 0 || item.char_family > 3) {
+        continue;
+      }
+      const auto mit = g_r.meshes.find(item.mesh);
+      if (mit == g_r.meshes.end() || mit->second.bone_hi < 0) continue;
+      const int lo = mit->second.bone_lo, hi = mit->second.bone_hi;
+      if (size_t(hi + 1) * 12 > item.bones.size()) continue;
+      Anchor a{&item, {0.0f, 0.0f, 0.0f}};
+      for (int k = lo; k <= hi; ++k) {
+        for (int c = 0; c < 3; ++c) a.p[c] += item.bones[size_t(k) * 12 + size_t(c) * 4 + 3];
+      }
+      float d2 = 0.0f;
+      for (int c = 0; c < 3; ++c) {
+        a.p[c] /= float(hi - lo + 1);
+        const float d = a.p[c] - scene.cam_pos[c];
+        d2 += d * d;
+      }
+      if (d2 < 40.0f * 40.0f) anchors.push_back(a);
+    }
+    // User-marker dump: every character piece near the camera, skinned
+    // (bone anchor) or rigid (world translation), with its provenance.
+    if (g_char_dump_frames.load(std::memory_order_acquire) > 0) {
+      const int left = g_char_dump_frames.fetch_sub(1, std::memory_order_acq_rel);
+      for (const DrawItem& item : scene.items) {
+        if (item.char_family == 0 && !item.skinned) continue;
+        float p[3] = {item.world[12], item.world[13], item.world[14]};
+        int lo = -1, hi = -1;
+        const auto mit = g_r.meshes.find(item.mesh);
+        if (item.skinned && mit != g_r.meshes.end() && mit->second.bone_hi >= 0 &&
+            size_t(mit->second.bone_hi + 1) * 12 <= item.bones.size()) {
+          lo = mit->second.bone_lo;
+          hi = mit->second.bone_hi;
+          p[0] = p[1] = p[2] = 0.0f;
+          for (int k = lo; k <= hi; ++k) {
+            for (int c = 0; c < 3; ++c) p[c] += item.bones[size_t(k) * 12 + size_t(c) * 4 + 3];
+          }
+          for (int c = 0; c < 3; ++c) p[c] /= float(hi - lo + 1);
+        }
+        float d2 = 0.0f;
+        for (int c = 0; c < 3; ++c) {
+          const float d = p[c] - scene.cam_pos[c];
+          d2 += d * d;
+        }
+        if (d2 > 25.0f * 25.0f) continue;
+        REXLOG_INFO(
+            "native-chardump: left={} frame={} mesh={:08X} ctx={:08X} material={} fam={} "
+            "skinned={} src={} pending={} retained={} ropa={} caster={} bones={} "
+            "range={}..{} anchor=({:.2f},{:.2f},{:.2f}) decoded={}",
+            left, frame_number, item.mesh, item.ctx, item.material_name, item.char_family,
+            item.skinned, item.dbg_src, item.pending, item.retained, item.ropa,
+            item.caster_bank, item.bones.size() / 12, lo, hi, p[0], p[1], p[2],
+            mit != g_r.meshes.end());
+      }
+    }
+    static std::atomic<uint32_t> s_detached_logs{0};
+    for (const Anchor& a : anchors) {
+      float best = 1e30f;
+      const Anchor* nb = nullptr;
+      for (const Anchor& b : anchors) {
+        if (&a == &b) continue;
+        float d2 = 0.0f;
+        for (int c = 0; c < 3; ++c) {
+          const float d = a.p[c] - b.p[c];
+          d2 += d * d;
+        }
+        if (d2 < best) {
+          best = d2;
+          nb = &b;
+        }
+      }
+      if (nb == nullptr || best < 1.75f * 1.75f || best > 8.0f * 8.0f) continue;
+      const uint32_t n = s_detached_logs.fetch_add(1, std::memory_order_relaxed);
+      if (n < 64 || (n & 511u) == 0) {
+        const DrawItem& it = *a.item;
+        REXLOG_WARN(
+            "native-detached: frame={} mesh={:08X} ctx={:08X} material={} fam={} "
+            "src={} pending={} retained={} ropa={} bones={} anchor=({:.2f},{:.2f},{:.2f}) "
+            "nearest={:.2f}m mesh={:08X} material={} src={} (n={})",
+            frame_number, it.mesh, it.ctx, it.material_name, it.char_family,
+            it.dbg_src, it.pending, it.retained, it.ropa, it.bones.size() / 12,
+            a.p[0], a.p[1], a.p[2], std::sqrt(best), nb->item->mesh,
+            nb->item->material_name, nb->item->dbg_src, n);
+      }
+    }
+  }
   // Opaque items first; environment.transparent items are deferred to an
   // alpha-blended sub-pass (depth test on, z-write off) drawn back-to-front;
   // interleaved opaque rendering alpha-tested the mist sheets into solid
@@ -10005,10 +12745,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // the sorted alpha sub-pass would composite the blended horizon sheet
     // (ocean.reflection) UNDER it. The legacy fallback also renders opaque,
     // so the route holds while textures/rows are still resolving.
-    const bool ocean_opaque = item.water && item.water_ocean == 1 &&
-                              scene.shadow_valid && scene.ocean_valid;
+    const bool ocean_opaque = IsSkate2Water(item) || IsSkate2Ocean(item) ||
+        (item.water && item.water_ocean == 1 && scene.shadow_valid && scene.ocean_valid);
+    // Skate 2 additive effects (neon overlays, glare halos, godray cones)
+    // composite after every opaque surface, like the game's sort order.
+    const bool s2_additive = item.s2_blend != 0 && use_depth;
+    // Hall of Meat bones (char fam 8, defaulthom) with validated rows: the
+    // x-ray overlay, drawn after the scene with a depth pull so the glowing
+    // bone shows through the body (see the blended loop).
+    const bool hom_xray = item.char_family == 8 && char_capture_ok && use_depth;
     if ((item.transparent || item.water || hair_blend || glass_blend ||
-         cac_alpha_blend || refl_trans_blend || char_fade_blend) &&
+         cac_alpha_blend || refl_trans_blend || char_fade_blend || s2_additive ||
+         item.indicator || hom_xray) &&
         !ocean_opaque && debug_mode == 0) {
       if (REXCVAR_GET(skate3_native_render_scene_transparents)) {
         transparent_items.push_back(&item);
@@ -10058,11 +12806,77 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                        if (fa != fb) {
                          return fa;
                        }
+                       // Hall of Meat bones draw LAST: hair (z-write off)
+                       // composited after them covered the broken skull.
+                       const bool ha = a->char_family == 8;
+                       const bool hb = b->char_family == 8;
+                       if (ha != hb) {
+                         return hb;
+                       }
                        return view_dist2(*a) > view_dist2(*b);
                      });
     cmd->SetPipeline(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
     nrhi::Pipeline* blend_bound = use_depth ? g_r.pso_transparent : g_r.pso_nodepth;
+    in_blend_pass = true;
     for (const DrawItem* item : transparent_items) {
+      // Skate 2 decalzbias overlays: straight blend + z-write + the material
+      // depth bias (matrix offset via blend_zbias), mirrored instances on
+      // the flipped-winding PSO.
+      if (item->s2_blend == 5 && use_depth && g_r.pso_s2_decal[0] != nullptr &&
+          g_r.pso_s2_decal[1] != nullptr) {
+        const float* w = item->world;
+        const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
+                           w[1] * (w[4] * w[10] - w[6] * w[8]) +
+                           w[2] * (w[4] * w[9] - w[5] * w[8]);
+        nrhi::Pipeline* want = g_r.pso_s2_decal[det3 >= 0.0f ? 0 : 1];
+        if (want != blend_bound) {
+          cmd->SetPipeline(want);
+          blend_bound = want;
+        }
+        blend_zbias = REXCVAR_GET(skate3_skate2_material_depth_bias);
+        timed_draw(*item);
+        blend_zbias = false;
+        continue;
+      }
+      // Skate 2 additive effects: their technique's ONE/ONE state (see
+      // pso_s2_add); the zbias variant also carries the matrix depth offset.
+      if (item->s2_blend >= 1 && item->s2_blend <= 4 && use_depth &&
+          g_r.pso_s2_add[item->s2_blend - 1] != nullptr) {
+        nrhi::Pipeline* want = g_r.pso_s2_add[item->s2_blend - 1];
+        if (want != blend_bound) {
+          cmd->SetPipeline(want);
+          blend_bound = want;
+        }
+        blend_zbias = item->s2_blend == 1;
+        timed_draw(*item);
+        blend_zbias = false;
+        continue;
+      }
+      // Hall of Meat bones: the transparent state (depth test on, z-write
+      // off; the PS outputs alpha 1), drawn last. The VS pulls their depth
+      // 0.5 m toward the camera (scene.hlsl, cam_pos.w = 8), so the bone
+      // shows through the skater's own body and hair but stays hidden
+      // behind world geometry nearer the camera (run 089: with the depth
+      // test off the bones drew through a bush in front of the camera).
+      if (item->char_family == 8 && use_depth && item->char_rows[14 * 4 + 1] > 7.5f) {
+        if (blend_bound != g_r.pso_transparent) {
+          cmd->SetPipeline(g_r.pso_transparent);
+          blend_bound = g_r.pso_transparent;
+        }
+        timed_draw(*item);
+        continue;
+      }
+      // visualindicator overlays: straight alpha blend, z-write off (the
+      // transparent state); the x-ray cvar drops the depth test.
+      if (item->indicator && use_depth && g_r.pso_indicator_xray != nullptr &&
+          REXCVAR_GET(skate3_native_render_scene_indicator_xray)) {
+        if (blend_bound != g_r.pso_indicator_xray) {
+          cmd->SetPipeline(g_r.pso_indicator_xray);
+          blend_bound = g_r.pso_indicator_xray;
+        }
+        timed_draw(*item);
+        continue;
+      }
       // Mid-fade entity pieces: alpha blend with z-write ON (see pso_fade).
       if (use_depth && g_r.pso_fade != nullptr && char_fade_zwrite(*item)) {
         if (blend_bound != g_r.pso_fade) {
@@ -10083,6 +12897,23 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cmd->SetPipeline(g_r.pso_hair_b);
         timed_draw(*item);
         cmd->SetPipeline(blend_bound);
+        continue;
+      }
+      // Skate 2 environment.transparent (New San Van): transparentenvironment
+      // .xml's own state, z-write ON + CULLMODE FRONT (pso_s2_trans; [1] for
+      // mirrored instances), still in this back-to-front blend order.
+      if (item->s2_trans_zwrite && use_depth && g_r.pso_s2_trans[0] != nullptr &&
+          g_r.pso_s2_trans[1] != nullptr && REXCVAR_GET(skate3_skate2_transparent_parity)) {
+        const float* w = item->world;
+        const float det3 = w[0] * (w[5] * w[10] - w[6] * w[9]) -
+                           w[1] * (w[4] * w[10] - w[6] * w[8]) +
+                           w[2] * (w[4] * w[9] - w[5] * w[8]);
+        nrhi::Pipeline* want = g_r.pso_s2_trans[det3 >= 0.0f ? 0 : 1];
+        if (want != blend_bound) {
+          cmd->SetPipeline(want);
+          blend_bound = want;
+        }
+        timed_draw(*item);
         continue;
       }
       // reflective_trans glass culls like the game (its material family's
@@ -10111,6 +12942,78 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         cmd->SetPipeline(blend_bound);
       }
       timed_draw(*item);
+    }
+    in_blend_pass = false;
+  }
+  for (const auto& [pick_item, st] : pick_map) {
+    if (st.submitted == 0) {
+      REXLOG_INFO("pick-skip: #{} mesh={:08X} {}", st.rank, pick_item->mesh,
+                  st.entered ? "returned before drawing (mesh or texture not ready, retained "
+                               "mismatch, or hidden)"
+                             : "never reached draw (occlusion-culled, faded out, or filtered "
+                               "out of the passes)");
+    }
+  }
+  // Hall of Meat stencil mark: the game's bones write stencil, and its
+  // postfx_visualfxPS / postfx_uberPS read that byte (packed-depth .z) to
+  // keep bone pixels out of the chain's grade (the left-trigger B&W look
+  // leaves the glowing bones coloured; run 095 draw order: defaulthom draws
+  // BEFORE visualfx). Only while the chain runs this frame: the bones'
+  // (0.5 m pulled, see scene.hlsl) depth goes into the R16G16 mask through
+  // ps_shadow_caster (MIN blend, cleared to 1.0 = no bone) and ps_depthpack
+  // marks only pixels where that depth passes the scene depth, the same test
+  // the bone colour draw passes. Run 097: an untested silhouette mask kept a
+  // bone-shaped patch of the bush in front of the camera out of the B&W.
+  if (scene.photo_fx.valid && debug_mode == 0 && g_r.pso_hom_depth != nullptr) {
+    bool any_hom = false;
+    for (const DrawItem& item : scene.items) {
+      any_hom = any_hom || (item.char_family == 8 && item.char_rows[14 * 4 + 1] > 7.5f);
+    }
+    const uint32_t mw = context.guest_output_width, mh = context.guest_output_height;
+    if (any_hom && (g_r.hom_depth == nullptr || g_r.hom_depth_width != mw ||
+                    g_r.hom_depth_height != mh)) {
+      if (g_r.hom_depth_srv != nullptr) {
+        g_r.device->DestroyDeferred(g_r.hom_depth_srv);
+        g_r.hom_depth_srv = nullptr;
+      }
+      if (g_r.hom_depth != nullptr) {
+        g_r.device->DestroyDeferred(g_r.hom_depth);
+        g_r.hom_depth = nullptr;
+      }
+      nrhi::TextureDesc desc;
+      desc.width = mw;
+      desc.height = mh;
+      desc.mip_levels = 1;
+      desc.format = nrhi::Format::kR16G16_UNORM;
+      desc.usage = nrhi::kTextureUsageRenderTarget;
+      desc.initial_state = nrhi::ResourceState::kRenderTarget;
+      g_r.hom_depth = context.device->CreateTexture(desc);
+      if (g_r.hom_depth != nullptr) {
+        nrhi::TextureViewDesc vd;
+        vd.mip_levels = 1;
+        g_r.hom_depth_srv = context.device->CreateTextureView(g_r.hom_depth, vd);
+      }
+      g_r.hom_depth_width = g_r.hom_depth_srv != nullptr ? mw : 0;
+      g_r.hom_depth_height = g_r.hom_depth_srv != nullptr ? mh : 0;
+    }
+    if (any_hom && g_r.hom_depth != nullptr && g_r.hom_depth_srv != nullptr) {
+      const float mask_clear[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+      cmd->ClearRenderTarget(g_r.hom_depth, mask_clear);
+      cmd->SetRenderTargets(g_r.hom_depth, nullptr);
+      cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, float(mw), float(mh), 0.0f, 1.0f});
+      cmd->SetScissor(nrhi::Rect{0, 0, int32_t(mw), int32_t(mh)});
+      cmd->SetPipeline(g_r.pso_hom_depth);
+      for (const DrawItem& item : scene.items) {
+        if (item.char_family == 8 && item.char_rows[14 * 4 + 1] > 7.5f) {
+          draw_item(item);
+        }
+      }
+      hom_mask_ready = true;
+      cmd->SetViewport(viewport);
+      cmd->SetScissor(scissor);
+      cmd->SetRenderTargets(scene_color, use_depth ? g_r.depth : nullptr);
+      cmd->SetPipeline(use_depth ? g_r.pso_transparent : g_r.pso_nodepth);
+      scene_pso_bound = nullptr;
     }
   }
   g_pw_items.Add(perf_ns_since(items_t0));
@@ -10365,7 +13268,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // Root constants: the scene's (smoothed) view_proj rows; the verts
       // are world-space, then i_intensity as staged (c149).
       float spline_consts[20];
-      std::memcpy(spline_consts, scene.view_proj, sizeof(float) * 16);
+      // Same depth mapping as the scene they are tested against (reversed Z).
+      constexpr float kNoOrigin[3] = {0.0f, 0.0f, 0.0f};
+      RebasedViewProj(scene.view_proj, kNoOrigin, spline_consts, kReversedZ);
       std::memcpy(spline_consts + 16, s.consts + 149 * 4, sizeof(float) * 4);
       // intensity.zw = showcase blackout gate (the guest row's unused
       // lanes): z = split x, w = left|right visibility bits. The spline PS
@@ -10410,7 +13315,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                      });
     const float gbuf_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     cmd->ClearRenderTarget(g_r.ssr_gbuf, gbuf_clear);
-    cmd->ClearDepth(g_r.ssr_gbuf_depth, 1.0f);
+    cmd->ClearDepth(g_r.ssr_gbuf_depth, kReversedZ ? 0.0f : 1.0f);
     cmd->SetRenderTargets(g_r.ssr_gbuf, g_r.ssr_gbuf_depth);
     cmd->SetViewport(nrhi::Viewport{0.0f, 0.0f, float(g_r.ssr_width),
                                     float(g_r.ssr_height), 0.0f, 1.0f});
@@ -10665,6 +13570,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           (vig != nullptr && vig->valid) ? vig->srv : g_r.white.srv;
       nrhi::TextureView* const grain_slot =
           (grain != nullptr && grain->valid) ? grain->srv : g_r.white.srv;
+      // fisheye_noise video look (slow-motion bail): the noise texture
+      // (f_noise_texture, tf5 at the game's noise draw) on t7.
+      const GuestTexture* noise_tex =
+          scene.photo_fx.noise
+              ? resolve_2d_texture(scene.photo_fx.noise_fetch, /*force_inline=*/true)
+              : nullptr;
+      const bool pfx_noise = noise_tex != nullptr && noise_tex->valid;
+      // HoM bone depth mask (drawn after the blended sub-pass).
+      const bool hom_stencil = hom_mask_ready;
 
       // Baked literal rows c250..c255 per pass (the shader asset footers the
       // game loads via PM4 LOAD_ALU_CONSTANT to PS rows 252+; values read
@@ -10752,6 +13666,22 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         rows[248 * 4 + 0] = float(context.guest_output_width);
         rows[248 * 4 + 1] = float(context.guest_output_height);
         rows[249 * 4 + 0] = float(pfx_debug);
+        if (!REXCVAR_GET(skate3_native_render_scene_postfx_motion_blur)) {
+          // f_MotionBlur_Intensity: visualfx c5.x (its alpha = the blur
+          // weight uber composites by) and tap9dofMotionBlur c0.x.
+          if (pass == kPfxVisualFx) rows[5 * 4 + 0] = 0.0f;
+          if (pass == kPfxDofMB) rows[0 * 4 + 0] = 0.0f;
+        }
+        // c249.z: ps_depthpack copies the HoM bone mask (t0) into the
+        // packed stencil byte.
+        rows[249 * 4 + 2] = hom_stencil ? 1.0f : 0.0f;
+        if (pass == kPfxFisheye && pfx_noise) {
+          // ps_fisheye's noise path: f_NoiseScroll/Fade/DotP1/DotP2 (c3..c6)
+          // from the noise draw, flag in c249.y.
+          std::memcpy(rows + 3 * 4, scene.photo_fx.noise_rows,
+                      sizeof(scene.photo_fx.noise_rows));
+          rows[249 * 4 + 1] = 1.0f;
+        }
         return uint64_t(slot) * 4096;
       };
       // One 8-entry texture table (pfx_layout param 1, registers t0..t7);
@@ -10817,8 +13747,18 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cmd->SetScissor(scissor);
       cmd->SetPipeline(g_r.pfx_pso[0]);
       cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(-1));
-      pfx_bind_all(W, W, W, W, g_r.pfx_srv[6], W, W, g_r.pfx_srv[7]);
+      if (hom_stencil) {
+        cmd->Barrier(g_r.hom_depth, nrhi::ResourceState::kRenderTarget,
+                     nrhi::ResourceState::kPixelShaderResource);
+        pfx_flush();
+      }
+      pfx_bind_all(hom_stencil ? g_r.hom_depth_srv : W, W, W, W, g_r.pfx_srv[6], W, W,
+                   g_r.pfx_srv[7]);
       cmd->Draw(3, 0);
+      if (hom_stencil) {
+        cmd->Barrier(g_r.hom_depth, nrhi::ResourceState::kPixelShaderResource,
+                     nrhi::ResourceState::kRenderTarget);
+      }
       cmd->Barrier(g_r.depth, nrhi::ResourceState::kPixelShaderResource,
                    nrhi::ResourceState::kDepthWrite);
       pfx_to_srv(g_r.pfx_depth);
@@ -10907,7 +13847,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cmd->SetRenderTargets(context.guest_output, nullptr);
       cmd->SetPipeline(g_r.pfx_pso[6]);
       cmd->SetConstantBuffer(0, g_r.pfx_cb, fill_cb(kPfxFisheye));
-      pfx_bind_all(g_r.pfx_srv[1], W, vig_slot, W, g_r.pfx_srv[6], W, W, W);
+      pfx_bind_all(g_r.pfx_srv[1], W, vig_slot, W, g_r.pfx_srv[6], W,
+                   pfx_noise ? noise_tex->srv : W, W);
       cmd->Draw(3, 0);
 
       // 8b) Debug view (photo_native_debug): overwrite the output with the
@@ -11553,6 +14494,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                     twod_t0 - mid_t0)
                     .count()));
   g_pw_render.Add(perf_ns_since(render_t0));
+  {
+    // Perf recorder phase split (before LogFrameStats resets the windows).
+    const auto d_ns = [&](size_t i) {
+      return perf_pw[i]->ns.load(std::memory_order_relaxed) - perf_pw0_ns[i];
+    };
+    const auto d_count = [&](size_t i) {
+      return uint32_t(perf_pw[i]->count.load(std::memory_order_relaxed) - perf_pw0_count[i]);
+    };
+    skate3::perf_recorder::RenderRecord& pr = perf_rec.r;
+    pr.pre_ns = d_ns(0);
+    pr.items_ns = d_ns(1);
+    pr.shadow_ns = d_ns(2);
+    pr.settle_ns = d_ns(3);
+    pr.commit_ns = d_ns(4);
+    pr.twod_ns = d_ns(5);
+    pr.tail_ns = d_ns(6);
+    pr.decode_ns = d_ns(7) + d_ns(8);
+    pr.mesh_decodes = d_count(7);
+    pr.tex_decodes = d_count(8);
+    pr.draws = drawn;
+    pr.complete = true;
+  }
   const uint64_t frames = g_frames_rendered.fetch_add(1) + 1;
   MaybeDumpSceneRing();
   LogFrameStats(scene, frames, drawn, drawn_2d, drawn_spline, shadow_ready,
@@ -11563,6 +14526,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
 }  // namespace
 
 bool SceneFailed() { return g_r.failed; }
+
+void GetDecodeQueueDepths(uint32_t out[4]) {
+  {
+    std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+    out[0] = uint32_t(g_prewarm_queue.size());
+    out[1] = uint32_t(g_miss_queue.size());
+    out[2] = uint32_t(g_dyn_jobs.size());
+  }
+  std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
+  out[3] = uint32_t(g_prewarm_out.size());
+}
 
 void ResetSceneFailure() {
   if (g_r.failed) {
@@ -11594,6 +14568,7 @@ namespace skate3::native_scene {
 void Install() {}
 bool SceneFailed() { return false; }
 void ResetSceneFailure() {}
+void GetDecodeQueueDepths(uint32_t out[4]) { out[0] = out[1] = out[2] = out[3] = 0; }
 }  // namespace skate3::native_scene
 
 #endif  // REX_HAS_D3D12 || REX_HAS_VULKAN

@@ -88,11 +88,29 @@ float4 ps_depthpack(VsOut i) : SV_Target {
 #else
   float d = depth_1x.Load(int3(int2(i.pos.xy), 0));
 #endif
+  const float d_rev = d;
+  // Scene depth is reversed-Z; the packed value keeps the conventional
+  // (near 0, far 1) encoding the photo-mode consumers expect.
+  d = 1.0 - d;
   float D = min(floor(d * 16777216.0), 16777215.0);
   float hi = floor(D / 65536.0);
   float mid = floor((D - hi * 65536.0) / 256.0);
   float lo = D - hi * 65536.0 - mid * 256.0;
-  return float4(mid, lo, 0.0, hi) * (1.0 / 255.0);
+  // Stencil byte (.z): the Hall of Meat bone mark (c249.z = mask bound).
+  // The game's bones write stencil; visualfx (sat(2 st) x c16.x) and uber
+  // (st x c4) keep marked pixels out of the grade, so the bones stay
+  // coloured over the slow-motion B&W. t0 = the bones' pulled reversed-Z
+  // depth (1.0 = no bone): mark only where it passes this pixel's scene
+  // depth, the bone colour draw's own depth test, so geometry in front of
+  // the skater (a bush at the lens) keeps its grade. Marked = 255.
+  float st = 0.0;
+  if (c[249].z > 0.5) {
+    float bone_d = t0.Load(int3(int2(i.pos.xy), 0)).r;
+    if (bone_d < 0.99998 && bone_d >= d_rev) {
+      st = 255.0;
+    }
+  }
+  return float4(mid, lo, st, hi) * (1.0 / 255.0);
 }
 
 // Plain bilinear blit: the quarter-res accumulation update (the game feeds
@@ -128,7 +146,11 @@ float4 ps_visualfx(VsOut i) : SV_Target {
   float nx, ny, nz, nw, dw, rx, old, r1x_old;
 
   r2 = t1.SampleLevel(s_pt, uv, 0);            // tfetch2D r2, r0.xy, tf1
-  r4.xyz = t0.SampleLevel(s_lin, uv, 0).xyz;   // tfetch2D r4.xyz_, r0.xy, tf0
+  // Scene input: the game's buffer holds sqrt(0.5 x tonemap) and this pass
+  // applies the 1.414 scene multiplier itself (line 7, c253.z); the native
+  // output already folds the uber's 1.41 in (scene_common.hlsli ToneOut),
+  // so undo it here or the chain doubles it (run 094: washed-out white).
+  r4.xyz = t0.SampleLevel(s_lin, uv, 0).xyz * (1.0 / 1.41);   // tfetch2D r4.xyz_, r0.xy, tf0
   r3.xyz = t3.SampleLevel(s_lin, uv, 0).xyz;   // tfetch2D r3.xyz_, r0.xy, tf3
 
   // 7: mad r3.xyz_, r4.zxyy, c253.zzzz, r3.zxyy
@@ -300,7 +322,14 @@ float4 ps_dof_down(VsOut i) : SV_Target {
 // from depth + camera rows in c1).
 float4 ps_dof_mb(VsOut i) : SV_Target {
   float4 r0 = i.r0;
-  float4 r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r11 = 0;
+  // r1.xyz = the quad VS's second interpolant (uv.x*c0 + uv.y*c1 + c2 of the
+  // pass's VS rows: the reprojection's uv-dependent columns); only .w is
+  // overwritten by the tf0 fetch at /*7*/. It was zeroed here, which the
+  // static photo editor never exposed (camera still: rows ~0); in gameplay
+  // it cancels most of c1 (f_PsConstant_BlurMatrixZZZ) and without it every
+  // pixel blurred by the raw camera term x 100 (run 096: multiple exposures).
+  float4 r1 = float4(i.r1.xyz, 0.0);
+  float4 r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r11 = 0;
   float ps = 0;
   float4 c254 = c[254], c255 = c[255];
 
@@ -315,7 +344,7 @@ float4 ps_dof_mb(VsOut i) : SV_Target {
   r2.x = c[2].x * r1.w;
   // /*10*/
   r2.x = max(r2.x, c254.y);
-  // /*11*/ mad r1.xyz_, r2.yyyy, c1.xzyy, r1.xzyy   (r1.xyz==0)
+  // /*11*/ mad r1.xyz_, r2.yyyy, c1.xzyy, r1.xzyy   (r1.xyz = interpolant)
   { float nx = r2.y * c[1].x + r1.x, ny = r2.y * c[1].z + r1.z, nz = r2.y * c[1].y + r1.y; r1.x = nx; r1.y = ny; r1.z = nz; }
   // /*12*/ mad r1.xy__, r1.yyyy, r0.zwww, r1.xzzz
   { float nx = r1.y * r0.z + r1.x, ny = r1.y * r0.w + r1.z; r1.x = nx; r1.y = ny; }
@@ -593,5 +622,21 @@ float4 ps_fisheye(VsOut i) : SV_Target {
   float4 oC0;
   oC0.xyz = r1.xyz * r0.xyz;
   oC0.w = 1.0;
+  // postfx_basictex_fisheye_noisePS (c249.y = 1; the slow-motion bail
+  // "video" look): the same warp/vignette/tint, the whole product scaled by
+  // f_NoiseFade.x (c4.x), plus scrolling video noise x f_NoiseFade.y. Two
+  // wrap-sampled noise taps at uv*(10,5.625)+c3.xy and uv*(11,6.625)+c3.zw
+  // are dotted with f_NoiseDotP1/P2 (c5/c6); ucode: n = sat(2 d5 + 2 d6 - 2)
+  // (literals c253..c255 = (1,-0.888889,-1,0) (6.625,11,-0.5,1.777778)
+  // (-2,0.5,5.625,10); the ucode's vignette/warp math is identical to the
+  // opaque variant above).
+  if (c[249].y > 0.5) {
+    float2 nuv_a = float2(i.r0.x * 10.0 + c[3].x, i.r0.y * 5.625 + c[3].y);
+    float2 nuv_b = float2(i.r0.x * 11.0 + c[3].z, i.r0.y * 6.625 + c[3].w);
+    float d5 = dot(t7.SampleLevel(s_wrap, nuv_a, 0), c[5]);
+    float d6 = dot(t7.SampleLevel(s_wrap, nuv_b, 0), c[6]);
+    float n = saturate(2.0 * d5 + 2.0 * d6 - 2.0);
+    oC0.xyz = oC0.xyz * c[4].x + n * c[4].y;
+  }
   return oC0;
 }

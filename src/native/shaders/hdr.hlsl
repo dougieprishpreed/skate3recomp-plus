@@ -113,8 +113,12 @@ float3 ToneMapScene(float3 x) {
 
 // Device depth -> view-space Z. Row-vector projection with m23 = 1:
 // ndc_z = m22 + m32 / z_view.
+// The scene depth buffer is REVERSED-Z (near = 1, far -> 0; the depth
+// column is (w - z) of the guest projection, formed CPU-side in double),
+// so device depth d' = 1 - d. Using d' directly keeps the far-range
+// precision reversed Z provides: z_view = -m32 / (d' + m22 - 1).
 float LinearZ(float d) {
-  return clamp(vp.w / min(d - vp.z, -1e-6), 0.05f, 4e5f);
+  return clamp(-vp.w / max(d + (vp.z - 1.0f), 1e-9f), 0.05f, 4e5f);
 }
 
 // View-space position from UV + linear Z (|m00|/|m11| make this the SSAO

@@ -20,6 +20,7 @@ struct LocalProfileStore {
   std::vector<LocalProfile> profiles;
 };
 
+void EnsureDiagnosticSettings(const std::filesystem::path& path);
 std::filesystem::path ProfilesFilePath(const std::filesystem::path& user_data_root);
 LocalProfileStore LoadProfiles(const std::filesystem::path& profiles_path);
 bool SaveProfiles(const std::filesystem::path& profiles_path, const LocalProfileStore& store);

@@ -8,6 +8,8 @@
 
 #include "skate3_native_scene_state.h"
 
+#include <array>
+#include <cmath>
 #include <unordered_set>
 
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
@@ -41,6 +43,30 @@ struct IbBinding {
   uint32_t size_bytes = 0;
 };
 
+// Sticky texture serving state of one (mesh, texture slot) site (see
+// resolve_texture in draw_item): the last ADOPTED (served-live) words
+// state. Serves the site's previous art while the current binding's decode
+// is in flight (the console's own mip-transition look), and powers the
+// detail-downgrade hold: a strict base-area shrink keeps serving the
+// previous state's store entry for the hold window. Render thread only.
+struct TexStickySite {
+  uint64_t words_key = 0;
+  uint64_t area = 0;
+  // Nonzero = a downgrade is being held, first seen at this frame. The
+  // site adopts the smaller binding once the downgrade persists past
+  // skate3_native_render_scene_detail_hold frames.
+  uint64_t downgrade_since = 0;
+  // New San Van: payload fingerprint of the decode this site last showed,
+  // and the frame it last served. A store entry is keyed by fetch words, so
+  // it can hold another texture that streaming loaded at the same words
+  // since (resolve_texture's content check).
+  uint64_t content_fp = 0;
+  uint64_t last_frame = 0;
+};
+// resolve_texture slots: 0 diffuse, 1 lightmap, 2 macro, 3 normal/ripple,
+// 4 decal art, 5 hair, 6 spec, 7 detail, 8 chromaticity.
+constexpr uint32_t kTexStickySlots = 9;
+
 struct MeshBuffers {
   nrhi::Buffer* vb = nullptr;
   nrhi::Buffer* ib = nullptr;
@@ -59,6 +85,10 @@ struct MeshBuffers {
   // flicker", stops up close where 1cm still resolves). These meshes draw
   // with the backface-culling PSO instead.
   bool two_sided_sheet = false;
+  // Skinned meshes: the blend-index range the vertices actually reference
+  // (weight > 0), -1 when none; the detached-piece detector's bone anchor.
+  int16_t bone_lo = -1;
+  int16_t bone_hi = -1;
   // ROPA only: the decoded vertex array (num_verts x 14 floats, the scene
   // VS layout) retained for draw-time shape blending onto the play clock.
   std::vector<float> ropa_verts;
@@ -66,7 +96,36 @@ struct MeshBuffers {
   // streamed-out areas age out instead of accumulating across map changes;
   // an evicted mesh re-decodes on miss exactly like first sight.
   uint64_t last_used_frame = 0;
+  // Per-slot sticky texture sites of this mesh. Kept in the record (one
+  // lookup already serves the draw) so they live and die with the mesh; a
+  // session-wide map keyed by mesh grew with every streamed mesh and cost
+  // a cache-missing hash lookup per texture per draw. A decode that
+  // replaces this record (streaming heal) carries them over.
+  std::array<TexStickySite, kTexStickySlots> sticky{};
+  // The mesh this record was decoded from (MeshIdentity): records are keyed
+  // by guest address, and a far trip can load a DIFFERENT mesh where an old
+  // one lived. A fingerprint change with the same identity is a streaming
+  // refill of this mesh (keep drawing, keep the sticky history); a new
+  // identity starts fresh.
+  uint64_t identity = 0;
 };
+
+// Geometry identity of a captured mesh: vertex bytes, index count, stride,
+// position format and the mesh-local bounds. Stable across streaming refills
+// of one mesh; a different mesh at a reused address almost never matches.
+inline uint64_t MeshIdentity(const DrawItem& item) {
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  mix(item.vb_bytes);
+  mix(item.ib_count);
+  mix(item.stride);
+  mix(item.pos_fmt);
+  for (int a = 0; a < 3; ++a) {
+    mix(uint64_t(int64_t(std::llround(double(item.bbox_min[a]) * 16.0))));
+    mix(uint64_t(int64_t(std::llround(double(item.bbox_max[a]) * 16.0))));
+  }
+  return h | 1u;  // never 0 (0 = unknown, pre-identity record)
+}
 
 struct GuestTexture {
   nrhi::Texture* texture = nullptr;
@@ -164,12 +223,22 @@ struct GuestTexture {
   // video's last frame; serving it flashed old content at every video
   // boundary; hold the quad black until fresh content commits).
   uint64_t last_change_frame = 0;
+  // New San Van content check (resolve_texture): frame this decode was last
+  // found NOT to match the guest payload at its words (0 = never). Skips
+  // re-sampling for a few frames while the re-decode is in flight; a heal
+  // commit replaces the entry and so clears it.
+  mutable uint64_t stale_frame = 0;
 };
 
 // THE texture identity key: FNV-1a
 // over the six fetch-constant words, console identity semantics for the
 // content store. Object resolves, draw-time word bindings, 2D/HUD art, and
 // the decode workers all key the same g_r.tex_store entries with it.
+// Main scene depth is REVERSED-Z (clear 0, GREATER; see RebasedViewProj in
+// skate3_native_scene_gpu.cpp). Every pass that shares the scene transform
+// or depth buffer follows this; shadow maps keep the conventional mapping.
+inline constexpr bool kReversedZ = true;
+
 inline uint64_t FetchWordsKey(const uint32_t words[6]) {
   uint64_t key = 1469598103934665603ull;
   for (int k = 0; k < 6; ++k) {
@@ -256,6 +325,19 @@ inline std::atomic<uint64_t> g_demote_hold{0};
 // first-sight draws suppressed entirely for the in-flight window.
 inline std::atomic<uint64_t> g_tex_sticky_served{0};
 inline std::atomic<uint64_t> g_skip_new{0};
+// Of skipnew: draws held for a packed lightmap or its chroma page; holds
+// that ran out and drew with a fallback; packed-atlas draws lit through the
+// neutral chromaticity (no chroma page to sample).
+inline std::atomic<uint64_t> g_skip_new_lighting{0};
+inline std::atomic<uint64_t> g_hold_expired{0};
+inline std::atomic<uint64_t> g_chroma_neutral_draws{0};
+// Mesh records replaced by a DIFFERENT mesh at the same guest address (no
+// sticky history carried; MeshBuffers::identity).
+inline std::atomic<uint64_t> g_mesh_identity_resets{0};
+// New San Van: slot serves refused because the decode under the bound words
+// no longer matched the guest payload (another texture now occupies that
+// memory); the slot waited for the re-decode instead.
+inline std::atomic<uint64_t> g_tex_stale_refused{0};
 // Per-mesh pipeline trace (skate3_native_render_scene_trace_mesh). Render
 // thread only: the traced mesh address (parsed once per frame), the traced
 // mesh's current store keys (so worker-commit events can be matched), and
@@ -472,6 +554,7 @@ struct RendererState {
   nrhi::Device* device = nullptr;
   nrhi::BindingLayout* layout = nullptr;  // main scene binding layout (was the root signature)
   nrhi::Pipeline* pso = nullptr;
+  nrhi::Pipeline* pso_bam_zbias = nullptr;
   nrhi::Pipeline* pso_cullback = nullptr;  // two_sided_sheet meshes (see MeshBuffers)
   nrhi::Pipeline* pso_nodepth = nullptr;
   // environment.transparent sub-pass: straight alpha blend, depth test on,
@@ -488,6 +571,18 @@ struct RendererState {
   // (the game's cac_hair/defaulthair two-pass draw order).
   nrhi::Pipeline* pso_hair_a = nullptr;
   nrhi::Pipeline* pso_hair_b = nullptr;
+  // Skate 2 additive effects (DrawItem::s2_blend 1..4): ONE/ONE, RGB writes,
+  // depth test on. 1 = z-write + material depth bias, cull FRONT
+  // (zbiasincandescent); 2 = z-write, cull FRONT (transparentincandescent);
+  // 3 = no z-write, uncull(ed) (glare); 4 = no z-write, cull FRONT (godray).
+  nrhi::Pipeline* pso_s2_add[4] = {};
+  // Skate 2 decalzbias overlays (s2_blend 5): straight alpha blend,
+  // z-write, material depth bias; [0] game cull, [1] mirrored winding.
+  nrhi::Pipeline* pso_s2_decal[2] = {};
+  // Skate 2 transparentenvironment state (z-write, cull FRONT; [1] mirrored).
+  nrhi::Pipeline* pso_s2_trans[2] = {};
+  // visualindicator x-ray: pso_transparent without the depth test.
+  nrhi::Pipeline* pso_indicator_xray = nullptr;
   nrhi::Format rtv_format = nrhi::Format::kUnknown;
   nrhi::Texture* depth = nullptr;
   uint32_t depth_width = 0;
@@ -788,6 +883,10 @@ struct RendererState {
   // destruction is deferred inside the RHI (Device::DestroyDeferred) and
   // texture bindings are backend-managed view objects.)
   GuestTexture white;
+  // 1x1 New San Van mean chromaticity (0.309, 0.332, 0.346): the colour a
+  // packed mono lightmap lights through while its chroma page is missing,
+  // instead of reading the atlas' unrelated R/G/B channels as light.
+  GuestTexture chroma_neutral;
   // Water environment CUBE maps (t6): separate cache; same guest object
   // addresses decode differently (6 faces, TextureCube SRV).
   std::unordered_map<uint32_t, GuestTexture> cube_textures;
@@ -844,6 +943,15 @@ struct RendererState {
   // diffuse at t0 and clips at the world families' ALPHAREF so foliage
   // cards and alphatest fences cast their cutout silhouette.
   nrhi::Pipeline* pso_shadow_caster_clip = nullptr;
+  // Hall of Meat bone depth mask (the stencil-mark source for the ported
+  // postfx chain): scene vs_main + ps_shadow_caster, MIN blend into an
+  // output-sized R16G16 target cleared to 1.0 (= no bone); ps_depthpack marks
+  // pixels whose (0.5 m pulled) bone depth passes the scene depth there.
+  nrhi::Pipeline* pso_hom_depth = nullptr;
+  nrhi::Texture* hom_depth = nullptr;
+  nrhi::TextureView* hom_depth_srv = nullptr;
+  uint32_t hom_depth_width = 0;
+  uint32_t hom_depth_height = 0;
   nrhi::Pipeline* pso_shadow_blur = nullptr;
   nrhi::Texture* shadow_raw = nullptr;    // caster pass target
   nrhi::Texture* shadow_mid = nullptr;    // hblur output
@@ -873,9 +981,10 @@ struct RendererState {
   // dynamicobject world-shadow transform (dyn_ws*), rows 19-22 the
   // flowingwateralpha m_params (wat_p*), rows 23-33 the ocean PCA/material
   // rows and the oceanreflection fade row (oc_* / orf), rows 34-35 the
-  // PCSS soft-shadow parameters (sh_pcss / sh_pcss2).
+  // PCSS soft-shadow parameters (sh_pcss / sh_pcss2). 1024 bytes since the
+  // Skate 2 vertex-animation rows (s2_anim_t / s2_anim, cb[192..219]).
   static constexpr uint32_t kShadowCbRegions = 8;
-  static constexpr uint32_t kShadowCbSlice = 768;
+  static constexpr uint32_t kShadowCbSlice = 1024;
   nrhi::Buffer* shadow_cb = nullptr;
   uint8_t* shadow_cb_cpu = nullptr;
   // Native static sun-shadow map: a single camera-centered ortho depth map
@@ -893,6 +1002,13 @@ struct RendererState {
   // this, not static_sun_size: a map that allocated smaller than requested
   // must not be retired and re-tried every frame.
   uint32_t static_sun_requested = 0;
+  // Back atlas (same size and format): full rebuilds render into it over
+  // several frames (skate3_native_render_scene_shadow_static_budget_ms)
+  // while static_sun keeps serving, then the two swap. Null when it could
+  // not be allocated; rebuilds then render into static_sun in one frame.
+  nrhi::Texture* static_sun_back = nullptr;
+  nrhi::TextureView* static_sun_back_srv = nullptr;
+  bool static_sun_back_in_srv = false;
   float nsm_rows[12] = {};
   float nsm_depth_range = 1.0f;  // meters per depth-map unit
   float nsm_radius = 1.0f;       // far-tile ortho half-extent in meters
@@ -908,6 +1024,38 @@ struct RendererState {
   bool nsm_dirty = true;
   uint64_t nsm_rebuild_frame = 0;
   uint64_t nsm_last_build_frame = 0;
+  // Per-frame static-term decision shared by every consumer (b1 nsm rows,
+  // t10, the volumetric march); see UpdateStaticSunGate. live_frame = the
+  // last render frame the gate was satisfied; capture_seen = a receiver
+  // capture arrived since the caster cache was last cleared (a load).
+  bool nsm_active = false;
+  bool nsm_capture_seen = false;
+  uint64_t nsm_live_frame = 0;
+  // Last rebuild: casters rasterized / skipped (mesh not resident or
+  // arena reused), for the rebuild diagnostics.
+  uint32_t nsm_casters_drawn = 0;
+  uint32_t nsm_casters_skipped = 0;
+  // This frame's map events for the lighting history (kLightSunHold /
+  // kLightAxisHold / kLightRebuilt bits) and the latest rebuild's reason
+  // (1 new/radius, 2 periodic, 3 content, 4 drift, 5 sun).
+  uint16_t nsm_frame_note = 0;
+  uint8_t nsm_rebuild_reason = 0;
+  // New San Van jumbotron clip (UpdateJumbotron): BC1 texture with the
+  // clip's mips (4x4 black while the clip loads or when it is missing),
+  // a 3-deep upload ring gated on GPU completion, and playback state.
+  nrhi::Texture* jumbo_tex = nullptr;
+  nrhi::TextureView* jumbo_srv = nullptr;
+  uint32_t jumbo_width = 0;
+  uint32_t jumbo_height = 0;
+  uint32_t jumbo_mips = 0;
+  uint32_t jumbo_serial = 0;         // Clip::serial the texture holds (0 = none)
+  bool jumbo_fresh = false;          // texture still in its initial copy-dest state
+  nrhi::Buffer* jumbo_up[3] = {};
+  uint64_t jumbo_up_sub[3] = {};
+  uint32_t jumbo_up_next = 0;
+  int64_t jumbo_shown = -1;          // clip frame in the texture (-1 = none)
+  int64_t jumbo_t0_us = 0;           // playback start (steady clock)
+  uint64_t jumbo_seen_frame = 0;     // last render frame a screen was drawn
   // Persistent static-caster cache for the sun map. scene.items is the
   // game's VIEW-CULLED draw list; rendering the map from it directly made
   // shadows pop with the camera (look away and the caster leaves the list;
@@ -917,7 +1065,13 @@ struct RendererState {
   // from the camera (region streamed away) plus a long staleness timeout
   // (bounds ghosts from content the game actually removed, e.g. deleted
   // park-editor objects).
+  // Records are contiguous (swap-removed on eviction) with a parallel
+  // compact bounds array, so the map passes walk the cache without chasing
+  // nodes or touching records and meshes that lie outside the map.
   struct StaticCaster {
+    uint64_t key = 0;
+    uint64_t diffuse_guid = 0;
+    uint8_t env_family = 0;
     uint32_t mesh = 0;
     uint64_t fingerprint = 0;
     float world[16] = {};
@@ -927,9 +1081,68 @@ struct RendererState {
     bool clip = false;
     std::vector<DrawEntry> draws;
     uint64_t last_seen_frame = 0;
+    bool queued = false;  // in nsm_pending
   };
-  std::unordered_map<uint64_t, StaticCaster> static_casters;
+  // World-space AABB of a record's transformed mesh box (center + half
+  // extents) and its caster phase (alpha-tested clip PSO or opaque).
+  struct CasterBounds {
+    float c[3] = {};
+    float h[3] = {};
+    uint32_t clip = 0;
+    uint32_t pad = 0;
+  };
+  std::vector<StaticCaster> static_casters;
+  std::vector<CasterBounds> static_caster_bounds;
+  std::unordered_map<uint64_t, uint32_t> static_caster_index;
   uint64_t static_casters_sweep_frame = 0;
+  // Casters to add to the served map without a rebuild: newly seen (or
+  // content-changed) records, and cached casters a rebuild skipped because
+  // their mesh was not resident yet. MIN blend makes the late draw land
+  // exactly as if the caster had been part of the rebuild. Retried while
+  // the mesh decodes, then dropped (the periodic rebuild picks it up).
+  struct PendingCaster {
+    uint64_t key = 0;
+    uint32_t tries = 0;
+  };
+  std::vector<PendingCaster> nsm_pending;
+  // A full map rebuild in progress (into static_sun_back, or static_sun when
+  // there is no back atlas or nothing is served yet). Candidate lists hold
+  // record indices per tile (inner, mid, far) and phase (opaque, clip),
+  // collected once at the start; records appended or changed meanwhile are
+  // queued in late and drawn before the swap. Evictions wait for the build
+  // (indices must stay valid).
+  struct NsmBuild {
+    bool active = false;
+    bool cleared = false;
+    bool into_back = false;
+    uint8_t reason = 0;
+    uint64_t start_frame = 0;
+    float rows[12] = {};
+    float center[3] = {};
+    float sun[3] = {};
+    float radius = 0.0f;
+    float depth_range = 1.0f;
+    float vp[3][16] = {};
+    std::vector<uint32_t> list[3][2];
+    std::vector<uint64_t> late;
+    uint32_t tile = 0;
+    uint32_t phase = 0;
+    size_t cursor = 0;
+    uint32_t far_drawn = 0;
+    uint32_t far_skipped = 0;
+    uint32_t draws = 0;
+    float cpu_ms = 0.0f;
+  };
+  NsmBuild nsm_build;
+  // Diagnostics for the gate summary: completed builds, their frames and
+  // caster draws, and casters appended into the served map.
+  uint32_t nsm_stat_builds = 0;
+  uint64_t nsm_stat_build_frames = 0;
+  uint64_t nsm_stat_build_draws = 0;
+  float nsm_stat_build_ms_max = 0.0f;
+  uint64_t nsm_stat_appended = 0;
+  uint64_t nsm_stat_new = 0;      // records created
+  uint64_t nsm_stat_changed = 0;  // records whose content changed in place
   // dynamicobject static world-shadow map (512x512, same convention as the
   // game's own: x = light-space depth, sge(x >= ray) = lit): re-rendered
   // natively from the frame's STATIC world items with the captured c5/c6/c7
@@ -989,25 +1202,17 @@ struct RendererState {
     bool demoted = false;
   };
   std::unordered_map<uint32_t, TexRoute> tex_routes;
-  // Sticky texture serving (see resolve_texture in draw_item): the last
-  // ADOPTED (served-live) words state per (mesh << 3 | slot). Serves the
-  // site's previous art while the current binding's decode is in flight
-  // (the console's own mip-transition look), and powers the
-  // detail-downgrade hold: a strict base-area shrink keeps serving the
-  // previous state's store entry for the hold window. Render thread only.
-  struct TexStickySite {
-    uint64_t words_key = 0;
-    uint64_t area = 0;
-    // Nonzero = a downgrade is being held, first seen at this frame. The
-    // site adopts the smaller binding once the downgrade persists past
-    // skate3_native_render_scene_detail_hold frames.
-    uint64_t downgrade_since = 0;
-  };
-  std::unordered_map<uint64_t, TexStickySite> tex_sticky;
   // First frame a texture object resolved white-with-heal-in-flight:
   // brand-new items (no sticky fallback) skip drawing for a short window
   // instead of flashing white.
-  std::unordered_map<uint32_t, uint64_t> tex_pending_first;
+  // New content held invisible while a texture it needs decodes, keyed by
+  // the guest texture object: the frame the wait began and the last frame
+  // it was requested (a return after a gap starts a fresh wait).
+  struct PendingSince {
+    uint64_t first = 0;
+    uint64_t last = 0;
+  };
+  std::unordered_map<uint32_t, PendingSince> tex_pending_first;
   bool failed = false;
   bool announced = false;
 };
@@ -1075,6 +1280,10 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
 bool ApplyMenuBlurPass(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
                        float target_sigma, bool output_in_guest_output_state);
 // Blur-over-emulated-frames post processor registered by Install().
+// New San Vanelona at night: the linear factor on the world's baked light
+// this frame (see kNightGrade); false (and 1, 1, 1) outside night mode or New
+// San Van.
+bool NightGrade(float grade[3]);
 void PostProcessGuestOutput(const NativeGuestOutputRenderContext& context,
                             void* user_data);
 

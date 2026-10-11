@@ -27,6 +27,14 @@ REXCVAR_DECLARE(bool, skate3_native_render);
 // Hot-reload feature gates (skate3_native_scene.cpp).
 REXCVAR_DECLARE(bool, skate3_native_render_scene);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lightmaps);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_lightmap_smooth);
+REXCVAR_DECLARE(bool, skate3_skate2_ad_overrides);
+REXCVAR_DECLARE(bool, skate3_skate2_transparent_parity);
+REXCVAR_DECLARE(bool, skate3_skate2_env_specular);
+REXCVAR_DECLARE(bool, skate3_skate2_stadium_crowd_shade);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_world_v2);
+REXCVAR_DECLARE(bool, skate3_skate2_hide_inherited_backdrop);
+REXCVAR_DECLARE(bool, skate3_skate2_native_occlusion);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
@@ -74,6 +82,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_static_casters);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_strength);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_radius);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadow_pcss);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_prop_world_shade);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_sun_deg);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_pcss_max_m);
 REXCVAR_DECLARE(double, skate3_native_render_scene_shadow_static_bias);
@@ -106,6 +115,8 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_freecam_capture_input);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ssr);
 // Draw distance (hot; skate3_draw_distance.cpp).
 REXCVAR_DECLARE(double, skate3_draw_distance_scale);
+REXCVAR_DECLARE(double, skate3_skate2_draw_distance_scale);
+REXCVAR_DECLARE(bool, skate3_skate2_material_depth_bias);
 REXCVAR_DECLARE(double, skate3_lod_distance_scale);
 REXCVAR_DECLARE(double, skate3_draw_distance_stream_probe);
 
@@ -759,6 +770,12 @@ void DrawShadowsSection() {
               CvarCheckbox("Dynamic shadows",
                            REXCVAR_GET(skate3_native_render_scene_shadows),
                            "Native CSM: skater/NPC/prop shadows onto the world"));
+  REXCVAR_SET(skate3_native_render_scene_prop_world_shade,
+              CvarCheckbox("Prop shade from buildings",
+                           REXCVAR_GET(skate3_native_render_scene_prop_world_shade),
+                           "Movable props (poles, cones, barriers, ramps) darken in "
+                           "the shade of buildings and trees. Off = props ignore it; "
+                           "for comparing a prop whose shading flickers."));
   REXCVAR_SET(skate3_native_render_scene_shadow_static_casters,
               CvarCheckbox(
                   "Static sun shadows",
@@ -815,9 +832,51 @@ void DrawShadowsSection() {
 }
 
 void DrawWorldShadingSection() {
+  REXCVAR_SET(skate3_skate2_material_depth_bias,
+      CvarCheckbox("Skate 2 overlay depth bias", REXCVAR_GET(skate3_skate2_material_depth_bias),
+                   "Restore depth separation for Skate 2 sign and decal overlays. Disable only for comparison."));
+  REXCVAR_SET(skate3_skate2_draw_distance_scale,
+      CvarSlider("New San Van draw distance", REXCVAR_GET(skate3_skate2_draw_distance_scale),
+                 0.0f, 8.0f, "%.2fx",
+                 "0 uses your global setting. Try 2 for New San Van only. Affects all world geometry, not just buildings; may cost performance. Does not preload cells."));
+  REXCVAR_SET(skate3_skate2_hide_inherited_backdrop,
+      CvarCheckbox("Skate 2 hide inherited backdrop", REXCVAR_GET(skate3_skate2_hide_inherited_backdrop),
+                   "Hide native Skate 3 district proxy scenery and Danny Way trees, mountains and mist during New San Van gameplay."));
+  REXCVAR_SET(skate3_skate2_native_occlusion,
+      CvarCheckbox("Skate 2 native occlusion culling", REXCVAR_GET(skate3_skate2_native_occlusion),
+                   "Experimental optimization. Leave off while checking disappearing or flickering objects; native Skate 3 maps keep their usual setting."));
+  REXCVAR_SET(skate3_skate2_ad_overrides,
+      CvarCheckbox("Skate 2 draw-time ad overrides", REXCVAR_GET(skate3_skate2_ad_overrides),
+                   "New San Van only: disable briefly to compare flickering signs with their original material artwork."));
+  REXCVAR_SET(skate3_skate2_transparent_parity,
+      CvarCheckbox("Skate 2 transparent depth + culling", REXCVAR_GET(skate3_skate2_transparent_parity),
+                   "New San Van only: environment.transparent surfaces (the Waterfront sail canopies, "
+                   "grates, glass) draw one-sided with depth writes, like Skate 2. Off = Skate 3's "
+                   "two-sided blend without depth writes."));
+  REXCVAR_SET(skate3_skate2_env_specular,
+      CvarCheckbox("Skate 2 reflections + shine", REXCVAR_GET(skate3_skate2_env_specular),
+                   "New San Van only: Skate 2's own sun highlights and environment-cube "
+                   "reflections, stronger at glancing angles (storefront glass, the Waterfront "
+                   "railing symbols), and its transparent-surface lighting. Off = the Skate 3 "
+                   "formulas."));
+  REXCVAR_SET(skate3_skate2_stadium_crowd_shade,
+      CvarCheckbox("Stadium stands in roof shade", REXCVAR_GET(skate3_skate2_stadium_crowd_shade),
+                   "New San Van Stadium: the crowd seating keeps the roof's shade while "
+                   "the rest of the arena shows its floodlit lighting. Off = the seating "
+                   "is lit like the floor."));
+  REXCVAR_SET(skate3_native_render_scene_world_v2,
+      CvarCheckbox("Material normal maps (world v2)", REXCVAR_GET(skate3_native_render_scene_world_v2),
+                   "Per-pixel normal, detail and spec maps on world materials. Off = flat "
+                   "response; for spotting shading noise that comes from a material's maps."));
   REXCVAR_SET(skate3_native_render_scene_lightmaps,
               CvarCheckbox("Lightmaps", REXCVAR_GET(skate3_native_render_scene_lightmaps),
                            "Baked lighting atlas sample x2 on world materials"));
+  REXCVAR_SET(skate3_native_render_scene_lightmap_smooth,
+              CvarCheckbox("Smooth baked lighting",
+                           REXCVAR_GET(skate3_native_render_scene_lightmap_smooth),
+                           "Cubic B-spline lightmap filtering: baked shadows lose the "
+                           "blocky texel-grid gradients. Off = the games' single "
+                           "bilinear tap."));
   REXCVAR_SET(skate3_native_render_scene_macro,
               CvarCheckbox("Macro overlay", REXCVAR_GET(skate3_native_render_scene_macro),
                            "Large-scale grime/crack multiply (ground/wall weathering)"));

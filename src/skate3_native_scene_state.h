@@ -368,6 +368,13 @@ inline std::unordered_multimap<uint64_t, size_t> g_frame_char_refresh;
 // the engine binds the streamed art via the fetch constants at draw time.
 // Guarded by g_palette_mutex; cleared at the end of BuildFrameScene.
 inline std::unordered_map<uint64_t, std::array<uint32_t, 12>> g_frame_draw_fetch;
+// trafficlight.one / .two rows (see FrameScene::traffic_rows), per family:
+// [0..3] = g_TrafficLightsStatus_1/_2 (VS c7), [4] = m_params[0].y (PS c3.y),
+// [5] = g_envattributes[2].x (PS c2.x). Captured by OnDrawDone from every
+// draw whose bound shader is a lamp shader (g_cur_*_traffic). Guest render
+// thread only.
+inline float g_traffic_rows[2][6] = {};
+inline bool g_traffic_have[2] = {};
 // mesh -> last VALIDATED character-lighting rows (see CaptureCharLighting).
 // The per-frame capture depends on a fragile draw-order chain (capture at
 // submit-exit -> pending fixup -> per-draw refresh, commit-on-success); on
@@ -468,6 +475,16 @@ inline std::atomic<uint64_t> g_hair_route_flips{0};
 // frame's value (legitimate animation/lighting drift never does).
 inline std::atomic<uint64_t> g_hair_bone_alternations{0};
 inline std::atomic<uint64_t> g_shadow_alternations{0};
+// Receiver-row capture outcomes (the environment PS bank behind
+// shadow_valid / shadow_fresh), per candidate draw: ok = accepted, the rest
+// name the first failed sanity group. Read by the static-sun gate logs.
+inline std::atomic<uint64_t> g_rcv_capture_ok{0};
+inline std::atomic<uint64_t> g_rcv_capture_geo{0};    // CSM row geometry
+inline std::atomic<uint64_t> g_rcv_capture_axis{0};   // c6 sun vs cross(c0, c3)
+inline std::atomic<uint64_t> g_rcv_capture_cam{0};    // c7 vs the scene camera
+inline std::atomic<uint64_t> g_rcv_capture_color{0};  // c8 shadow color
+inline std::atomic<uint64_t> g_rcv_capture_tone{0};   // c10.x exposure, c11.y
+
 // ctx -> last PUBLISHED item of a live LW entity (skinned character
 // families, non-ropa): when a ctx drops out of the submit records for a
 // frame or two while its entity is still alive in the store (observed as
@@ -623,6 +640,10 @@ inline std::atomic<uint64_t> g_draws_spline{0};
 // recon recording (grouping the stream by shader / reading blend state).
 inline std::atomic<uint32_t> g_cur_ps_obj{0};
 inline std::atomic<uint32_t> g_cur_vs_obj{0};
+// The traffic light family of the shader last bound under each hook label:
+// 0 = none, 1 = trafficlight_one, 2 = trafficlight_two (see OnSetShader).
+inline std::atomic<uint8_t> g_cur_ps_traffic{0};
+inline std::atomic<uint8_t> g_cur_vs_traffic{0};
 inline std::atomic<uint32_t> g_rs_bank{0};
 inline std::atomic<uint32_t> g_cur_viewport[6];
 inline std::atomic<uint32_t> g_cur_scissor[4];
@@ -704,6 +725,76 @@ struct SceneRingFrame {
 inline std::deque<SceneRingFrame> g_scene_ring;  // render thread only
 constexpr size_t kSceneRingFrames = 2400;
 inline std::atomic<bool> g_scene_ring_dump{false};
+// User-marker character dump (RequestCharDump): rendered frames left to log
+// every character piece near the camera (the detached-shoe hunt).
+inline std::atomic<int> g_char_dump_frames{0};
+
+// ---- User-marker lighting history (RequestLightHistory) ----
+// One record per RenderScene call (one presented frame), always on: the path
+// the frame took (native, or which yield handed it to the emulated output)
+// and every input of the static sun-shadow decision. The "original lighting
+// for a split second" flash lasts a frame or two; the player presses the
+// marker key right after seeing one and the log names those frames.
+enum LightPath : uint8_t {
+  kLightNative = 0,
+  kLightYieldMenus,        // menus / loading presence (emulated output)
+  kLightYieldNoBase,
+  kLightYieldPhoto,        // photo display
+  kLightYieldPhotoEditor,
+  kLightYieldCasEditor,
+  kLightYieldNoScene,
+  kLightYieldPipeline,
+  kLightYieldMovie,
+  kLightYieldTakeover,     // stale / fade-in scene before a takeover
+  kLightPathOther = 255,
+};
+enum : uint16_t {
+  kLightEnabled = 1u << 0,      // shadow + static-caster cvars on, debug off
+  kLightServable = 1u << 1,     // a built map is ready to bind
+  kLightMap = 1u << 2,          // static_sun_valid this frame
+  kLightFresh = 1u << 3,        // receiver rows captured within 120 guest frames
+  kLightCsm = 1u << 4,          // the game's CSM pass drew this frame
+  kLightSeen = 1u << 5,         // a receiver capture arrived since the last load
+  kLightLive = 1u << 6,
+  kLightHeld = 1u << 7,
+  kLightActive = 1u << 8,       // static term applied (nsm_active)
+  kLightShadowValid = 1u << 9,  // the scene carried shadow rows
+  kLightLoading = 1u << 10,     // native loading frame (empty scene)
+  kLightSkate2 = 1u << 11,      // New San Van gameplay
+  kLightSunHold = 1u << 12,     // sun capture unusable: cached map served
+  kLightAxisHold = 1u << 13,    // sun axis jump held
+  kLightRebuilt = 1u << 14,     // the static map was re-rendered this frame
+};
+struct LightFrame {
+  int64_t t_us = 0;         // steady clock
+  uint64_t frame = 0;       // g_frames_rendered at the call
+  uint64_t generation = 0;  // scene generation drawn
+  float cam[3] = {};
+  float strength = 0.0f;    // static term strength written to b1 (0 = off)
+  float venue = 1.0f;       // StaticSunVenueFactor
+  uint32_t items = 0;
+  uint32_t casters = 0;     // casters drawn by the latest map rebuild
+  uint32_t shadow_age = 0;  // guest frames since the receiver capture
+  uint16_t gate = 0;
+  uint16_t shadow_draws = 0;
+  uint8_t path = kLightPathOther;
+  uint8_t rebuild_reason = 0;  // 1 new/radius 2 periodic 3 content 4 drift 5 sun
+  // Dynamic-shadow (CSM) height window this frame: the world heights where the
+  // receiver depth row c4 reads 1 (bottom) and 0 (top) at the camera's x/z,
+  // the base cascade's half extent and the two sub-cascade scales; plus
+  // whether the props' world-shadow map was cleared/re-primed this frame.
+  float csm_bot = 0.0f, csm_top = 0.0f, csm_r0 = 0.0f, csm_s1 = 0.0f, csm_s2 = 0.0f;
+  uint8_t ws_reprime = 0;
+};
+constexpr size_t kLightRingFrames = 2048;  // ~34 s at 60 fps
+inline LightFrame g_light_ring[kLightRingFrames];  // render thread only
+inline uint64_t g_light_ring_count = 0;
+inline LightFrame* g_light_cur = nullptr;  // the RenderScene call being recorded
+// Marker number to dump (0 = none); set by RequestLightHistory.
+inline std::atomic<uint32_t> g_light_history_marker{0};
+// Same key press: the next rendered scene logs every item on the
+// screen-centre ray (RenderScene's surface probe). Consumed there.
+inline std::atomic<bool> g_pick_request{false};
 
 // Render thread, frame end: write the whole ring as CSV. One F line per
 // frame, then one I line per item (hex object addresses to match every
@@ -876,6 +967,15 @@ inline std::atomic<uint64_t> g_rej_bbox{0};
 // processor thread (render segments); read by the render thread's stats log.
 // Atomics with relaxed ordering: telemetry, not synchronization.
 using PerfClock = std::chrono::steady_clock;
+// New San Van material channels found bound to the engine's missing-texture
+// placeholder at item build (counted per channel per build), treated as not
+// bound yet (DrawItem::tex_missing).
+inline std::atomic<uint64_t> g_placeholder_slots{0};
+// New San Van: cached item cores re-walked because a material channel's live
+// binding changed (ItemBindingWatch), and texture registrations dropped when
+// the game unloaded the texture (OnUnregisterTexture).
+inline std::atomic<uint64_t> g_item_rebinds{0};
+inline std::atomic<uint64_t> g_tex_unregistered{0};
 inline uint64_t PerfNsSince(PerfClock::time_point t0) {
   return uint64_t(
       std::chrono::duration_cast<std::chrono::nanoseconds>(PerfClock::now() - t0)
@@ -1146,9 +1246,21 @@ bool GuestTryLoadU32(uint8_t* base, uint32_t addr, uint32_t* out);
 void ClearItemCache();
 bool CasEditorActive(uint8_t* base);
 bool PortraitRttWindowActive();
+// Live channel bindings an item walk read: each material channel's stream
+// record and the texture object its word 0 named. The world-item cache
+// re-walks a New San Van item as soon as one changes (a cached pointer can
+// name a texture object the game has freed since).
+struct ItemBindingWatch {
+  static constexpr uint32_t kMax = 8;
+  uint32_t stream[kMax] = {};
+  uint32_t bound[kMax] = {};
+  uint32_t count = 0;
+};
 // Parse a guest mesh struct into a DrawItem (prewarm decode workers build
-// items off the queue without a live capture).
-bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item);
+// items off the queue without a live capture). `watch`, when given,
+// receives the channel bindings read.
+bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
+                       ItemBindingWatch* watch = nullptr);
 
 // Render-side helper the capture thread calls (defined in
 // skate3_native_scene_gpu.cpp): photo-editor detection shared by the yield

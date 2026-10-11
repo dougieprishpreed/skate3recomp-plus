@@ -1,1 +1,11 @@
 * text=auto eol=lf
+
+# Preserve the established Windows source conventions.
+src/skate3_world_loading.cpp text eol=crlf
+src/skate3_world_loading.h text eol=crlf
+src/skate3_native_scene.h text eol=crlf
+src/native/shaders/scene.hlsl text eol=crlf
+README.md text eol=lf
+config/release-defaults.toml text eol=crlf
+packaging/README.txt -text
+assets/installer/title.png -text

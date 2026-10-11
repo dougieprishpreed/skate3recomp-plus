@@ -236,8 +236,8 @@ float NsmTap(float2 suv, float refd, float tile_u0) {
   // and implicit-gradient sampling is not allowed in divergent flow.
   return static_sun.SampleLevel(smp_clamp, suv, 0.0).x;
 }
-float SampleStaticSun(float3 wp, float3 nrm, float2 px) {
-  if (nsm_p.x <= 0.0) {
+float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) {
+  if (strength <= 0.0) {
     return 1.0;
   }
   // Showcase: until the shadow layer is revealed, render fully lit.
@@ -301,7 +301,7 @@ float SampleStaticSun(float3 wp, float3 nrm, float2 px) {
   float refd = dot(nsm_z.xyz, wp) + nsm_z.w - (nsm_p2.x + nsm_p2.y * slope);
   if (sh_pcss.x <= 0.5) {
     float s0 = NsmTap(suv, refd, tile_u0) >= refd ? 1.0 : 0.0;
-    return 1.0 - fade * nsm_p.x * (1.0 - s0);
+    return 1.0 - fade * strength * (1.0 - s0);
   }
   // FIXED kernels throughout this sampler: no per-pixel noise. Verified
   // offline against synthetic roof/wall/streetlamp depth maps at the real
@@ -354,5 +354,10 @@ float SampleStaticSun(float3 wp, float3 nrm, float2 px) {
     acc += saturate((d - refd) / w + 0.5);
   }
   float s = acc / float(n);
-  return 1.0 - fade * nsm_p.x * (1.0 - s);
+  return 1.0 - fade * strength * (1.0 - s);
+}
+// The scene receive at the frame strength (venue-scaled, see
+// StaticSunVenueFactor).
+float SampleStaticSun(float3 wp, float3 nrm, float2 px) {
+  return SampleStaticSunStrength(wp, nrm, px, nsm_p.x);
 }

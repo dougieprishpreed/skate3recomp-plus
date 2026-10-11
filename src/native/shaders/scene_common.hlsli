@@ -32,6 +32,18 @@ void KdAxes(float4 tanb, float3 wn, float3 tt_s, float3 bb_s,
     kt = cross(kb, wn) * ((tanb.w > 0.6 ? 1.0 : -1.0) * sh_v2.x);
   }
 }
+// sign() for the GetTangentLight axis terms (sign of dot(axis, sun)). The
+// exact term flips where a tangent axis is perpendicular to the light, and
+// there the dot is pure rounding noise (interpolated or screen-derivative
+// frames); a hard sign() turned it into per-pixel black/white static
+// wherever the normal map tilts along that axis (the Stadium BLACK BOX
+// flags: flags at 45 degrees under a 45-degree light put the binormal
+// exactly perpendicular). The ramp is identical to sign() outside
+// |d| < 1/256 (about 0.2 degrees) and resolves the perpendicular case to
+// sign(0) = 0.
+float AxisSign(float d) {
+  return clamp(d * 256.0, -1.0, 1.0);
+}
 // ---- Output encode --------------------------------------------------------
 // Every exact branch ends in the same chain: x = the post-fog,
 // post-exposure linear value ("xe"), then

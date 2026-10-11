@@ -1,0 +1,1524 @@
+diff --git a/include/rex/graphics/native_rhi.h b/include/rex/graphics/native_rhi.h
+index d2bdcd4..0a12dbb 100644
+--- a/include/rex/graphics/native_rhi.h
++++ b/include/rex/graphics/native_rhi.h
+@@ -140,6 +140,9 @@ enum class CompareFunc : uint32_t {
+   kAlways = 0,
+   kLess,
+   kLessEqual,
++  // Reversed-Z depth (near = 1). Appended: existing values are unchanged.
++  kGreater,
++  kGreaterEqual,
+ };
+ 
+ enum class CullMode : uint32_t {
+@@ -378,6 +381,9 @@ struct GraphicsPipelineDesc {
+   DepthStateDesc depth;
+   CullMode cull = CullMode::kNone;
+   bool depth_clip = true;
++  // Rasterizer bias in host depth-buffer ULP units, plus slope term.
++  int32_t depth_bias = 0;
++  float depth_bias_slope = 0.0f;
+   Format rtv_format = Format::kUnknown;  // kUnknown = no color target
+   Format dsv_format = Format::kUnknown;  // kUnknown = no depth target
+   uint32_t sample_count = 1;
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index 5d607c6..292dd0f 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -61,6 +61,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   void AddDialog(ImGuiDialog* dialog);
+   void RemoveDialog(ImGuiDialog* dialog);
+ 
++  // UI-thread image upload; drawer-owned until the presenter changes.
++  ImmediateTexture* CreateImage(uint32_t width, uint32_t height, const uint8_t* rgba);
+   Presenter* presenter() const { return presenter_; }
+ 
+   // SetPresenter may be called from the destructor.
+diff --git a/include/rex/ui/overlay/simple_settings_overlay.h b/include/rex/ui/overlay/simple_settings_overlay.h
+index e4d1c0c..5d70642 100644
+--- a/include/rex/ui/overlay/simple_settings_overlay.h
++++ b/include/rex/ui/overlay/simple_settings_overlay.h
+@@ -107,6 +107,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+   int monitor_index_ = 0;
+   int audio_buffer_index_ = 0;
+   int language_index_ = 0;
++  // 0 = Skate 2 sky, 1 = Skate 3 sky (skate3_skate2_sky), 2 = night
++  // (skate3_skate2_night, which takes priority over skate3_skate2_sky).
++  int nsv_sky_index_ = 0;
+   float field_of_view_ = 60.0f;
+   bool fullscreen_ = true;
+   bool vsync_ = false;
+@@ -126,6 +129,14 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+   int stream_probe_index_ = 0;
+   bool mode_indicator_ = true;
+   bool fps_counter_ = false;
++  // World > Cheats (skate3_cheat_* cvars).
++  bool cheat_no_air_timer_ = false;
++  bool cheat_no_fall_damage_ = false;
++  bool cheat_no_hom_bail_timer_ = false;
++  bool cheat_out_of_bounds_ = false;
++  bool cheat_no_black_screen_ = false;
++  bool cheat_no_camera_shake_ = false;
++  float ragdoll_scale_ = 1.0f;  // skate3_cheat_ragdoll_drive_scale
+   bool audio_mute_ = false;
+   bool rumble_ = true;
+   float mnk_sensitivity_ = 1.0f;
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index cc6e25b..3a9f5fe 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -370,6 +370,25 @@ class Presenter {
+     uint64_t frame_count = 0;
+   };
+   GuestFrameStats GetGuestFrameStats() const;
++  // How the connected surface presents (process-wide, any thread; kUnknown
++  // while unconnected or for backends that don't report it):
++  // - kFifo: implicit vsync, every refreshed guest output image shown once,
++  //   in order, at a vertical blank. Guest output refreshes wait for the
++  //   previous image to be taken by the paint (strict backpressure), so the
++  //   display paces guest frames and frame caps should step aside
++  //   (IsGuestOutputDisplayPaced).
++  // - kMailbox: tear-free, never blocks; each blank shows the newest ready
++  //   image. Frame pacing should run at the refresh rate, phase-locked so
++  //   frames become ready just before a blank (LastGuestFrameReady).
++  // - kTearing: immediate presentation (variable refresh rate displays).
++  enum class HostPresentSync : uint8_t { kUnknown, kTearing, kMailbox, kFifo };
++  static HostPresentSync GetHostPresentSync();
++  static bool IsGuestOutputDisplayPaced() { return GetHostPresentSync() == HostPresentSync::kFifo; }
++  // Mailbox presentation: host steady-clock time (nanoseconds since the
++  // clock's epoch) at which the paint of the latest new guest frame finished
++  // on the GPU - the earliest moment the image could be scanned out - and a
++  // sequence number advancing once per such frame (0 = no samples yet).
++  static uint64_t LastGuestFrameReady(int64_t* ready_ns);
+   bool GuestFrameStatsEnabled() const {
+     return guest_frame_stats_enabled_.load(std::memory_order_relaxed);
+   }
+@@ -418,6 +437,12 @@ class Presenter {
+   void RequestUIPaintFromUIThread();
+ 
+  protected:
++  // For implementations: the present mode of the connected swapchain (the
++  // generic connection code resets it to kUnknown on disconnect), and the
++  // readiness time of each new guest frame's mailbox paint.
++  static void SetHostPresentSync(HostPresentSync sync);
++  static void PublishGuestFrameReady(int64_t ready_ns);
++
+   enum class PaintResult {
+     kPresented,
+     kPresentedSuboptimal,
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index 4194c8c..ff89b83 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -358,7 +358,7 @@ class VulkanPresenter final : public Presenter {
+         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
+         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
+         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
+-        bool& ui_surface_unusable_out);
++        bool& is_mailbox_out, bool& ui_surface_unusable_out);
+ 
+     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
+     // the original swapchain object, if it existed, for use as oldSwapchain if
+@@ -419,6 +419,11 @@ class VulkanPresenter final : public Presenter {
+     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+     VkExtent2D swapchain_extent = {};
+     bool swapchain_is_fifo = false;
++    bool swapchain_is_mailbox = false;
++    // FIFO swapchain images are acquired with this fence and awaited on the
++    // host (see PaintAndPresentImpl). Created on first use, reset after each
++    // wait; destroyed with the presenter.
++    VkFence acquire_fence = VK_NULL_HANDLE;
+     std::vector<VkImage> swapchain_images;
+     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+     // One presentation-wait ("draw complete") semaphore per swapchain image,
+@@ -502,6 +507,18 @@ class VulkanPresenter final : public Presenter {
+   // drawers (accessible from the UI thread only, at any time).
+   VulkanSubmissionTracker ui_submission_tracker_;
+ 
++  // Mailbox readiness (Presenter::LastGuestFrameReady): after the paint of a
++  // new guest frame, an empty submission signals one of the observer's
++  // fences once all earlier work (the guest frame and its paint) is done on
++  // the GPU; the observer thread timestamps the signal. Painting threads only
++  // (created on first use, joined before the device goes away).
++  struct ReadyObserver;
++  struct ReadyObserverDeleter {
++    void operator()(ReadyObserver* observer) const;  // defined with ReadyObserver
++  };
++  std::unique_ptr<ReadyObserver, ReadyObserverDeleter> ready_observer_;
++  uint64_t ready_last_refresher_submission_ = 0;
++
+   // Accessible only by painting and by surface connection lifetime management
+   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,
+   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 9d304be..7c9accf 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -9,11 +9,14 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <charconv>
++#include <cmath>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <initializer_list>
++#include <locale>
+ #include <mutex>
++#include <sstream>
+ #include <unordered_map>
+ 
+ #include <CLI/CLI.hpp>
+@@ -146,6 +149,62 @@ bool WriteConfigValue(toml::table& config, const FlagEntry& entry, const std::st
+   return false;
+ }
+ 
++// The shortest text that reads back as the same double through toml++'s
++// float parser (a classic-locale stream wherever TOML_FLOAT_CHARCONV is off).
++std::string FormatConfigDouble(double value) {
++  if (!std::isfinite(value)) {
++    return std::isnan(value) ? "nan" : (value < 0 ? "-inf" : "inf");
++  }
++  std::string text;
++  for (int precision = 15; precision <= 17; ++precision) {
++    std::ostringstream out;
++    out.imbue(std::locale::classic());
++    out.precision(precision);
++    out << value;
++    text = out.str();
++    std::istringstream in(text);
++    in.imbue(std::locale::classic());
++    double parsed = 0.0;
++    if ((in >> parsed) && parsed == value) {
++      break;
++    }
++  }
++  if (text.find_first_of(".eE") == std::string::npos) {
++    text += ".0";
++  }
++  return text;
++}
++
++bool IsBareConfigKey(std::string_view key) {
++  return !key.empty() && std::all_of(key.begin(), key.end(), [](char c) {
++    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++           c == '_' || c == '-';
++  });
++}
++
++// toml++ prints floats through std::to_chars only where it trusts the
++// standard library; under Clang it falls back to a stream at max_digits10, so
++// every save rewrote 0.1 as 0.10000000000000001 across the whole file. A flat
++// file (every cvar config) is written key by key here instead: floats as
++// FormatConfigDouble, everything else through toml++'s own formatter.
++void WriteConfigTable(std::ostream& out, const toml::table& config) {
++  for (auto&& [key, node] : config) {
++    if (!IsBareConfigKey(key.str()) || node.is_table() || node.is_array()) {
++      out << config;  // nested layouts keep toml++'s formatting
++      return;
++    }
++  }
++  for (auto&& [key, node] : config) {
++    out << key.str() << " = ";
++    if (const auto* value = node.as_floating_point()) {
++      out << FormatConfigDouble(value->get());
++    } else {
++      out << toml::toml_formatter{node};
++    }
++    out << '\n';
++  }
++}
++
+ bool WriteConfigFile(const std::filesystem::path& config_path, const toml::table& config) {
+   if (auto parent = config_path.parent_path(); !parent.empty()) {
+     std::error_code ec;
+@@ -168,7 +227,7 @@ bool WriteConfigFile(const std::filesystem::path& config_path, const toml::table
+       return false;
+     }
+     file << "# Auto-generated cvar configuration\n";
+-    file << config;
++    WriteConfigTable(file, config);
+     file.flush();
+     if (!file) {
+       REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
+index b56664b..2918210 100644
+--- a/src/filesystem/virtual_file_system.cpp
++++ b/src/filesystem/virtual_file_system.cpp
+@@ -228,14 +228,30 @@ bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
+   return true;
+ }
+ 
++namespace {
++// Nested overlays must override a broader directory alias regardless of
++// unordered-map iteration order. Match a complete component (or scheme),
++// so an alias for "recipe" cannot capture "recipe_backup".
++auto MostSpecificLink(const std::unordered_map<std::string, std::string>& links,
++                      std::string_view path) {
++  auto best = links.cend();
++  for (auto it = links.cbegin(); it != links.cend(); ++it) {
++    const auto& prefix = it->first;
++    if (prefix.empty() || !rex::string::utf8_starts_with_case(path, prefix)) continue;
++    const bool boundary = path.size() == prefix.size() || prefix.back() == ':' ||
++        prefix.back() == '\\' || prefix.back() == '/' ||
++        path[prefix.size()] == '\\' || path[prefix.size()] == '/';
++    if (boundary && (best == links.cend() || prefix.size() > best->first.size())) best = it;
++  }
++  return best;
++}
++}  // namespace
++
+ bool VirtualFileSystem::FindSymbolicLink(const std::string_view path, std::string& target) {
+-  auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+-    return rex::string::utf8_starts_with_case(path, s.first);
+-  });
+-  if (it == symlinks_.cend()) {
+-    return false;
+-  }
+-  target = (*it).second;
++  auto global_lock = global_critical_region_.Acquire();
++  auto it = MostSpecificLink(symlinks_, path);
++  if (it == symlinks_.cend()) return false;
++  target = it->second;
+   return true;
+ }
+ 
+@@ -243,16 +259,10 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
+   result = path;
+   bool was_resolved = false;
+   while (true) {
+-    auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
+-      return rex::string::utf8_starts_with_case(result, s.first);
+-    });
+-    if (it == symlinks_.cend()) {
+-      break;
+-    }
+-    // Found symlink!
+-    auto target_path = (*it).second;
+-    auto relative_path = result.substr((*it).first.size());
+-    result = target_path + relative_path;
++    auto it = MostSpecificLink(symlinks_, result);
++    if (it == symlinks_.cend()) break;
++    const auto relative_path = result.substr(it->first.size());
++    result = it->second + relative_path;
+     was_resolved = true;
+   }
+   return was_resolved;
+diff --git a/src/graphics/d3d12/native_rhi_d3d12.cpp b/src/graphics/d3d12/native_rhi_d3d12.cpp
+index cc9175e..6da78f7 100644
+--- a/src/graphics/d3d12/native_rhi_d3d12.cpp
++++ b/src/graphics/d3d12/native_rhi_d3d12.cpp
+@@ -17,6 +17,7 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+@@ -260,6 +261,10 @@ D3D12_COMPARISON_FUNC ToCompare(nrhi::CompareFunc func) {
+       return D3D12_COMPARISON_FUNC_LESS;
+     case nrhi::CompareFunc::kLessEqual:
+       return D3D12_COMPARISON_FUNC_LESS_EQUAL;
++    case nrhi::CompareFunc::kGreater:
++      return D3D12_COMPARISON_FUNC_GREATER;
++    case nrhi::CompareFunc::kGreaterEqual:
++      return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+     case nrhi::CompareFunc::kAlways:
+     default:
+       return D3D12_COMPARISON_FUNC_ALWAYS;
+@@ -302,6 +307,13 @@ class NrTextureViewD3D12 : public nrhi::TextureView {
+   // SRV descriptor is copied from here into shader-visible binding slots.
+   uint32_t staging_slot = ~0u;
+   NrTextureD3D12* texture = nullptr;
++  // Ids of the cached shader-visible bindings whose key holds this view
++  // (render thread only), so destroying the view retires exactly those
++  // bindings instead of sweeping the whole cache. Ids of bindings already
++  // retired through another of their views go stale; they are skipped at
++  // the flush and compacted away as the list grows.
++  std::vector<uint64_t> binding_ids;
++  size_t binding_ids_compact_at = 16;
+ };
+ 
+ class NrBindingLayoutD3D12 : public nrhi::BindingLayout {
+@@ -652,30 +664,26 @@ class NrDeviceD3D12 : public nrhi::Device {
+     if (view == nullptr) return;
+     // Destruction is batched: the view object stays allocated (so its
+     // address cannot be reused while stale binding-cache keys still hold it)
+-    // and FlushDissolvedViews sweeps the binding cache ONCE per frame for
+-    // the whole batch instead of once per destroyed view.
++    // and FlushDissolvedViews retires the batch once per frame.
+     dissolved_views_.push_back(static_cast<NrTextureViewD3D12*>(view));
+   }
+ 
+   // Render thread, once per frame (and at device destruction): retire every
+   // shader-visible binding referencing a view destroyed since the last
+-  // flush, then retire the views themselves.
++  // flush, then retire the views themselves. Each view indexes its own
++  // bindings, so the cost follows what was destroyed, not the cache size.
+   void FlushDissolvedViews() {
+     if (dissolved_views_.empty()) return;
+-    std::unordered_set<const NrTextureViewD3D12*> dissolved(dissolved_views_.begin(),
+-                                                            dissolved_views_.end());
+     std::lock_guard<std::mutex> lock(mutex_);
+     const uint64_t submission = cp_->GetCurrentSubmission();
+-    std::erase_if(bindings_, [&](auto& entry) {
+-      for (uint32_t i = 0; i < entry.first.count; ++i) {
+-        if (dissolved.count(entry.first.views[i]) != 0) {
+-          srv_slots_.Retire(entry.second.first_slot, entry.second.count, submission);
+-          return true;
+-        }
+-      }
+-      return false;
+-    });
+     for (NrTextureViewD3D12* v : dissolved_views_) {
++      for (uint64_t id : v->binding_ids) {
++        const auto it = bindings_by_id_.find(id);
++        if (it == bindings_by_id_.end()) continue;  // retired through another view
++        srv_slots_.Retire(it->second->second.first_slot, it->second->second.count, submission);
++        bindings_.erase(it->second);
++        bindings_by_id_.erase(it);
++      }
+       staging_slots_.Retire(v->staging_slot, 1, submission);
+       delete v;
+     }
+@@ -883,6 +891,8 @@ class NrDeviceD3D12 : public nrhi::Device {
+                                   : desc.cull == nrhi::CullMode::kBack ? D3D12_CULL_MODE_BACK
+                                                                        : D3D12_CULL_MODE_NONE;
+     pd.RasterizerState.DepthClipEnable = desc.depth_clip;
++    pd.RasterizerState.DepthBias = desc.depth_bias;
++    pd.RasterizerState.SlopeScaledDepthBias = desc.depth_bias_slope;
+     pd.DepthStencilState.DepthEnable = desc.depth.test_enable;
+     pd.DepthStencilState.DepthWriteMask = desc.depth.write_enable
+                                               ? D3D12_DEPTH_WRITE_MASK_ALL
+@@ -1098,6 +1108,24 @@ class NrDeviceD3D12 : public nrhi::Device {
+                                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+       }
+       it = bindings_.emplace(key, Binding{first_slot, count}).first;
++      const uint64_t id = next_binding_id_++;
++      bindings_by_id_.emplace(id, it);
++      for (uint32_t i = 0; i < count; ++i) {
++        NrTextureViewD3D12* v = views[i];
++        bool repeat = v == nullptr;
++        for (uint32_t j = 0; j < i && !repeat; ++j) {
++          repeat = views[j] == v;
++        }
++        if (repeat) continue;
++        v->binding_ids.push_back(id);
++        if (v->binding_ids.size() >= v->binding_ids_compact_at) {
++          // Long-lived views pick up ids of bindings retired through other
++          // views; drop those so the list tracks the live bindings.
++          std::erase_if(v->binding_ids,
++                        [&](uint64_t binding_id) { return !bindings_by_id_.contains(binding_id); });
++          v->binding_ids_compact_at = std::max<size_t>(16, v->binding_ids.size() * 2);
++        }
++      }
+     }
+     *gpu_out = SrvGpuHandle(it->second.first_slot);
+     return true;
+@@ -1223,6 +1251,9 @@ class NrDeviceD3D12 : public nrhi::Device {
+   SlotAllocator dsv_slots_;
+   std::vector<RetiredObject> retired_;
+   std::map<BindingKey, Binding> bindings_;
++  // Live bindings by id (NrTextureViewD3D12::binding_ids).
++  std::unordered_map<uint64_t, std::map<BindingKey, Binding>::iterator> bindings_by_id_;
++  uint64_t next_binding_id_ = 1;
+   // Views destroyed since the last FlushDissolvedViews (render thread only).
+   // The objects stay allocated until the flush so stale binding-cache keys
+   // can never collide with a newly created view at the same address.
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 69863ce..ed44128 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -6200,6 +6200,14 @@ void VulkanCommandProcessor::ResolveGpuTimestampFrame(VkCommandBuffer command_bu
+   }
+ 
+   const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
++  // The copy is a transfer: without an execution dependency it may run before
++  // the frame-end timestamp (bottom of pipe, after all prior work) has been
++  // written, copying it as unavailable, so every frame span was skipped. The
++  // barrier's first scope covers everything earlier in submission order,
++  // including a frame start written in an earlier submission.
++  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 0,
++                           nullptr);
+   // Copying with the availability word instead of VK_QUERY_RESULT_WAIT_BIT:
+   // waiting hangs the device forever if any query in the range never gets its
+   // timestamp written (this happened with bucket timestamps at 3x resolution
+diff --git a/src/graphics/vulkan/native_rhi_vulkan.cpp b/src/graphics/vulkan/native_rhi_vulkan.cpp
+index 28fd5b0..0f4c4c2 100644
+--- a/src/graphics/vulkan/native_rhi_vulkan.cpp
++++ b/src/graphics/vulkan/native_rhi_vulkan.cpp
+@@ -30,10 +30,13 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <string>
++#include <thread>
++#include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+@@ -229,6 +232,10 @@ VkCompareOp ToVkCompare(nrhi::CompareFunc func) {
+       return VK_COMPARE_OP_LESS;
+     case nrhi::CompareFunc::kLessEqual:
+       return VK_COMPARE_OP_LESS_OR_EQUAL;
++    case nrhi::CompareFunc::kGreater:
++      return VK_COMPARE_OP_GREATER;
++    case nrhi::CompareFunc::kGreaterEqual:
++      return VK_COMPARE_OP_GREATER_OR_EQUAL;
+     case nrhi::CompareFunc::kAlways:
+     default:
+       return VK_COMPARE_OP_ALWAYS;
+@@ -298,6 +305,13 @@ class NrTextureViewVulkan : public nrhi::TextureView {
+  public:
+   VkImageView view = VK_NULL_HANDLE;
+   NrTextureVulkan* texture = nullptr;
++  // Ids of the cached texture-table descriptor sets whose key holds this
++  // view (render thread only), so destroying the view retires exactly those
++  // sets instead of sweeping the whole cache. Ids of sets already retired
++  // through another of their views go stale; they are skipped at the flush
++  // and compacted away as the list grows.
++  std::vector<uint64_t> table_set_ids;
++  size_t table_set_ids_compact_at = 16;
+ };
+ 
+ class NrBindingLayoutVulkan : public nrhi::BindingLayout {
+@@ -358,6 +372,8 @@ class NrPipelineVulkan : public nrhi::Pipeline {
+   nrhi::DepthStateDesc depth;
+   nrhi::CullMode cull = nrhi::CullMode::kNone;
+   bool depth_clip = true;
++  int32_t depth_bias = 0;
++  float depth_bias_slope = 0.0f;
+   Format rtv_format = Format::kUnknown;
+   Format dsv_format = Format::kUnknown;
+   uint32_t sample_count = 1;
+@@ -519,6 +535,7 @@ class NrDeviceVulkan : public nrhi::Device {
+     // Thread-safe allocator: nrhi creation APIs are called from decode
+     // worker threads concurrently with the render thread.
+     allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device_, /*externally_synchronized=*/false);
++    release_thread_ = std::thread([this] { ReleaseThreadMain(); });
+ 
+     // The internal root-constant ring UBO: kRingRegions regions cycled by
+     // frame index (deeper than the CP's 3 frames in flight), persistently
+@@ -553,6 +570,16 @@ class NrDeviceVulkan : public nrhi::Device {
+     const VkDevice device = vulkan_device_->device();
+     FlushDissolvedViews();
+     DrainRetired(~0ull);
++    // The release thread drains its queue before exiting, so every
++    // retirement is released before the pools and the allocator go away.
++    {
++      std::lock_guard<std::mutex> lock(release_mutex_);
++      release_exit_ = true;
++    }
++    release_cv_.notify_one();
++    if (release_thread_.joinable()) {
++      release_thread_.join();
++    }
+     for (auto& entry : set0_sets_) {
+       dfn.vkFreeDescriptorSets(device, entry.second.pool, 1, &entry.second.set);
+     }
+@@ -907,10 +934,9 @@ class NrDeviceVulkan : public nrhi::Device {
+     if (view == nullptr) return;
+     // Destruction is batched: the view object stays allocated (so its
+     // address cannot be reused by a new view while stale cache keys still
+-    // hold it) and FlushDissolvedViews sweeps the descriptor-set cache ONCE
+-    // per frame for the whole batch. The eviction sweeps retire ~1500 views
+-    // in a single frame; a per-view cache scan was a measured 10-15 ms
+-    // recurring hitch.
++    // hold it) and FlushDissolvedViews retires the batch once per frame.
++    // The eviction sweeps retire ~1500 views in a single frame; a per-view
++    // cache scan was a measured 10-15 ms recurring hitch.
+     auto* v = static_cast<NrTextureViewVulkan*>(view);
+     {
+       std::lock_guard<std::mutex> lock(mutex_);
+@@ -921,31 +947,23 @@ class NrDeviceVulkan : public nrhi::Device {
+ 
+   // Render thread, once per frame (and at device destruction): retire every
+   // cached texture descriptor set referencing a view destroyed since the
+-  // last flush, then retire the views themselves.
++  // last flush, then retire the views themselves. Each view indexes its own
++  // sets, so the cost follows what was destroyed, not the cache size (the
++  // cache grows with every texture combination a session draws; a full
++  // sweep per flush grew into milliseconds per frame while streaming).
+   void FlushDissolvedViews() {
+     if (dissolved_views_.empty()) return;
+     NrProfScope prof_scope(prof_.view_destroy);
+     const uint64_t submission = cp_->GetCurrentSubmission();
+-    std::unordered_set<const NrTextureViewVulkan*> dissolved(dissolved_views_.begin(),
+-                                                             dissolved_views_.end());
+-    for (auto it = table_sets_.begin(); it != table_sets_.end();) {
+-      bool references = false;
+-      for (uint32_t i = 0; i < it->first.count; ++i) {
+-        if (dissolved.count(it->first.views[i]) != 0) {
+-          references = true;
+-          break;
+-        }
+-      }
+-      if (references) {
+-        std::lock_guard<std::mutex> lock(mutex_);
+-        RetireDescriptorSetLocked(it->second, submission);
+-        it = table_sets_.erase(it);
+-      } else {
+-        ++it;
+-      }
+-    }
+     std::lock_guard<std::mutex> lock(mutex_);
+     for (NrTextureViewVulkan* v : dissolved_views_) {
++      for (uint64_t id : v->table_set_ids) {
++        const auto it = table_sets_by_id_.find(id);
++        if (it == table_sets_by_id_.end()) continue;  // retired through another view
++        RetireDescriptorSetLocked(it->second->second, submission);
++        table_sets_.erase(it->second);
++        table_sets_by_id_.erase(it);
++      }
+       RetiredObject r;
+       r.submission = submission;
+       r.view = v->view;
+@@ -1223,6 +1241,8 @@ class NrDeviceVulkan : public nrhi::Device {
+     pipeline->depth = desc.depth;
+     pipeline->cull = desc.cull;
+     pipeline->depth_clip = desc.depth_clip;
++    pipeline->depth_bias = desc.depth_bias;
++    pipeline->depth_bias_slope = desc.depth_bias_slope;
+     pipeline->rtv_format = desc.rtv_format;
+     pipeline->dsv_format = desc.dsv_format;
+     pipeline->sample_count = desc.sample_count;
+@@ -1274,10 +1294,9 @@ class NrDeviceVulkan : public nrhi::Device {
+     FlushDissolvedViews();
+     {
+       std::lock_guard<std::mutex> lock(mutex_);
+-      // Bounded per frame: the eviction sweeps retire thousands of objects
+-      // at once, and destroying them all in one frame is its own hitch (the
+-      // remainder drains over the following frames). 256 objects measured
+-      // ~5 ms worst case through the allocator.
++      // GPU-completed retirements go to the release thread; only descriptor
++      // set frees run here, bounded per frame (the eviction sweeps retire
++      // thousands of objects at once).
+       DrainRetired(cp_->GetCompletedSubmission(), 256);
+     }
+     ++frame_index_;
+@@ -1298,18 +1317,21 @@ class NrDeviceVulkan : public nrhi::Device {
+                              (unsigned long long)(budgets[i].budget >> 20));
+       }
+       size_t retired_backlog = 0;
++      size_t release_backlog = 0;
+       {
+         std::lock_guard<std::mutex> lock(mutex_);
+         retired_backlog = retired_.size();
++        std::lock_guard<std::mutex> release_lock(release_mutex_);
++        release_backlog = release_queue_.size();
+       }
+       REXLOG_INFO(
+           "nrhi-vulkan mem: {} | bufs upload dl={}MB host={}MB, default dl={}MB host={}MB | "
+-          "retired={} | ring peak={}KB ovf={}",
++          "retired={} releasing={} | ring peak={}KB ovf={}",
+           line, g_buf_bytes_upload_dl.load(std::memory_order_relaxed) >> 20,
+           g_buf_bytes_upload_host.load(std::memory_order_relaxed) >> 20,
+           g_buf_bytes_default_dl.load(std::memory_order_relaxed) >> 20,
+           g_buf_bytes_default_host.load(std::memory_order_relaxed) >> 20, retired_backlog,
+-          ring_peak_bytes_ >> 10, ring_overflow_count_);
++          release_backlog, ring_peak_bytes_ >> 10, ring_overflow_count_);
+     }
+     ring_region_base_ = uint32_t(frame_index_ % kRingRegions) * kRingRegionSize;
+     ring_region_offset_ = 0;
+@@ -1705,7 +1727,24 @@ class NrDeviceVulkan : public nrhi::Device {
+     }
+     vulkan_device_->functions().vkUpdateDescriptorSets(vulkan_device_->device(), count, writes, 0,
+                                                        nullptr);
+-    table_sets_.emplace(key, entry);
++    const uint64_t id = next_table_set_id_++;
++    table_sets_by_id_.emplace(id, table_sets_.emplace(key, entry).first);
++    for (uint32_t i = 0; i < count; ++i) {
++      NrTextureViewVulkan* v = views[i];
++      bool repeat = v == nullptr;  // white fallback: device-owned, never dissolved
++      for (uint32_t j = 0; j < i && !repeat; ++j) {
++        repeat = views[j] == v;
++      }
++      if (repeat) continue;
++      v->table_set_ids.push_back(id);
++      if (v->table_set_ids.size() >= v->table_set_ids_compact_at) {
++        // Long-lived views pick up ids of sets retired through other views;
++        // drop those so the list tracks the live sets (amortized O(1)).
++        std::erase_if(v->table_set_ids,
++                      [&](uint64_t set_id) { return !table_sets_by_id_.contains(set_id); });
++        v->table_set_ids_compact_at = std::max<size_t>(16, v->table_set_ids.size() * 2);
++      }
++    }
+     return entry.set;
+   }
+ 
+@@ -1846,29 +1885,78 @@ class NrDeviceVulkan : public nrhi::Device {
+     retired_.push_back(r);
+   }
+ 
++  // Hands GPU-completed retirements to the release thread, in retirement
++  // order (framebuffers and views before their images). Buffer and image
++  // releases through the allocator measured ~85 us each on the render
++  // thread (run 158: a mesh-store eviction's ~7,900 buffers made 20-35 ms
++  // frames for about a second), the D3D12 backend's lesson as well.
++  // Descriptor sets are freed here: their pools are externally
++  // synchronized with set allocation on the render thread; max_objects
++  // bounds those frees per call. Callers hold mutex_ (or own the device).
+   void DrainRetired(uint64_t completed, size_t max_objects = SIZE_MAX) {
+     NrProfScope prof_scope(prof_.drain);
+     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+     const VkDevice device = vulkan_device_->device();
+-    size_t destroyed = 0;
+-    std::erase_if(retired_, [&](const RetiredObject& r) {
+-      if (r.submission >= completed || destroyed >= max_objects) return false;
+-      ++destroyed;
+-      if (r.framebuffer != VK_NULL_HANDLE) dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
+-      if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
+-      for (VkPipeline pipeline : r.pipelines) {
+-        if (pipeline != VK_NULL_HANDLE) dfn.vkDestroyPipeline(device, pipeline, nullptr);
+-      }
+-      if (r.shader_module != VK_NULL_HANDLE) {
+-        dfn.vkDestroyShaderModule(device, r.shader_module, nullptr);
++    size_t freed_sets = 0;
++    size_t moved = 0;
++    {
++      std::lock_guard<std::mutex> release_lock(release_mutex_);
++      std::erase_if(retired_, [&](const RetiredObject& r) {
++        if (r.submission >= completed) return false;
++        if (r.descriptor_set != VK_NULL_HANDLE) {
++          if (freed_sets >= max_objects) return false;
++          ++freed_sets;
++          dfn.vkFreeDescriptorSets(device, r.descriptor_pool, 1, &r.descriptor_set);
++        }
++        if (r.framebuffer != VK_NULL_HANDLE || r.view != VK_NULL_HANDLE ||
++            r.pipelines[0] != VK_NULL_HANDLE || r.pipelines[1] != VK_NULL_HANDLE ||
++            r.shader_module != VK_NULL_HANDLE || r.image != VK_NULL_HANDLE ||
++            r.buffer != VK_NULL_HANDLE) {
++          RetiredObject rest = r;
++          rest.descriptor_set = VK_NULL_HANDLE;
++          rest.descriptor_pool = VK_NULL_HANDLE;
++          release_queue_.push_back(rest);
++          ++moved;
++        }
++        return true;
++      });
++    }
++    if (moved != 0) {
++      release_cv_.notify_one();
++    }
++  }
++
++  void ReleaseThreadMain() {
++    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
++    const VkDevice device = vulkan_device_->device();
++    std::vector<RetiredObject> batch;
++    for (;;) {
++      {
++        std::unique_lock<std::mutex> lock(release_mutex_);
++        release_cv_.wait(lock, [&] { return release_exit_ || !release_queue_.empty(); });
++        if (release_queue_.empty() && release_exit_) {
++          return;
++        }
++        batch.swap(release_queue_);
+       }
+-      if (r.descriptor_set != VK_NULL_HANDLE) {
+-        dfn.vkFreeDescriptorSets(device, r.descriptor_pool, 1, &r.descriptor_set);
++      for (const RetiredObject& r : batch) {
++        if (r.framebuffer != VK_NULL_HANDLE) {
++          dfn.vkDestroyFramebuffer(device, r.framebuffer, nullptr);
++        }
++        if (r.view != VK_NULL_HANDLE) dfn.vkDestroyImageView(device, r.view, nullptr);
++        for (VkPipeline pipeline : r.pipelines) {
++          if (pipeline != VK_NULL_HANDLE) dfn.vkDestroyPipeline(device, pipeline, nullptr);
++        }
++        if (r.shader_module != VK_NULL_HANDLE) {
++          dfn.vkDestroyShaderModule(device, r.shader_module, nullptr);
++        }
++        if (r.image != VK_NULL_HANDLE) vmaDestroyImage(allocator_, r.image, r.image_allocation);
++        if (r.buffer != VK_NULL_HANDLE) {
++          vmaDestroyBuffer(allocator_, r.buffer, r.buffer_allocation);
++        }
+       }
+-      if (r.image != VK_NULL_HANDLE) vmaDestroyImage(allocator_, r.image, r.image_allocation);
+-      if (r.buffer != VK_NULL_HANDLE) vmaDestroyBuffer(allocator_, r.buffer, r.buffer_allocation);
+-      return true;
+-    });
++      batch.clear();
++    }
+   }
+ 
+   void DestroyGuestOutputWrapper(NrTextureVulkan* wrapper) {
+@@ -2028,6 +2116,9 @@ class NrDeviceVulkan : public nrhi::Device {
+     // winding is unchanged.
+     raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
+     raster.lineWidth = 1.0f;
++    raster.depthBiasEnable = p.depth_bias != 0 || p.depth_bias_slope != 0.0f;
++    raster.depthBiasConstantFactor = float(p.depth_bias);
++    raster.depthBiasSlopeFactor = p.depth_bias_slope;
+ 
+     VkPipelineMultisampleStateCreateInfo multisample = {};
+     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+@@ -2130,6 +2221,14 @@ class NrDeviceVulkan : public nrhi::Device {
+   // destruction are thread-safe); the caches below are render-thread-only.
+   std::mutex mutex_;
+   std::vector<RetiredObject> retired_;
++  // GPU-completed retirements awaiting release on release_thread_ (see
++  // DrainRetired). release_mutex_ guards release_queue_/release_exit_ and
++  // nests inside mutex_ (the release thread never takes mutex_).
++  std::thread release_thread_;
++  std::mutex release_mutex_;
++  std::condition_variable release_cv_;
++  std::vector<RetiredObject> release_queue_;
++  bool release_exit_ = false;
+   // Every app-created object still alive (inserted at Create*, erased at
+   // DestroyDeferred). The app holds its caches (meshes, texture store,
+   // rings, PSOs) across the whole session and has no device-teardown
+@@ -2152,6 +2251,9 @@ class NrDeviceVulkan : public nrhi::Device {
+   std::vector<VkDescriptorPool> descriptor_pools_;
+   std::map<Set0Key, SetEntry> set0_sets_;
+   std::map<TableKey, SetEntry> table_sets_;
++  // Live texture-table sets by id (NrTextureViewVulkan::table_set_ids).
++  std::unordered_map<uint64_t, std::map<TableKey, SetEntry>::iterator> table_sets_by_id_;
++  uint64_t next_table_set_id_ = 1;
+   std::vector<NrBindingLayoutVulkan*> layouts_;  // owned; no destroy API on the interface
+   std::map<VkImage, NrTextureVulkan*> guest_outputs_;
+   std::vector<NrTextureVulkan*> pending_clear_textures_;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index 50a26d0..b64ed8e 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -387,7 +387,6 @@ void ImGuiDrawer::SetupFonts() {
+     // DirectWrite white-on-black edge
+     // profiles (identity was measurably thinner/dimmer). The *_on_light_
+     // variants below keep gamma 1.0 - dark-on-light needs no correction.
+-    config.RasterizerGamma = 0.62f;
+     config.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
+     ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+         GetInterRegularCompressedBase85(), 18.0f, &config);
+@@ -406,9 +405,6 @@ void ImGuiDrawer::SetupFonts() {
+     // experiment read as "lighter, not sharper" in playtest. Kept as the
+     // per-polarity tuning knob.
+     config_on_light.RasterizerMultiply = 1.0f;
+-    // Dark-on-light matches the browser with NO coverage curve (harness fit:
+-    // identity beat every contrast/gamma variant once bake==draw size).
+-    config_on_light.RasterizerGamma = 1.0f;
+     ui_font_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+         GetInterRegularCompressedBase85(), 18.0f, &config_on_light);
+     ui_font_semibold_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
+@@ -502,6 +498,15 @@ void ImGuiDrawer::SetupFonts() {
+               (void*)io.Fonts, io.Fonts->Fonts.Size, (void*)ui_font_, (void*)ui_font_semibold_);
+ }
+ 
++ImmediateTexture* ImGuiDrawer::CreateImage(uint32_t width, uint32_t height,
++                                                         const uint8_t* rgba) {
++  if (!immediate_drawer_) return {};
++  auto image = immediate_drawer_->CreateTexture(width, height, ImmediateTextureFilter::kLinear, false, rgba);
++  auto* result = image.get();
++  if (image) imgui_managed_textures_.push_back(std::move(image));
++  return result;
++}
++
+ void ImGuiDrawer::SetupFontTexture() {
+   if (font_texture_ || !immediate_drawer_) {
+     return;
+diff --git a/src/ui/overlay/simple_settings_overlay.cpp b/src/ui/overlay/simple_settings_overlay.cpp
+index c22345f..ffc1ddc 100644
+--- a/src/ui/overlay/simple_settings_overlay.cpp
++++ b/src/ui/overlay/simple_settings_overlay.cpp
+@@ -54,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
+ // Optional cvars persisted when the host defines them (HasCvar-gated: app
+ // cvars like the native-renderer knobs don't exist in every embedder, and
+ // backend/platform cvars don't exist in every build).
+-constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
++constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
+     "skate3_native_render_scene",
+     "skate3_native_render_scene_msaa",
+     "skate3_native_render_scene_shadows",
+@@ -70,6 +70,15 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+     "skate3_draw_distance_scale",
+     "skate3_lod_distance_scale",
+     "skate3_draw_distance_stream_probe",
++    "skate3_skate2_sky",
++    "skate3_skate2_night",
++    "skate3_cheat_no_air_timer",
++    "skate3_cheat_no_fall_damage",
++    "skate3_cheat_no_hom_bail_timer",
++    "skate3_cheat_out_of_bounds",
++    "skate3_cheat_no_black_screen",
++    "skate3_cheat_no_camera_shake",
++    "skate3_cheat_ragdoll_drive_scale",
+     "show_fps_counter",
+     "monitor",
+     "mnk_sensitivity",
+@@ -148,8 +157,10 @@ struct CategoryInfo {
+   const char* name;
+   const char* desc;
+ };
+-constexpr std::array<CategoryInfo, 5> kCategories = {{
++constexpr std::array<CategoryInfo, 6> kCategories = {{
+     {"Video", "Display, resolution, framerate and renderer quality settings."},
++    {"World",
++     "World settings: the sky over New San Vanelona, and gameplay settings for every map."},
+     {"Controls", "Controller, mouse and keyboard input settings."},
+     {"Audio", "Sound output settings."},
+     {"Profile", "Local player profile and sign-in."},
+@@ -630,6 +641,12 @@ bool TearingDefault() {
+   return CvarDefaultBool("vulkan_allow_present_mode_immediate", true);
+ }
+ 
++// Off = never tear: immediate and FIFO-relaxed (which tears on late frames)
++// go, mailbox stays. Mailbox never blocks the queue the guest frames render
++// on, and the guest frame pacer times each frame to finish just before a
++// blank (Presenter::GetHostPresentSync, LastGuestFrameReady), so nothing
++// waits in a present queue. Without mailbox support the presenter falls back
++// to FIFO, where the display paces guest frames (more latency, still smooth).
+ void SetTearingCvars(bool value) {
+   if (HasCvar("d3d12_allow_variable_refresh_rate_and_tearing")) {
+     SetBoolCvar("d3d12_allow_variable_refresh_rate_and_tearing", value);
+@@ -638,7 +655,7 @@ void SetTearingCvars(bool value) {
+     SetBoolCvar("vulkan_allow_present_mode_immediate", value);
+   }
+   if (HasCvar("vulkan_allow_present_mode_mailbox")) {
+-    SetBoolCvar("vulkan_allow_present_mode_mailbox", value);
++    SetBoolCvar("vulkan_allow_present_mode_mailbox", true);
+   }
+   if (HasCvar("vulkan_allow_present_mode_fifo_relaxed")) {
+     SetBoolCvar("vulkan_allow_present_mode_fifo_relaxed", value);
+@@ -1008,6 +1025,14 @@ void SimpleSettingsDialog::Show() {
+   just_shown_ = true;          // swallow the stale cursor delta too
+ }
+ 
++// New San Vanelona sky row index from its two cvars (night wins).
++static int NsvSkyIndexFromCvars() {
++  if (HasCvar("skate3_skate2_night") && rex::cvar::Query<bool>("skate3_skate2_night")) {
++    return 2;
++  }
++  return HasCvar("skate3_skate2_sky") && !rex::cvar::Query<bool>("skate3_skate2_sky") ? 1 : 0;
++}
++
+ void SimpleSettingsDialog::LoadSettingsFromCvars() {
+   device_list_ = GetGraphicsDeviceList();
+   graphics_api_index_ = HasGraphicsApiChoice() ? GraphicsApiIndexFromCvar() : 0;
+@@ -1022,6 +1047,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
+   monitor_index_ = MonitorIndexFromCvar();
+   audio_buffer_index_ = AudioBufferIndexFromCvar();
+   language_index_ = LanguageIndexFromCvar();
++  nsv_sky_index_ = NsvSkyIndexFromCvars();
+   field_of_view_ = FieldOfViewFromCvar();
+   fullscreen_ = rex::cvar::Query<bool>("fullscreen");
+   vsync_ = rex::cvar::Query<bool>("vsync");
+@@ -1050,6 +1076,23 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
+   mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
+                     rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
+   fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
++  cheat_no_air_timer_ = HasCvar("skate3_cheat_no_air_timer") &&
++                        rex::cvar::Query<bool>("skate3_cheat_no_air_timer");
++  cheat_no_fall_damage_ = HasCvar("skate3_cheat_no_fall_damage") &&
++                          rex::cvar::Query<bool>("skate3_cheat_no_fall_damage");
++  cheat_no_hom_bail_timer_ = HasCvar("skate3_cheat_no_hom_bail_timer") &&
++                             rex::cvar::Query<bool>("skate3_cheat_no_hom_bail_timer");
++  cheat_out_of_bounds_ = HasCvar("skate3_cheat_out_of_bounds") &&
++                         rex::cvar::Query<bool>("skate3_cheat_out_of_bounds");
++  cheat_no_black_screen_ = HasCvar("skate3_cheat_no_black_screen") &&
++                           rex::cvar::Query<bool>("skate3_cheat_no_black_screen");
++  cheat_no_camera_shake_ = HasCvar("skate3_cheat_no_camera_shake") &&
++                           rex::cvar::Query<bool>("skate3_cheat_no_camera_shake");
++  ragdoll_scale_ =
++      HasCvar("skate3_cheat_ragdoll_drive_scale")
++          ? float(std::clamp(rex::cvar::Query<double>("skate3_cheat_ragdoll_drive_scale"),
++                             0.0, 1.0))
++          : 1.0f;
+   audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
+   rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
+   mnk_sensitivity_ = HasCvar("mnk_sensitivity")
+@@ -1075,6 +1118,7 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
+          (HasCvar("audio_device_sample_frames") &&
+           audio_buffer_index_ != AudioBufferIndexFromCvar()) ||
+          (HasCvar("user_language") && language_index_ != LanguageIndexFromCvar()) ||
++         (HasCvar("skate3_skate2_sky") && nsv_sky_index_ != NsvSkyIndexFromCvars()) ||
+          fullscreen_ != rex::cvar::Query<bool>("fullscreen") ||
+          vsync_ != rex::cvar::Query<bool>("vsync") ||
+          tearing_ != TearingFromCvar() ||
+@@ -1228,6 +1272,16 @@ void SimpleSettingsDialog::SaveVideo() {
+         std::clamp(language_index_, 0, static_cast<int>(kLanguageLabels.size()) - 1);
+     rex::cvar::SetFlagByName("user_language", std::to_string(language_index_ + 1));
+   }
++  if (HasCvar("skate3_skate2_sky")) {
++    const bool night = HasCvar("skate3_skate2_night");
++    nsv_sky_index_ = std::clamp(nsv_sky_index_, 0, night ? 2 : 1);
++    if (night) {
++      SetBoolCvar("skate3_skate2_night", nsv_sky_index_ == 2);
++    }
++    if (nsv_sky_index_ != 2) {
++      SetBoolCvar("skate3_skate2_sky", nsv_sky_index_ == 0);
++    }
++  }
+   SetBoolCvar("vsync", vsync_);
+   SetTearingCvars(tearing_);
+   SetBoolCvar("mnk_mode", mnk_mode_);
+@@ -1346,14 +1400,21 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.kind = RowSpec::kEnum;
+         row.label = "Framerate Cap";
+         row.desc =
+-            "Limit how fast the game runs. A steady cap slightly below your display's "
+-            "refresh rate gives the smoothest pacing on variable-refresh displays; "
+-            "Auto tracks the current display and does exactly that. Frames above the "
+-            "refresh rate cannot be shown and only make steady motion judder.";
++            "Limit how fast the game runs. Auto follows VRR / Tearing: with it on, a "
++            "steady cap slightly below the refresh rate, the smoothest pacing on "
++            "G-Sync / FreeSync displays; with it off, the refresh rate itself, each "
++            "frame timed to the display. Frames above the refresh rate cannot be "
++            "shown and only make steady motion judder.";
+         if (FrameCapHasAuto()) {
+-          // Same policy the guest pacer applies (see Window::AutoFrameCapHz).
++          // Same policy the guest pacer applies (see Window::AutoFrameCapHz and
++          // Presenter::GetHostPresentSync).
++          const float refresh_hz = rex::ui::Window::CachedDisplayRefreshHz();
++          const rex::ui::Presenter::HostPresentSync sync =
++              rex::ui::Presenter::GetHostPresentSync();
++          const bool vsynced = sync == rex::ui::Presenter::HostPresentSync::kMailbox ||
++                               sync == rex::ui::Presenter::HostPresentSync::kFifo;
+           const float auto_cap =
+-              rex::ui::Window::AutoFrameCapHz(rex::ui::Window::CachedDisplayRefreshHz());
++              vsynced ? std::round(refresh_hz) : rex::ui::Window::AutoFrameCapHz(refresh_hz);
+           row.options.push_back(
+               auto_cap > 0.0f
+                   ? "Auto (" + std::to_string(int(auto_cap)) + " FPS)"
+@@ -1439,8 +1500,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.kind = RowSpec::kEnum;
+         row.label = "VRR / Tearing";
+         row.desc =
+-            "Allows uncapped presentation with variable-refresh-rate displays "
+-            "(G-Sync / FreeSync). Recommended on.";
++            "On: frames are shown the moment they are ready - use with G-Sync / "
++            "FreeSync displays (tears on fixed-refresh displays). Off: never tears; "
++            "each frame is timed to finish just before the display refreshes.";
+         row.options = {"Off", "On"};
+         row.flag = &tearing_;
+         row.reset = [this] { tearing_ = TearingDefault(); };
+@@ -1794,7 +1856,123 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+       }
+       break;
+     }
+-    case 1: {  // Controls
++    case 1: {  // World
++      if (HasCvar("skate3_skate2_sky")) {
++        // Read once at startup by the world loader: a staged, restart-applied row.
++        header("New San Vanelona");
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = "New San Vanelona Sky";
++        const bool night = HasCvar("skate3_skate2_night");
++        row.desc = night
++            ? "The sky over New San Vanelona: Skate 2's original sky, Skate 3's, or "
++              "Night: the Sanitarium's night sky and moon, with the city lit the way "
++              "the Sanitarium is (needs the Sanitarium download). The distant "
++              "mountains, bay and city backdrop stay. Applied with Apply & Restart."
++            : "The skybox and clouds over New San Vanelona: Skate 2's original sky "
++              "or Skate 3's. The distant mountains, bay and city backdrop stay the "
++              "same. Applied with Apply & Restart.";
++        row.options = {"Skate 2", "Skate 3"};
++        if (night) {
++          row.options.push_back("Night");
++        }
++        row.index = &nsv_sky_index_;
++        row.reset = [this, night] {
++          nsv_sky_index_ = night && CvarDefaultBool("skate3_skate2_night", false) ? 2
++                           : CvarDefaultBool("skate3_skate2_sky", true)            ? 0
++                                                                                    : 1;
++        };
++        rows.push_back(std::move(row));
++      }
++      // Gameplay settings (skate3_cheats.cpp): every map, applied immediately.
++      // Plain World rows with no section bar of their own.
++      struct CheatRow {
++        const char* cvar;
++        const char* label;
++        const char* desc;
++        bool* flag;
++      };
++      const CheatRow cheats[] = {
++          {"skate3_cheat_no_air_timer", "Remove Air Timer",
++           "Stay in the air as long as you like: the game no longer resets you after "
++           "five seconds airborne, for huge drops, mega ramps and speed glitches. "
++           "Every map. Applies immediately.",
++           &cheat_no_air_timer_},
++          {"skate3_cheat_no_fall_damage", "No Fall Damage",
++           "Land drops from any height without bailing, on your board and after "
++           "hippy jumps. Slamming into walls or objects at speed still wipes you out. "
++           "Every map. Applies immediately.",
++           &cheat_no_fall_damage_},
++          {"skate3_cheat_no_hom_bail_timer", "No Hall of Meat Bail Timer",
++           "Hall of Meat bails no longer end after 20 seconds: the tumble lasts until "
++           "your skater comes to rest. Applies immediately.",
++           &cheat_no_hom_bail_timer_},
++          {"skate3_cheat_out_of_bounds", "Go Out of Bounds",
++           "Walk, skate and footplant on ground that normally sends you back, like "
++           "grass and hillsides. Every map. Applies immediately.",
++           &cheat_out_of_bounds_},
++          {"skate3_cheat_no_black_screen", "No Black Screen",
++           "No black screen when you or the camera go far outside the map. Every map. "
++           "Applies immediately.",
++           &cheat_no_black_screen_},
++          {"skate3_cheat_no_camera_shake", "Remove Camera Shake",
++           "No camera shake or sway, including the unsteady sway that builds up at "
++           "very high speed, as after a big drop-in. Every map. Applies immediately.",
++           &cheat_no_camera_shake_},
++      };
++      for (const CheatRow& cheat : cheats) {
++        if (!HasCvar(cheat.cvar)) {
++          continue;
++        }
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = cheat.label;
++        row.desc = cheat.desc;
++        row.options = {"Off", "On"};
++        row.flag = cheat.flag;
++        const std::string name = cheat.cvar;
++        bool* const flag = cheat.flag;
++        row.on_enum_change = [this, name](int value) {
++          SetBoolCvar(name, value != 0);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        row.reset = [this, name, flag] {
++          *flag = CvarDefaultBool(name, false);
++          SetBoolCvar(name, *flag);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        rows.push_back(std::move(row));
++      }
++      if (HasCvar("skate3_cheat_ragdoll_drive_scale")) {
++        RowSpec row;
++        row.kind = RowSpec::kSlider;
++        row.label = "Realistic Ragdoll";
++        row.desc =
++            "How firmly your skater holds a pose during a bail. 1.00 is the normal "
++            "bail; lower values let the limbs flop more freely, down to a fully loose "
++            "ragdoll at 0.00. Every map. Applies immediately.";
++        row.value = &ragdoll_scale_;
++        row.min = 0.0f;
++        row.max = 1.0f;
++        row.step = 0.05f;
++        row.fmt = "%.2f";
++        row.on_value_change = [this] {
++          ragdoll_scale_ = std::clamp(ragdoll_scale_, 0.0f, 1.0f);
++          rex::cvar::SetFlagByName("skate3_cheat_ragdoll_drive_scale",
++                                   std::to_string(ragdoll_scale_));
++        };
++        row.reset = [this] {
++          ragdoll_scale_ = float(std::clamp(
++              CvarDefaultDouble("skate3_cheat_ragdoll_drive_scale", 1.0), 0.0, 1.0));
++          rex::cvar::SetFlagByName("skate3_cheat_ragdoll_drive_scale",
++                                   std::to_string(ragdoll_scale_));
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        rows.push_back(std::move(row));
++      }
++      break;
++    }
++    case 2: {  // Controls
+       header("Mouse & Keyboard");
+       {
+         RowSpec row;
+@@ -1918,7 +2096,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+       }
+       break;
+     }
+-    case 2: {  // Audio
++    case 3: {  // Audio
+       header("Output");
+       if (HasCvar("audio_mute")) {
+         RowSpec row;
+@@ -1966,7 +2144,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+       }
+       break;
+     }
+-    case 3: {  // Profile
++    case 4: {  // Profile
+       header("Local Profile");
+       {
+         RowSpec row;
+@@ -2013,7 +2191,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+       }
+       break;
+     }
+-    case 4: {  // System
++    case 5: {  // System
+       if (HasCvar("user_language")) {
+         RowSpec row;
+         row.kind = RowSpec::kEnum;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 72d7c07..7246c29 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -296,11 +296,48 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+   return config;
+ }
+ 
++// See Presenter::GetHostPresentSync: written by the UI thread when the surface
++// paint connection changes, read by the guest output thread and the guest
++// frame pacer.
++std::atomic<uint8_t> g_host_present_sync{0};
++// See Presenter::LastGuestFrameReady: seqlock-style pair (odd sequence =
++// write in progress), one writer (the readiness observer).
++std::atomic<uint64_t> g_guest_frame_ready_seq{0};
++std::atomic<int64_t> g_guest_frame_ready_ns{0};
++
+ }  // namespace
+ 
+ namespace rex {
+ namespace ui {
+ 
++Presenter::HostPresentSync Presenter::GetHostPresentSync() {
++  return HostPresentSync(g_host_present_sync.load(std::memory_order_relaxed));
++}
++
++void Presenter::SetHostPresentSync(HostPresentSync sync) {
++  g_host_present_sync.store(uint8_t(sync), std::memory_order_relaxed);
++}
++
++void Presenter::PublishGuestFrameReady(int64_t ready_ns) {
++  const uint64_t seq = g_guest_frame_ready_seq.load(std::memory_order_relaxed);
++  g_guest_frame_ready_seq.store(seq + 1, std::memory_order_relaxed);
++  std::atomic_thread_fence(std::memory_order_release);
++  g_guest_frame_ready_ns.store(ready_ns, std::memory_order_relaxed);
++  g_guest_frame_ready_seq.store(seq + 2, std::memory_order_release);
++}
++
++uint64_t Presenter::LastGuestFrameReady(int64_t* ready_ns) {
++  while (true) {
++    const uint64_t seq = g_guest_frame_ready_seq.load(std::memory_order_acquire);
++    const int64_t ns = g_guest_frame_ready_ns.load(std::memory_order_relaxed);
++    std::atomic_thread_fence(std::memory_order_acquire);
++    if ((seq & 1) == 0 && g_guest_frame_ready_seq.load(std::memory_order_relaxed) == seq) {
++      *ready_ns = ns;
++      return seq / 2;
++    }
++  }
++}
++
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
+   rex::FatalError("Graphics device lost (probably due to an internal error)");
+@@ -646,7 +683,13 @@ bool Presenter::RefreshGuestOutput(
+     guest_output_active_last_refresh_ = false;
+   }
+ 
+-  if (REXCVAR_GET(presenter_strict_guest_output_backpressure)) {
++  // Implicit vsync shows every image once at a blank, so waiting for the
++  // previous image's consumption locks guest frames to the display: each
++  // frame is shown exactly once, and the occasional slow frame is absorbed by
++  // the queued images instead of turning into a drop/repeat pair at an
++  // arbitrary frame-to-blank phase (the periodic micro-hitch of a free-running
++  // 60 fps cap on a 60 Hz panel).
++  if (REXCVAR_GET(presenter_strict_guest_output_backpressure) || IsGuestOutputDisplayPaced()) {
+     const int32_t timeout_ms =
+         REXCVAR_GET(presenter_strict_guest_output_backpressure_timeout_ms);
+     std::unique_lock<std::mutex> producer_wait_lock(
+@@ -1537,6 +1580,7 @@ void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnection
+   }
+   surface_paint_connection_state_ = new_state;
+   surface_paint_connection_has_implicit_vsync_ = false;
++  SetHostPresentSync(HostPresentSync::kUnknown);
+   surface_width_in_paint_connection_ = 0;
+   surface_height_in_paint_connection_ = 0;
+ }
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index b404ec8..627ff2b 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -11,12 +11,17 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <bit>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstring>
++#include <deque>
+ #include <memory>
++#include <mutex>
++#include <thread>
+ #include <utility>
+ #include <vector>
+ 
+@@ -249,6 +254,117 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
+   return true;
+ }
+ 
++struct VulkanPresenter::ReadyObserver {
++  static constexpr uint32_t kFenceCount = 4;
++
++  explicit ReadyObserver(const VulkanDevice* device) : device_(device) {
++    const VulkanDevice::Functions& dfn = device_->functions();
++    VkFenceCreateInfo fence_create_info = {};
++    fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    for (uint32_t i = 0; i < kFenceCount; ++i) {
++      if (dfn.vkCreateFence(device_->device(), &fence_create_info, nullptr, &fences_[i]) ==
++          VK_SUCCESS) {
++        free_mask_ |= uint32_t(1) << i;
++      }
++    }
++    thread_ = std::thread([this] { Run(); });
++  }
++
++  ~ReadyObserver() {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      stop_ = true;
++    }
++    cv_.notify_all();
++    thread_.join();
++    const VulkanDevice::Functions& dfn = device_->functions();
++    // Submitted signals still pending must land before their fences go.
++    for (uint32_t index : pending_) {
++      dfn.vkWaitForFences(device_->device(), 1, &fences_[index], VK_TRUE, 1'000'000'000ull);
++    }
++    for (VkFence fence : fences_) {
++      if (fence != VK_NULL_HANDLE) {
++        dfn.vkDestroyFence(device_->device(), fence, nullptr);
++      }
++    }
++  }
++
++  // Painting thread: queues an empty submission that signals a fence once
++  // everything submitted before it has finished on the GPU. Skipped (the
++  // frame goes unobserved) when the observer still holds every fence.
++  void Observe(VkQueue queue) {
++    uint32_t index;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (free_mask_ == 0) {
++        return;
++      }
++      index = uint32_t(std::countr_zero(free_mask_));
++      free_mask_ &= ~(uint32_t(1) << index);
++    }
++    const bool submitted = device_->functions().vkQueueSubmit(queue, 0, nullptr,
++                                                              fences_[index]) == VK_SUCCESS;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (submitted) {
++        pending_.push_back(index);
++      } else {
++        free_mask_ |= uint32_t(1) << index;
++      }
++    }
++    if (submitted) {
++      cv_.notify_one();
++    }
++  }
++
++ private:
++  void Run() {
++    const VulkanDevice::Functions& dfn = device_->functions();
++    while (true) {
++      uint32_t index;
++      {
++        std::unique_lock<std::mutex> lock(mutex_);
++        cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
++        if (stop_) {
++          return;
++        }
++        index = pending_.front();
++        pending_.pop_front();
++      }
++      const VkResult result =
++          dfn.vkWaitForFences(device_->device(), 1, &fences_[index], VK_TRUE, 1'000'000'000ull);
++      if (result == VK_SUCCESS) {
++        PublishGuestFrameReady(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++        dfn.vkResetFences(device_->device(), 1, &fences_[index]);
++      }
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (result == VK_SUCCESS) {
++        free_mask_ |= uint32_t(1) << index;
++      } else if (result == VK_TIMEOUT) {
++        // Still pending: keep it out of use rather than resetting it under a
++        // queued submission, and look again.
++        pending_.push_back(index);
++      }
++      // Device loss: the fence stays retired.
++    }
++  }
++
++  const VulkanDevice* device_;
++  VkFence fences_[kFenceCount] = {};
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::deque<uint32_t> pending_;
++  uint32_t free_mask_ = 0;
++  bool stop_ = false;
++  std::thread thread_;
++};
++
++void VulkanPresenter::ReadyObserverDeleter::operator()(ReadyObserver* observer) const {
++  delete observer;
++}
++
+ VulkanPresenter::~VulkanPresenter() {
+   // Destroy the swapchain after its images are not used for drawing anymore.
+   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
+@@ -260,6 +376,7 @@ VulkanPresenter::~VulkanPresenter() {
+   // and the vkQueuePresentKHR semaphore wait).
+   // This will await completion of all paint submissions also.
+   paint_context_.DestroySwapchainAndVulkanSurface();
++  ready_observer_.reset();
+ 
+   // Await completion of the usage of everything before destroying anything
+   // (paint submission completion already awaited).
+@@ -284,6 +401,7 @@ VulkanPresenter::~VulkanPresenter() {
+     dfn.vkDestroySemaphore(device, retired_present_semaphore, nullptr);
+   }
+   paint_context_.retired_present_semaphores.clear();
++  util::DestroyAndNullHandle(dfn.vkDestroyFence, device, paint_context_.acquire_fence);
+ 
+   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
+     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
+@@ -846,7 +964,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
+-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
++        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
++        paint_context_.swapchain_is_mailbox, surface_unusable);
+     // Destroy the old swapchain that may be retired now.
+     if (old_swapchain != VK_NULL_HANDLE) {
+       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
+@@ -939,7 +1058,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
+-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
++        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
++        paint_context_.swapchain_is_mailbox, surface_unusable);
+     if (paint_context_.swapchain == VK_NULL_HANDLE) {
+       // Failed to create the swapchain for the new Vulkan surface - destroy the
+       // Vulkan surface.
+@@ -1129,6 +1249,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+   }
+ 
+   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
++  SetHostPresentSync(paint_context_.swapchain_is_fifo      ? HostPresentSync::kFifo
++                     : paint_context_.swapchain_is_mailbox ? HostPresentSync::kMailbox
++                                                           : HostPresentSync::kTearing);
+   return SurfacePaintConnectResult::kSuccess;
+ }
+ 
+@@ -1201,7 +1324,8 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+     const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
+     VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out, VkFormat& image_format_out,
+-    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& ui_surface_unusable_out) {
++    VkExtent2D& image_extent_out, bool& is_fifo_out, bool& is_mailbox_out,
++    bool& ui_surface_unusable_out) {
+   ui_surface_unusable_out = false;
+ 
+   const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
+@@ -1513,6 +1637,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+   present_queue_family_out = queue_family_index_present;
+   image_format_out = swapchain_create_info.imageFormat;
+   image_extent_out = swapchain_create_info.imageExtent;
++  is_mailbox_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR;
+   is_fifo_out = swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+                 swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+   return swapchain;
+@@ -1678,11 +1803,36 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   // safe to return early from this function in case of an error.
+ 
+   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
++  // FIFO frees images only at vertical blanks, and the acquire returns before
++  // the image is free. A semaphore would make the GPU wait for the blank, and
++  // as the paint shares the queue the command processor renders on, every
++  // later guest frame's GPU work queued behind that wait (measured: the
++  // command processor blocked on its frame fences for up to 2-3 refreshes at
++  // ~45% GPU load). Wait for the image on the host instead: with implicit
++  // vsync, painting always runs on the UI thread
++  // (Presenter::GetDesiredPaintModeFromUIThread), never on the thread that
++  // produces guest output.
++  const bool acquire_on_host = paint_context_.swapchain_is_fifo;
++  if (acquire_on_host && paint_context_.acquire_fence == VK_NULL_HANDLE) {
++    VkFenceCreateInfo fence_create_info = {};
++    fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++    if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &paint_context_.acquire_fence) !=
++        VK_SUCCESS) {
++      REXLOG_ERROR("VulkanPresenter: Failed to create the swapchain image acquisition fence");
++      return PaintResult::kNotPresented;
++    }
++  }
+   uint32_t swapchain_image_index;
+   const auto timing_acquire_start = std::chrono::steady_clock::now();
+-  VkResult acquire_result =
+-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+-                                VK_NULL_HANDLE, &swapchain_image_index);
++  VkResult acquire_result = dfn.vkAcquireNextImageKHR(
++      device, paint_context_.swapchain, UINT64_MAX,
++      acquire_on_host ? VK_NULL_HANDLE : acquire_semaphore,
++      acquire_on_host ? paint_context_.acquire_fence : VK_NULL_HANDLE, &swapchain_image_index);
++  if (acquire_on_host &&
++      (acquire_result == VK_SUCCESS || acquire_result == VK_SUBOPTIMAL_KHR)) {
++    dfn.vkWaitForFences(device, 1, &paint_context_.acquire_fence, VK_TRUE, UINT64_MAX);
++    dfn.vkResetFences(device, 1, &paint_context_.acquire_fence);
++  }
+   const auto timing_acquire_end = std::chrono::steady_clock::now();
+   switch (acquire_result) {
+     case VK_SUCCESS:
+@@ -1745,6 +1895,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   std::shared_ptr<GuestOutputImage> guest_output_image;
++  // Identifies the guest frame painted (each refresh gets a new submission
++  // index), so a repaint of the same frame isn't reported as a new one.
++  uint64_t painted_refresher_submission = 0;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+@@ -1752,6 +1905,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
+       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
++      painted_refresher_submission =
++          guest_output_images_[guest_output_mailbox_index].last_refresher_submission;
+     }
+     // Incremented the reference count of the guest output image - safe to leave
+     // the consumer critical section now as everything here either will be using
+@@ -2305,9 +2460,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   VkSubmitInfo submit_info;
+   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+   submit_info.pNext = nullptr;
+-  submit_info.waitSemaphoreCount = 1;
+-  submit_info.pWaitSemaphores = &acquire_semaphore;
+-  submit_info.pWaitDstStageMask = &acquire_semaphore_wait_stage;
++  // Host-acquired images are already free (see acquire_on_host).
++  submit_info.waitSemaphoreCount = acquire_on_host ? 0 : 1;
++  submit_info.pWaitSemaphores = acquire_on_host ? nullptr : &acquire_semaphore;
++  submit_info.pWaitDstStageMask = acquire_on_host ? nullptr : &acquire_semaphore_wait_stage;
+   submit_info.commandBufferCount = command_buffer_count;
+   submit_info.pCommandBuffers = command_buffers;
+   submit_info.signalSemaphoreCount = 1;
+@@ -2373,6 +2529,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  if (paint_context_.swapchain_is_mailbox &&
++      (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) &&
++      painted_refresher_submission > ready_last_refresher_submission_) {
++    // A new guest frame went out: report when its paint completes (see
++    // Presenter::LastGuestFrameReady).
++    ready_last_refresher_submission_ = painted_refresher_submission;
++    if (!ready_observer_) {
++      ready_observer_.reset(new ReadyObserver(vulkan_device_));
++    }
++    const VulkanDevice::Queue::Acquisition queue_acquisition =
++        vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
++    ready_observer_->Observe(queue_acquisition.queue());
++  }
+   const auto timing_present_end = std::chrono::steady_clock::now();
+   AccumulateAndMaybeLogPresentTiming(
+       execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),

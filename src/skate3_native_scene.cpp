@@ -5,6 +5,8 @@
 // skate3_native_scene_state.h.
 
 #include "skate3_native_scene.h"
+#include "skate3_perf_recorder.h"
+#include "skate3_world_loading.h"
 
 #include "generated/skate3_init.h"
 
@@ -35,6 +37,39 @@
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_hide_inherited_backdrop, true, "Skate 3",
+                    "Hide native district proxies and Danny Way backdrop assets inherited by New San Van")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_native_occlusion, false, "Skate 3",
+                    "Experimental native occlusion optimization in New San Van; disabled for visibility validation")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_ad_overrides, true, "Skate 3",
+                    "Allow native draw-time artwork overrides in New San Van; toggle for flicker comparison")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_transparent_parity, true, "Skate 3",
+                    "Draw New San Van's environment.transparent surfaces (the Waterfront "
+                    "sail canopies, grates, glass) with Skate 2's own state: depth writes "
+                    "and one-sided culling. Off = Skate 3's two-sided, no-depth-write blend.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_env_specular, true, "Skate 3",
+                    "New San Van surfaces use Skate 2's own shine: sun highlights and "
+                    "environment-cube reflections weighted by its fresnel (storefront "
+                    "glass, the Waterfront railing symbols), and its transparent-surface "
+                    "lighting. Off = the Skate 3 formulas.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_stadium_crowd_shade, true, "Skate 3",
+                    "Keep the Stadium's crowd seating in the roof's shade while the rest "
+                    "of the arena shows its own floodlit lighting. Off = the seating is lit "
+                    "like the arena floor.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_texture_probe, false, "Skate 3",
+                    "Trace New San Van diffuse bindings and missing-texture identity, "
+                    "Skate 3 items seen in New San Van (bam-foreign-item) and packed "
+                    "lightmaps (packed-lightmap)");
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -71,6 +106,12 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, true, "Skate 3",
                     "lightmap x2 at the |uv2| unwrap reproduces the emulated baked "
                     "sun/shadow/AO structure), and the texture payload revalidation "
                     "re-decodes pages that were captured before composition.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmap_smooth, true, "Skate 3",
+                    "Smooth baked lighting: reconstruct the lightmap atlas with a "
+                    "cubic B-spline (four bilinear taps) instead of the games' single "
+                    "bilinear tap, which draws the low-resolution baked shadows as "
+                    "blocky gradients. Off = the original look.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_menu_blur_sigma, 9.0, "Skate 3",
                       "Settings-menu backdrop gaussian sigma, in 1080p pixels (matches "
@@ -501,6 +542,25 @@ REXCVAR_DEFINE_BOOL(
     "(see photo_native_accum), the bloom pyramid contribution (disabled in "
     "every editor capture), grade LUT served as identity, deck AO.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_gameplay_postfx, true, "Skate 3",
+    "Apply the game's full postfx chain (visualfx -> DOF/motion blur -> uber "
+    "-> fisheye, plus the fisheye_noise video look) in GAMEPLAY while the "
+    "game itself runs it: the left-trigger slow-motion bail camera switches "
+    "from postfx_fast_uberPS to this chain (run 093 shader census). Same "
+    "exact ports as the photo editor, driven by the live constants; the chain "
+    "turns off within ~0.15 s of the game dropping it. Run 095 fixes: scene "
+    "input / 1.41 (the native tone chain already folds the uber multiplier; "
+    "doubled = washed-out) and the HoM bone stencil mark (bones stay coloured "
+    "over the B&W). native-pfx-diag / -order / -chars log each episode.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_postfx_motion_blur, true, "Skate 3",
+    "Keep the game's camera motion blur in the ported postfx chain (bail camera "
+    "/ photo editor). OFF zeroes f_MotionBlur_Intensity in visualfx (c5.x) and "
+    "tap9dofMotionBlur (c0.x): no motion blur, sharp image, the grade / fisheye "
+    "/ slow-motion B&W / HoM bones unchanged.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(
     skate3_native_render_scene_photo_native_accum, 0, "Skate 3",
     "Source for the visualfx pass's quarter-res motion-accumulation input "
@@ -682,6 +742,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_caster_parity, true,
                     "casting it painted a hard brim band across the editor face). "
                     "OFF = every published character piece casts (old behavior).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_prop_world_shade, true, "Skate 3",
+                    "Movable props take the shade of buildings and trees from the "
+                    "dynamicobject world-shadow map (the game's own term). Off = props "
+                    "ignore it; an A/B for prop shading only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_shadow_static_casters, true,
                     "Skate 3",
                     "Native static sun-shadow map: render the STATIC world "
@@ -703,6 +768,15 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_strength, 1.0,
                       "with the baked lighting's own sun.")
     .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_venue, 0.0,
+                      "Skate 3",
+                      "Static sun-shadow strength inside enclosed New San Van "
+                      "venues lit by their own lights (the Stadium interior), "
+                      "as a fraction of the static strength. 0 = the venue's "
+                      "baked floodlit lighting, as Skate 3's own indoor venues "
+                      "get; 1 = full outdoor sun shading (dim).")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_radius, 180.0,
                       "Skate 3",
                       "Half-extent in meters of the static sun-shadow map's "
@@ -711,6 +785,16 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_radius, 180.0,
                       "the texel density). Larger reaches farther at lower "
                       "texel density; the term fades out at the outer edge.")
     .range(40.0, 600.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_budget_ms, 1.5,
+                      "Skate 3",
+                      "Static sun-shadow map: CPU time per frame (ms) for "
+                      "map rebuilds and newly seen casters. A rebuild renders "
+                      "into a second map over as many frames as it needs and "
+                      "swaps in complete; newly seen geometry is added to the "
+                      "shown map without a rebuild. 0 = rebuild in one frame "
+                      "(a hitch that grows with the session in dense areas).")
+    .range(0.0, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
                      "Skate 3",
@@ -835,6 +919,31 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_decals, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_transparents, true, "Skate 3",
                     "Draw environment.transparent items (mist/glass/fences) in the "
                     "alpha-blended sub-pass")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_indicator_xray, false, "Skate 3",
+                    "Draw visualindicator overlays (the Hall of Meat bones) without "
+                    "the depth test, so they show through the body. Off = the "
+                    "authored depth-tested blend (Skate 2 visualindicator.xml).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_attach_bank_world, true, "Skate 3",
+                    "Rigid character attachments (character.* pieces without skinning, "
+                    "e.g. some shoes): when the instance matrix has stopped updating "
+                    "while the draw's own world keeps moving, render the draw's world "
+                    "(the detached-shoe fix). Off = the prop clone rule everywhere.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cac_stamps, true, "Skate 3",
+                    "CAC skin stamp layers (cacstamp_skin): the tattoo texture. Off = "
+                    "skin without any stamp (the pre-084 look), for A/B checks.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cac_cloth_dirt, true, "Skate 3",
+                    "Draw the clothing dirt layer the game accumulates over bails "
+                    "(cac_cloth_defaultPS: the garment's decal2 dirt texture blended "
+                    "over the tinted diffuse by its alpha x i_params.y) on the player's "
+                    "cloth / leather / ropa cloth pieces.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cac_stamp_overlay, true, "Skate 3",
+                    "CAC skin second stamp overlay (cacstamp_skin i_decal2 x i_params.z; "
+                    "shows bruises and scrapes after a Hall of Meat bone break).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
                     "Publish world sort-list items (static geometry)")
@@ -1158,6 +1267,24 @@ REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
                     "Log periodic native-renderer performance breakdown lines "
                     "(see skate3_native_render_scene_perf_interval)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_character_log, false, "Skate 3",
+                    "Log character shading diagnostics: Hall of Meat bone overlay rows "
+                    "and textures (native-hom), skin stamp rows and decals "
+                    "(native-stamp), cloth dirt and decals (native-cloth), first "
+                    "sightings of each dynamic material (native-material-seen)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_postfx_log, false, "Skate 3",
+                    "Log the game's post-effect chain: per-episode pass rows and "
+                    "fetches, draw order and character copies (native-pfx-*), and "
+                    "the 2D shader census (native-shader-seen)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_capture_log, false, "Skate 3",
+                    "Log scene-capture diagnostics: the per-second capture and "
+                    "publish-gate lines, detached character pieces (native-detached), "
+                    "palette serves that disagree with the draw (native-serve-diverge) "
+                    "and traffic-light state changes. The piece and palette checks "
+                    "only run while this is on")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(skate3_native_render_scene_perf_interval, 600, "Skate 3",
@@ -1821,6 +1948,32 @@ bool GuestTryLoadU32(uint8_t* base, uint32_t addr, uint32_t* out) {
   return true;
 }
 
+// A draw context whose record -> mesh -> vertex-descriptor links are not
+// aligned object pointers is stale: the game is drawing a mesh whose memory
+// was freed and reused. Log149: after a New San Van stream change the vertex
+// descriptor read was 38373061 ("870a", texture-name text) and the raw read
+// faulted. Reported once per context with the bytes now at each link.
+bool StaleDrawChain(uint8_t* base, uint32_t ctx, uint32_t record, uint32_t mesh, uint32_t vdesc) {
+  if (((record | mesh | vdesc) & 3u) == 0) return false;
+  static std::mutex mutex;
+  static std::unordered_set<uint32_t> reported;
+  std::lock_guard lock(mutex);
+  if (reported.size() < 64 && reported.insert(ctx).second) {
+    const auto bytes = [&](uint32_t address) {
+      uint8_t raw[32];
+      if (address < 0x10000 || !GuestTryCopy(raw, base + address, sizeof(raw))) return std::string("unreadable");
+      char hex[sizeof(raw) * 2 + 1];
+      for (size_t i = 0; i < sizeof(raw); ++i) std::snprintf(hex + 2 * i, 3, "%02X", raw[i]);
+      return std::string(hex);
+    };
+    REXLOG_WARN("native-scene: stale draw ctx={:08X} record={:08X} mesh={:08X} vdesc={:08X} "
+                "skate2={} frame={} record_bytes={} mesh_bytes={}",
+                ctx, record, mesh, vdesc, skate3::world_loading::IsSkate2Gameplay(),
+                g_guest_frame, bytes(record), bytes(mesh & ~3u));
+  }
+  return true;
+}
+
 bool GuestTryLoadU64(uint8_t* base, uint32_t addr, uint64_t* out) {
   if (addr < 0x10000) {
     return false;
@@ -1967,7 +2120,145 @@ bool ComputeItemFingerprint(uint8_t* base, DrawItem& item) {
 // Parse a guest mesh struct (vertex descriptor, buffers, bbox, material
 // channels, payload fingerprint) into the item. The draw list and world
 // transform are the caller's responsibility (world starts as identity).
-bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
+// The engine's missing-texture placeholder: FNV-1 64 (82382840) of
+// "missingtexture.Texture". The game binds it into a material channel whose
+// texture is not loaded (logs 053/054); registered like any asset texture.
+constexpr uint64_t kMissingTextureGuid = 0x4E8AAC7B89E95463ull;
+// The latest registered placeholder object, plus every registration seen
+// (a world package may register its own copy). Written under
+// g_texture_map_mutex, read lock-free.
+std::atomic<uint32_t> g_missing_texture_object{0};
+std::array<std::atomic<uint32_t>, 8> g_missing_texture_objects{};
+
+void RememberPlaceholderTexture(uint32_t texture) {
+  g_missing_texture_object.store(texture, std::memory_order_relaxed);
+  for (auto& slot : g_missing_texture_objects) {
+    const uint32_t v = slot.load(std::memory_order_relaxed);
+    if (v == texture) {
+      return;
+    }
+    if (v == 0) {
+      slot.store(texture, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// True when `tex` is a registered placeholder object, or a copy carrying the
+// latest one's fetch constant.
+bool IsPlaceholderTexture(uint8_t* base, uint32_t tex) {
+  const uint32_t missing = g_missing_texture_object.load(std::memory_order_relaxed);
+  if (missing == 0 || tex == 0) {
+    return false;
+  }
+  for (const auto& slot : g_missing_texture_objects) {
+    const uint32_t v = slot.load(std::memory_order_relaxed);
+    if (v == 0) {
+      break;
+    }
+    if (v == tex) {
+      return true;
+    }
+  }
+  uint32_t a[6], b[6];
+  if (tex < 0x10000 || tex > 0xffffffc0 || missing < 0x10000 || missing > 0xffffffc0 ||
+      !GuestTryCopy(a, base + tex + 28, sizeof(a)) ||
+      !GuestTryCopy(b, base + missing + 28, sizeof(b))) {
+    return false;
+  }
+  return (BSwap32(a[0]) & 3u) == 2u && std::memcmp(a, b, sizeof(a)) == 0;
+}
+
+void TraceSkate2TextureBinding(uint8_t* base, uint32_t mesh, uint32_t material,
+                             uint64_t guid, uint32_t stream, uint32_t selected,
+                             uint32_t channel_flags, uint32_t alternate) {
+  if (!REXCVAR_GET(skate3_skate2_texture_probe) ||
+      !skate3::world_loading::IsSkate2Gameplay()) return;
+  // FNV-1 64, as implemented by82382840, of "missingtexture.Texture".
+  constexpr uint64_t missing_guid = 0x4E8AAC7B89E95463ull;
+  uint32_t registered = 0, missing = 0, paired = 0;
+  // BAM's uncompressed Texture exports identify Pres min-mips with ...870B
+  // and the corresponding Tex detail with ...870A. Observe this candidate;
+  // the registration map is historical and must NOT be used to infer liveness.
+  const uint64_t paired_guid = uint32_t(guid) == 0x03E3870A ? (guid ^ 1) : 0;
+  {
+    std::lock_guard lock(g_texture_map_mutex);
+    if (auto it = g_texture_map.find(guid & kGuidMask); it != g_texture_map.end()) registered = it->second;
+    if (auto it = g_texture_map.find(missing_guid); it != g_texture_map.end()) missing = it->second;
+    if (paired_guid) {
+      if (auto it = g_texture_map.find(paired_guid & kGuidMask); it != g_texture_map.end()) paired = it->second;
+    }
+  }
+  uint32_t live = 0, selected_words[6]{}, registered_w0 = 0, missing_words[6]{};
+  GuestTryLoadU32(base, stream, &live);
+  const auto words = [&](uint32_t object, uint32_t* out) {
+    if (object < 0x10000 || object > 0xffffffc0 ||
+        !GuestTryCopy(out, base + object + 28, 24)) return false;
+    for (unsigned i = 0; i < 6; ++i) out[i] = BSwap32(out[i]);
+    return true;
+  };
+  const bool selected_readable = words(selected, selected_words);
+  const bool missing_readable = words(missing, missing_words);
+  uint32_t paired_words[6]{}, alternate_object = 0, alternate_words[6]{}, stream_words[8]{};
+  const bool paired_readable = words(paired, paired_words);
+  GuestTryLoadU32(base, alternate, &alternate_object);
+  const bool alternate_readable = words(alternate_object, alternate_words);
+  if (stream >= 0x10000 && stream <= 0xffffffdf &&
+      GuestTryCopy(stream_words, base + stream, sizeof(stream_words))) {
+    for (auto& word : stream_words) word = BSwap32(word);
+  }
+  if (registered >= 0x10000 && registered < 0xffffffc0)
+    GuestTryLoadU32(base, registered + 28, &registered_w0);
+  const bool missing_binding = missing != 0 && selected_readable &&
+      missing_readable && (selected_words[0] & 3u) == 2u &&
+      (missing_words[0] & 3u) == 2u && (selected == missing ||
+       std::memcmp(selected_words, missing_words, sizeof(selected_words)) == 0);
+  const bool invalid_registry = registered && (registered_w0 & 3u) != 2u;
+  // Record edges and a bounded baseline. A stable placeholder does not emit
+  // a line every frame. Independent lock: do not hold the registry while logging.
+  static std::mutex trace_mutex;
+  static std::unordered_map<uint32_t, std::array<uint64_t, 6>> previous;
+  static uint64_t window_frame = 0;
+  static unsigned window_count = 0, baseline_count = 0;
+  std::lock_guard lock(trace_mutex);
+  const uint64_t frame = g_guest_frame;
+  if (frame < window_frame || frame - window_frame >= 120) {
+    window_frame = frame; window_count = 0;
+  }
+  const std::array<uint64_t, 6> state{guid, (uint64_t(live) << 32) | selected,
+      (uint64_t(registered) << 32) | selected_words[1],
+      uint64_t(missing_binding) | (uint64_t(invalid_registry) << 1),
+      (uint64_t(paired) << 32) | paired_words[1],
+      (uint64_t(alternate_object) << 32) | alternate_words[1]};
+  auto it = previous.find(mesh);
+  if (it != previous.end() && it->second == state) return;
+  const bool changed = it != previous.end();
+  if (window_count >= 64) return;
+  if (previous.size() >= 8192) previous.clear();
+  previous[mesh] = state;
+  if (!missing_binding && !invalid_registry && !changed && baseline_count >= 24) return;
+  ++window_count;
+  if (!changed) ++baseline_count;
+  REXLOG_INFO("world-texture-binding: frame={} mesh={:08X} material={:08X} guid={:016X} stream={:08X} live={:08X} selected={:08X} registered={:08X} registered_w0={:08X} missing={:08X} placeholder={} invalid_registry={} fetch=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+              frame, mesh, material, guid, stream, live, selected, registered,
+              registered_w0, missing, missing_binding, invalid_registry,
+              selected_words[0], selected_words[1], selected_words[2],
+              selected_words[3], selected_words[4], selected_words[5]);
+  REXLOG_INFO("world-texture-pair: frame={} mesh={:08X} guid={:016X} flags={:08X} alternate={:08X} alternate_object={:08X} alternate_type={} pair_guid={:016X} pair_registered={:08X} pair_type={} pair_fetch=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] stream_words=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+              frame, mesh, guid, channel_flags, alternate, alternate_object,
+              alternate_readable && (alternate_words[0] & 3u) == 2u,
+              paired_guid, paired, paired_readable && (paired_words[0] & 3u) == 2u,
+              paired_words[0], paired_words[1], paired_words[2], paired_words[3],
+              paired_words[4], paired_words[5], stream_words[0], stream_words[1],
+              stream_words[2], stream_words[3], stream_words[4], stream_words[5],
+              stream_words[6], stream_words[7]);
+}
+
+bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
+                       ItemBindingWatch* watch) {
+  if (watch != nullptr) {
+    watch->count = 0;
+  }
   const uint32_t vdesc = REX_LOAD_U32(mesh + kMeshVertexDescriptor);
   const uint32_t ib = REX_LOAD_U32(mesh + kMeshIndexBuffer);
   const uint32_t vb = REX_LOAD_U32(mesh + kMeshVertexBuffer);
@@ -2116,7 +2407,12 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   // Material channels: resolve the "diffuse" and "lightmap" texture guids to
   // registered texture objects.
   item.diffuse_tex = 0;
+  item.diffuse_guid = 0;
   item.lightmap_tex = 0;
+  item.chromaticity_tex = 0;
+  item.packed_lightmap = false;
+  item.tex_missing = 0;
+  std::fill_n(item.mono_lightmap_dot, 4, 0.0f);
   item.macro_tex = 0;
   item.macro_scale = 1.0f;
   item.macro_opacity = 1.0f;
@@ -2138,6 +2434,19 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
   item.water_env = 0;
   item.unlit = false;
   item.env_family = 0;
+  item.traffic_light = 0;
+  item.s2_blend = 0;
+  item.s2_lm_weight = 0.0f;
+  item.s2_mult = 0.0f;
+  item.s2_alpha_ref = 0.0f;
+  item.glare_scale = 0.0f;
+  item.diffuse2_tex = 0;
+  item.decal2_art = 0;
+  item.indicator = false;
+  item.ind_valid = false;
+  item.stamp_uv_valid = false;
+  item.floor_height = 0.0f;
+  item.floor_count = 0.0f;
   item.dynobj = 0;
   item.spec_tex = 0;
   item.tint[0] = item.tint[1] = item.tint[2] = item.tint[3] = 0.0f;
@@ -2160,6 +2469,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         std::memcpy(&v, chan_buf + idx * 0x20 + off, 4);
         return BSwap32(v);
       };
+      uint32_t packed_channel = UINT32_MAX;
+      const bool s2_world = skate3::world_loading::IsSkate2Gameplay();
       for (uint32_t i = 0; i < num_channels; ++i) {
         const uint32_t name = chan_u32(i, 0);
         char text[20];
@@ -2168,8 +2479,35 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
         uint32_t* slot = nullptr;
         if (std::memcmp(text, "diffuse", 8) == 0) {
           slot = &item.diffuse_tex;
+          item.diffuse_guid = (uint64_t(chan_u32(i, 0x10)) << 32) | chan_u32(i, 0x14);
+        } else if (std::memcmp(text, "decal2", 7) == 0) {
+          // cacstamp second stamp overlay (see DrawItem::decal2_art).
+          slot = &item.decal2_art;
+        } else if (std::memcmp(text, "diffuse2", 9) == 0) {
+          // Second diffuse (building_ceiling_worldspace: the interior
+          // ceiling projected behind the window glass).
+          slot = &item.diffuse2_tex;
+        } else if (std::memcmp(text, "glareScale", 11) == 0 ||
+                   std::memcmp(text, "floorHeightMeters", 18) == 0 ||
+                   std::memcmp(text, "floorCount", 11) == 0) {
+          // Shader-constant channels (float in the first guid word): the
+          // Skate 2 glare sprite size and the building interior-ceiling
+          // projection (see ApplySkate2Material).
+          const float f = std::bit_cast<float>(chan_u32(i, 0x10));
+          if (f > 0.0f && f < 1e6f) {
+            (text[0] == 'g' ? item.glare_scale
+                            : text[5] == 'H' ? item.floor_height
+                                             : item.floor_count) = f;
+          }
+          continue;
+        } else if (std::memcmp(text, "chromaticity", 13) == 0) {
+          slot = &item.chromaticity_tex;
         } else if (std::memcmp(text, "lightmap", 9) == 0) {
           slot = &item.lightmap_tex;
+          // Skate 2 0x82BCEB34 reads channel+6 and masks its low 2 bits.
+          // Its table is R, G, B, then (0.33, 0.34, 0.33, 0).
+          // The dot selector is metadata, not a named material parameter.
+          packed_channel = chan_u32(i, 4) & 3u;
         } else if (std::memcmp(text, "macrooverlay", 13) == 0) {
           slot = &item.macro_tex;
         } else if (std::memcmp(text, "decal", 6) == 0) {
@@ -2239,8 +2577,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // the longest name that must be distinguishable; the previous
             // 28-byte buffer truncated both vehicle names into the plain
             // "livingworld" pedestrian prefix.
-            char mat_name[40];
+            char mat_name[40] = {};
             GuestTryReadString(base, s, mat_name, sizeof(mat_name));
+            std::memcpy(item.material_name, mat_name, sizeof(mat_name));
+            item.material_name[sizeof(item.material_name) - 1] = 0;
             // character.*_ropa = the Ropa cloth-sim VS variant (flag-row
             // switched skinned/rigid, see CaptureSkinnedState). The suffix
             // composes with the base family name: cloth_ropa (player tees),
@@ -2275,6 +2615,9 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               const char* sub = mat_name + 10;
               if (std::memcmp(sub, "default_hair", 13) == 0) {
                 item.char_family = 5;
+              } else if (std::memcmp(sub, "default_hom", 12) == 0) {
+                // Hall of Meat x-ray bones (defaulthom.fx): family 8.
+                item.char_family = 8;
               } else if (std::memcmp(sub, "default", 7) == 0) {
                 item.char_family = 1;
               } else if (std::memcmp(sub, "hair", 5) == 0) {
@@ -2375,10 +2718,25 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
             // (model verified exact against the game's own pixel shader).
             // Separate from the world env families; the lighting rows come
             // from the draw's PS bank, not the frame-global world rows.
+            // visualindicator (Hall of Meat bone overlays): family 19, see
+            // DrawItem::indicator. Skate 3 native, every world.
+            if (std::memcmp(mat_name, "visualindicator", 15) == 0) {
+              item.indicator = true;
+              item.env_family = 19;
+            }
             if (is("dynamicobject.alphatest", 24)) {
               item.dynobj = 2;
             } else if (is("dynamicobject", 13)) {
               item.dynobj = 1;
+            }
+            // trafficlight.one / .two (trafficlight_one/two.fx, the signal
+            // lamps): family 20, unlit lamp texture whose lit or unlit UV
+            // follows the game's lamp state (see FrameScene::traffic_rows).
+            // Unrecognized they took the generic path, which only ever
+            // samples the unlit UV: every signal stayed dark, in every world.
+            if (is("trafficlight.one", 17) || is("trafficlight.two", 17)) {
+              item.env_family = 20;
+              item.traffic_light = mat_name[13] == 'o' ? 1 : 2;
             }
           }
           continue;
@@ -2397,7 +2755,23 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               GuestTryLoadU32(base, tex + 7 * 4, &tex_w0) && (tex_w0 & 3u) == 2u) {
             *slot = tex;
           }
-          if (*slot == 0) {
+          if (watch != nullptr && stream >= 0x10000 &&
+              watch->count < ItemBindingWatch::kMax) {
+            watch->stream[watch->count] = stream;
+            watch->bound[watch->count] = tex;
+            ++watch->count;
+          }
+          // New San Van: the placeholder the game binds while a channel's
+          // texture is not loaded (a cell drawn before its texture package
+          // arrives) is not art to draw. The channel counts as not bound
+          // (tex_missing below); the historical registry is not consulted
+          // for it (log053: a registration does not prove liveness).
+          bool placeholder = false;
+          if (*slot != 0 && s2_world && IsPlaceholderTexture(base, *slot)) {
+            *slot = 0;
+            placeholder = true;
+          }
+          if (*slot == 0 && !placeholder) {
             const uint64_t guid =
                 (uint64_t(chan_u32(i, 0x10)) << 32) | chan_u32(i, 0x14);
             std::lock_guard<std::mutex> lock(g_texture_map_mutex);
@@ -2406,12 +2780,69 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item) {
               *slot = it->second;
             }
           }
+          if (*slot != 0 && s2_world && IsPlaceholderTexture(base, *slot)) {
+            *slot = 0;
+            placeholder = true;
+          }
+          if (placeholder) {
+            g_placeholder_slots.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (slot == &item.diffuse_tex) {
+            TraceSkate2TextureBinding(base, mesh, material,
+                (uint64_t(chan_u32(i, 0x10)) << 32) | chan_u32(i, 0x14),
+                stream, *slot, chan_u32(i, 4), chan_u32(i, 0x18));
+          }
+        }
+        // A channel that names a texture (non-zero GUID) the game has not
+        // bound or registered yet: streamed content binds a few frames after
+        // its first draw.
+        if (slot != nullptr && *slot == 0 &&
+            ((uint64_t(chan_u32(i, 0x10)) << 32) | chan_u32(i, 0x14)) != 0) {
+          if (slot == &item.diffuse_tex) {
+            item.tex_missing |= 1u;
+          } else if (slot == &item.lightmap_tex) {
+            item.tex_missing |= 2u;
+          } else if (slot == &item.chromaticity_tex) {
+            item.tex_missing |= 4u;
+          }
         }
         // No early-out: channel order varies per material and the float
         // channels ride AFTER their texture (macroOverlayUVScale follows
         // macrooverlay on the plaza asphalt, breaking once the textures
         // resolved left the macro tiling at 1.0 instead of 0.3).
       }
+      // Packed (Skate 2 mono lightmap atlas + chromaticity) by DECLARATION:
+      // a chroma page not bound yet must not turn the atlas into RGB light.
+      if (packed_channel != UINT32_MAX &&
+          (item.chromaticity_tex != 0 || (item.tex_missing & 4u) != 0)) {
+        static constexpr float selectors[4][4] = {
+            {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0},
+            {0.33f, 0.34f, 0.33f, 0}};
+        std::copy_n(selectors[packed_channel], 4, item.mono_lightmap_dot);
+        item.packed_lightmap = true;
+      }
+      // Skate 2 environmentsimple.background (DIST_skybox's distant proxy
+      // mountains) is the same S2 effect and m_params as
+      // environmentsimple.default (skater.vlt: identical attribute layout,
+      // m_params (0.4, 1, 0, 0)); the name only files it in a different
+      // collection. Unrecognized, it took the generic path, which carries no
+      // distance fog, so the km-distant hills rendered sharp above the fogged
+      // PROXY terrain in front of them. Scoped to the S2 texture namespace;
+      // native Skate 3 materials keep their own classification.
+      if (item.env_family == 0 &&
+          std::strcmp(item.material_name, "environmentsimple.background") == 0 &&
+          skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
+        item.env_family = 2;
+      }
+      // Skate 2 animated.flag (vertexanimate.fx): its own exact family 15
+      // (vertex wave in vs_main, S2 PS: packed lightmap x diffuse x
+      // g_ViewDotLight.x). Unrecognized it took the static generic path.
+      if (item.env_family == 0 &&
+          std::strcmp(item.material_name, "animated.flag") == 0 &&
+          skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
+        item.env_family = 15;
+      }
+
     }
   }
 
@@ -2451,6 +2882,8 @@ namespace {
 // Per-frame state (g_frame_draw_fetch), so this runs on every item build;
 // it is NOT part of the cacheable item core.
 void AdoptDrawFetchOverrides(uint8_t* base, DrawItem& item) {
+  if (skate3::world_loading::IsSkate2Gameplay() &&
+      !REXCVAR_GET(skate3_skate2_ad_overrides)) return;
   if (item.env_family != 0 && item.diffuse_tex != 0 && item.lightmap_tex != 0) {
     // Physical base of a fetch word-1, collapsing the 0xA0000000-style
     // cached/uncached mirrors (the channel object records the mirror
@@ -2543,7 +2976,10 @@ struct CachedItemCore {
   DrawItem item;  // draws empty, world identity, fetch overrides zero
   uint64_t fp_frame = 0;       // next fingerprint refresh (guest frames)
   uint64_t rebuild_frame = 0;  // next full rebuild
+  uint64_t last_used = 0;      // last guest frame it served (LRU at the cap)
+  ItemBindingWatch watch;      // live channel bindings the walk read
 };
+constexpr size_t kItemCacheCap = 16384;
 std::mutex g_item_cache_mutex;
 std::unordered_map<uint32_t, CachedItemCore> g_item_cache;
 
@@ -2559,6 +2995,26 @@ void ClearItemCache() {
 }
 
 namespace {
+
+// New San Van: true (and counted) when a material channel's live binding
+// changed since the walk: a texture the game unloaded falls back to its
+// low-detail copy, and the cached pointer can name the freed object, whose
+// memory the next streamed texture reuses (another texture's art drawn
+// until the 32-frame re-walk). Skate 3 maps keep the cadence.
+bool ItemRebound(uint8_t* base, const ItemBindingWatch& watch) {
+  if (watch.count == 0 || !skate3::world_loading::IsSkate2Gameplay()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < watch.count; ++i) {
+    uint32_t bound = 0;
+    GuestTryLoadU32(base, watch.stream[i], &bound);
+    if (bound != watch.bound[i]) {
+      g_item_rebinds.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+  }
+  return false;
+}
 
 bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   const uint64_t frame = g_guest_frame;
@@ -2584,7 +3040,8 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
           (BSwap32(vb_words[0]) & 0xFFFFFFFC) == core.item.vb_addr &&
           BSwap32(vb_words[2]) == core.item.vb_bytes &&
           (BSwap32(ib_words[0]) & 0xFFFFFFFC) == core.item.ib_addr &&
-          BSwap32(ib_words[2]) == core.item.ib_count) {
+          BSwap32(ib_words[2]) == core.item.ib_count &&
+          !ItemRebound(base, core.watch)) {
         // Fingerprint cadence: per frame for CPU-rewritten payloads
         // (skinned/ropa), every 4th frame otherwise (mesh_revalidate heals
         // streamed fills within that window; address reuse is caught by the
@@ -2603,6 +3060,7 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
           }
           core.fp_frame = frame + 4;
         }
+        core.last_used = frame;
         item = core.item;
         g_item_cache_hits.fetch_add(1, std::memory_order_relaxed);
         return true;
@@ -2611,7 +3069,8 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
     }
   }
   const auto walk_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
-  const bool walked = BuildItemFromMesh(base, mesh, item);
+  ItemBindingWatch watch;
+  const bool walked = BuildItemFromMesh(base, mesh, item, &watch);
   if (prof) {
     g_pw_bi_walk.Add(PerfNsSince(walk_t0));
   }
@@ -2620,21 +3079,144 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   }
   g_item_cache_builds.fetch_add(1, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_item_cache_mutex);
-  if (g_item_cache.size() >= 16384) {
-    // Runaway growth backstop (streaming churn over a long session): drop
-    // everything and let the next frames rebuild, one frame of full walks.
-    g_item_cache.clear();
+  if (g_item_cache.size() >= kItemCacheCap) {
+    // Streaming keeps adding mesh addresses over a long session: drop the
+    // least recently used eighth (one scan per kItemCacheCap / 8 new
+    // entries). Clearing the whole cache made the next frame re-walk every
+    // visible item at once, a recurring hitch late in a session.
+    std::vector<std::pair<uint64_t, uint32_t>> ages;
+    ages.reserve(g_item_cache.size());
+    for (const auto& [cached_mesh, cached] : g_item_cache) {
+      ages.emplace_back(cached.last_used, cached_mesh);
+    }
+    const size_t drop = ages.size() / 8;
+    std::nth_element(ages.begin(), ages.begin() + drop, ages.end());
+    for (size_t i = 0; i < drop; ++i) {
+      g_item_cache.erase(ages[i].second);
+    }
   }
   CachedItemCore core;
   core.item = item;
+  core.watch = watch;
+  core.last_used = frame;
   core.fp_frame = frame + 4;
   // Materials with an unresolved diffuse retry the full walk quickly: CAS
   // composites and streamed channel textures bind shortly after first sight
   // (ocean.default legitimately has no diffuse and just rebuilds often,
   // a handful of items).
-  core.rebuild_frame = frame + (item.diffuse_tex != 0 ? 32 : 2);
+  // Packed lightmap/chroma channels still unbound re-walk as quickly.
+  const bool channels_pending =
+      item.diffuse_tex == 0 || (item.packed_lightmap && (item.tex_missing & 6u) != 0);
+  core.rebuild_frame = frame + (channels_pending ? 2 : 32);
   g_item_cache[mesh] = std::move(core);
   return true;
+}
+
+// New San Van: Skate 2's own effect for the S2 materials that have no exact
+// Skate 3 family (or, for incandescent.default / backlituvscroll, a Skate 3
+// family with different parameters). Effect names and m_params come from
+// Skate 2's skater.vlt/bin (out/research/log083/s2_material_effects.py:
+// the collection layout's effect-name pointer, parent m_params inherited);
+// blend/depth/alpha states from the effects' technique XMLs. Applied per
+// frame on the item copy (never the cached core), only during Skate 2
+// gameplay and only for S2-namespace art, so native Skate 3 worlds keep
+// their classification.
+void ApplySkate2Material(DrawItem& item) {
+  if (item.skinned || (uint32_t(item.diffuse_guid) & ~1u) != 0x03E3870Au) {
+    return;
+  }
+  struct Row {
+    const char* name;
+    uint8_t family;
+    uint8_t blend;
+    float lm_weight;
+    float mult;
+    float alpha_ref;
+  };
+  static constexpr Row kRows[] = {
+      // baseincandescent: D^2 * lerp(1, LM, x) * y, no shadow receive.
+      {"incandescent.default", 16, 0, 0.0f, 10.0f, 0.0f},
+      {"incandescent.backlit", 16, 0, 0.75f, 1.0f, 0.0f},
+      {"incandescent.videoscreen", 16, 0, 0.0f, 1.0f, 0.0f},
+      // zbiasincandescent: ONE/ONE additive, z-write, DEPTHBIAS -0.0001.
+      {"incandescent.incandescentzbias", 16, 1, 0.0f, 10.0f, 0.0f},
+      // zbiasincandescentbacklit: opaque, ALPHAREF 16, DEPTHBIAS -0.0001
+      // (parent incandescent.backlit's m_params).
+      {"incandescent.backlitzbias", 16, 0, 0.75f, 1.0f, 16.0f / 255.0f},
+      // transparentincandescent: ONE/ONE additive, z-write.
+      {"incandescent.transparent", 16, 2, 0.0f, 0.3f, 0.0f},
+      // scrollincandescent keeps family 14 with the backlit m_params.
+      {"incandescent.backlituvscroll", 14, 0, 0.75f, 1.0f, 0.0f},
+      // glare: ONE/ONE additive, no z-write, ALPHAREF 1.
+      {"glare.default", 17, 3, 0.0f, 0.0f, 1.0f / 255.0f},
+      // godrayspotlight: ONE/ONE additive, no z-write, cull FRONT.
+      {"godray.spotlight", 18, 4, 0.0f, 0.0f, 0.0f},
+      // decalzbias (decal.default overlay prints: logos, stencils): lit like
+      // baseenvironment with shadow receive, SRCALPHA/INVSRCALPHA blend by
+      // the diffuse alpha, ALPHAREF 16, z-write, DEPTHBIAS -0.0001 slope 1.
+      // Drawn opaque with the generic 0.35 alpha test, soft alpha edges
+      // became hard speckled cutouts.
+      {"decal.default", 0, 5, 0.0f, 1.0f, 16.0f / 255.0f},
+  };
+  for (const Row& r : kRows) {
+    if (std::strcmp(item.material_name, r.name) == 0) {
+      if (r.family == 17 && item.glare_scale <= 0.0f) {
+        return;  // no sprite size: leave the legacy path
+      }
+      item.env_family = r.family;
+      item.s2_blend = r.blend;
+      item.s2_lm_weight = r.lm_weight;
+      item.s2_mult = r.mult;
+      item.s2_alpha_ref = r.alpha_ref;
+      item.s2_video = std::strcmp(r.name, "incandescent.videoscreen") == 0;
+      return;
+    }
+  }
+  // Skate 2 effects with no alpha test in their technique XMLs
+  // (baseenvironment, defaultenvironment, decalenvironment, baseterrain,
+  // decalterrain, advertisement, building_ceiling_worldspace, proxyworld):
+  // opaque whatever the diffuse alpha holds. The world ALPHAREF our exact
+  // families apply (Skate 3's own world techniques test at 30) cut holes
+  // wherever Skate 2 art keeps a distressed alpha edge: the static-like
+  // speckled strips on the Stadium's BLACK BOX pole flags
+  // (environment.default, diffuse obj_sign_sponsblackboxhoriz_01_ot_d).
+  static constexpr const char* kNoAlphaTest[] = {
+      "environment.default", "environmentsimple.default", "environment.decal",
+      "terrain.default",     "terrain.decal",             "advertisement.default",
+      "building.default",    "proxyworld.default"};
+  for (const char* name : kNoAlphaTest) {
+    if (std::strcmp(item.material_name, name) == 0) {
+      item.s2_no_alpha_test = true;
+      break;
+    }
+  }
+  // transparentenvironment.xml: SRCALPHA/INVSRCALPHA with z-write ON and
+  // CULLMODE FRONT (ALPHAREF 16 on a^2); the blended sub-pass draws these
+  // with that state (pso_s2_trans) instead of Skate 3's cull-none,
+  // z-write-off transparent state.
+  if (std::strcmp(item.material_name, "environment.transparent") == 0) {
+    item.s2_trans_zwrite = true;
+  }
+  // Effects whose PS ends in GetSpecularTerm (the render.big shader
+  // sources): sun phong + `environment` cube reflection, fresnel-weighted.
+  // defaultenvironment (environmentsimple) has no spec term at all.
+  static constexpr const char* kSpecTerm[] = {"environment.default", "environment.decal",
+                                              "building.default", "environment.transparent"};
+  for (const char* name : kSpecTerm) {
+    if (std::strcmp(item.material_name, name) == 0) {
+      item.s2_env = true;
+      break;
+    }
+  }
+  // building_ceiling_worldspace: the environment.default lighting (shadowed
+  // lightmap, kd, spec) plus the interior-ceiling strip behind the glass
+  // (floorHeightMeters > 0 marks it in the shader). Without the family the
+  // generic path alpha-clipped the glass away.
+  if (std::strcmp(item.material_name, "building.default") == 0 &&
+      item.floor_height > 0.0f && item.diffuse2_tex != 0) {
+    item.env_family = 1;
+    if (item.floor_count <= 0.0f) item.floor_count = 1.0f;
+  }
 }
 
 bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
@@ -2643,8 +3225,10 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
-  const uint32_t mesh = REX_LOAD_U32(record);
-  if (!GuestReadableApprox(base, mesh)) {
+  uint32_t mesh = 0, vdesc = 0;
+  if (!GuestTryLoadU32(base, record, &mesh) || !GuestReadableApprox(base, mesh) ||
+      !GuestTryLoadU32(base, mesh + kMeshVertexDescriptor, &vdesc) ||
+      StaleDrawChain(base, ctx, record, mesh, vdesc)) {
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -2656,6 +3240,61 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
   }
   if (!built) {
     return false;
+  }
+  if (REXCVAR_GET(skate3_skate2_hide_inherited_backdrop) &&
+      skate3::world_loading::IsSkate2Gameplay() &&
+      skate3::world_loading::IsInheritedBackdrop(item.diffuse_guid, item.env_family)) {
+    static std::atomic<uint32_t> hidden{0};
+    if (hidden.fetch_add(1) < 8)
+      REXLOG_INFO("world-inherited-backdrop: suppressed mesh={:08X} guid={:016X}", item.mesh, item.diffuse_guid);
+    return false;
+  }
+  // New San Vanelona sky choice (skate3_skate2_sky=false): Skate 2's sky dome
+  // is Skate 3's DIST_skybox dome scaled 1.25 with the same UVs, so it is drawn
+  // with Skate 3's sky textures (world_loading::PrepareSky): the University
+  // panorama, which carries Skate 3's clouds, and its sun gradient. The night
+  // sky (skate3_skate2_night) is the Sanitarium's DIST_skyboxnightdlc, the
+  // same dome at Skate 2's scale: its night panorama and moon gradient.
+  // Skate 2's cloud layer (the dome's detail texture) is dropped. The dome
+  // model's distant mountains and billboards are not sky.* and are untouched.
+  if (item.unlit && skate3::world_loading::IsSkate2Gameplay() &&
+      skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid) &&
+      std::strcmp(item.material_name, "sky.default") == 0) {
+    uint32_t diffuse = 0, specular = 0;
+    if (skate3::world_loading::DomeSkyTextures(&diffuse, &specular)) {
+      item.diffuse_tex = diffuse;
+      item.spec_tex = specular;
+      item.detail_tex = 0;
+      static std::atomic<bool> logged{false};
+      if (!logged.exchange(true))
+        REXLOG_INFO("skate2-sky: Skate 2 dome mesh={:08X} drawn with {} sky textures", item.mesh,
+                    skate3::world_loading::NightSky() ? "the Sanitarium's night" : "Skate 3's");
+    }
+  }
+  if (skate3::world_loading::IsSkate2Gameplay()) {
+    ApplySkate2Material(item);
+  }
+  // Inherited-asset audit (always on, bounded): every static world mesh drawn
+  // in New San Van should carry Skate 2 art (IsSkate2TextureNamespace).
+  // Record each distinct foreign diffuse identity once, so any Skate 3 asset
+  // reaching the scene is named in the log. Evidence only; nothing is hidden
+  // here.
+  if (skate3::world_loading::IsSkate2Gameplay() && item.diffuse_guid != 0 && !item.skinned &&
+      !skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
+    static std::mutex audit_mutex;
+    static std::unordered_set<uint64_t> audited;
+    std::lock_guard lock(audit_mutex);
+    if (REXCVAR_GET(skate3_skate2_texture_probe) && audited.size() < 256 && audited.insert(item.diffuse_guid).second) {
+      // Placed props carry mesh-local bounds; the instance translation
+      // (when the context has one) says where the prop actually stands.
+      float w[16];
+      const bool placed = ReadCtxInstanceWorld(base, ctx, w);
+      REXLOG_WARN("bam-foreign-item: mesh={:08X} guid={:016X} material={} family={} bbox=({:.0f},{:.0f},{:.0f})..({:.0f},{:.0f},{:.0f}) at=({:.0f},{:.0f},{:.0f})",
+                  item.mesh, item.diffuse_guid, item.material_name, item.env_family,
+                  item.bbox_min[0], item.bbox_min[1], item.bbox_min[2],
+                  item.bbox_max[0], item.bbox_max[1], item.bbox_max[2],
+                  placed ? w[12] : 0.0f, placed ? w[13] : 0.0f, placed ? w[14] : 0.0f);
+    }
   }
   // Draw-time fetch overrides are per-frame state, applied after the cached
   // core, on every build.
@@ -2712,6 +3351,13 @@ void FlushTextureCache() { g_flush_textures.store(true, std::memory_order_relaxe
 void RequestSceneRingDump() {
   g_scene_ring_dump.store(true, std::memory_order_release);
 }
+void RequestCharDump() {
+  g_char_dump_frames.store(4, std::memory_order_release);
+}
+void RequestLightHistory(uint32_t marker) {
+  g_light_history_marker.store(std::max(marker, 1u), std::memory_order_release);
+  g_pick_request.store(true, std::memory_order_release);
+}
 void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
 
 // RecordBoneSignal / RecordCameraSignal: native/skate3_native_diagnostics.cpp.
@@ -2761,6 +3407,25 @@ void OnRegisterTexture(uint64_t guid, uint32_t texture) {
   }
   std::lock_guard<std::mutex> lock(g_texture_map_mutex);
   g_texture_map[guid & kGuidMask] = texture;
+  if ((guid & kGuidMask) == kMissingTextureGuid) {
+    RememberPlaceholderTexture(texture);
+  }
+  if (REXCVAR_GET(skate3_skate2_texture_probe) &&
+      (guid & kGuidMask) == 0x4E8AAC7B89E95463ull) {
+    REXLOG_INFO("world-texture-placeholder: guid={:016X} object={:08X}", guid, texture);
+  }
+}
+
+void OnUnregisterTexture(uint64_t guid, uint32_t texture) {
+  if (texture == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_texture_map_mutex);
+  const auto it = g_texture_map.find(guid & kGuidMask);
+  if (it != g_texture_map.end() && it->second == texture) {
+    g_texture_map.erase(it);
+    g_tex_unregistered.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void OnMeshRegistered(uint8_t* base, uint32_t mesh) {
@@ -2891,6 +3556,66 @@ struct PfxCapture {
   bool vs_seen;
 };
 PfxCapture g_pfx_cap[kPfxPassCount] = {};
+// postfx_basictex_fisheye_noisePS (the left-trigger slow-motion bail "video"
+// look, run 093 census): the same fisheye rows plus f_NoiseScroll c3,
+// f_NoiseFade c4, f_NoiseDotP1/P2 c5/c6 and f_noise_texture (tf5). Captured
+// alongside kPfxFisheye whenever the noise variant draws.
+PfxCapture g_pfx_noise_cap = {};
+
+// Slow-motion draw-order probe: the last (guest frame, draw sequence) of the
+// game's visualfx / uber / fisheye / fisheye_noise / defaulthom (HoM bones)
+// / projected_tex draws. Tells whether the game draws the Hall of Meat bones
+// AFTER its postfx chain (bones stay coloured over the B&W filter).
+enum PfxOrderSlot { kOrdVisualFx, kOrdUber, kOrdFisheye, kOrdNoise, kOrdHom, kOrdProjTex, kOrdCount };
+uint64_t g_pfx_order_frame[kOrdCount] = {};
+uint64_t g_pfx_order_seq[kOrdCount] = {};
+int PfxOrderSlotOf(uint8_t* base, uint32_t obj) {
+  if (obj == 0 || !GuestReadableApprox(base, obj)) {
+    return -1;
+  }
+  static std::unordered_map<uint32_t, int> cache;  // guest render thread
+  auto it = cache.find(obj);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  char text[112] = {};
+  for (int k = 0; k < 111; ++k) {
+    text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+    if (text[k] == 0) break;
+  }
+  int slot = -1;
+  if (std::strstr(text, "postfx_visualfxPS")) slot = kOrdVisualFx;
+  else if (std::strstr(text, "postfx_uberPS")) slot = kOrdUber;
+  else if (std::strstr(text, "postfx_basictex_fisheye_noise")) slot = kOrdNoise;
+  else if (std::strstr(text, "postfx_basictex_fisheye")) slot = kOrdFisheye;
+  else if (std::strstr(text, "defaulthom_")) slot = kOrdHom;
+  else if (std::strstr(text, "postfx_projected_tex")) slot = kOrdProjTex;
+  if (cache.size() < 4096) {
+    cache.emplace(obj, slot);
+  }
+  return slot;
+}
+
+bool IsFisheyeNoiseShader(uint8_t* base, uint32_t obj) {
+  if (obj == 0 || !GuestReadableApprox(base, obj)) {
+    return false;
+  }
+  static std::unordered_map<uint32_t, bool> cache;  // guest render thread
+  auto it = cache.find(obj);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  char text[112] = {};
+  for (int k = 0; k < 111; ++k) {
+    text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+    if (text[k] == 0) break;
+  }
+  const bool noise = std::strstr(text, "postfx_basictex_fisheye_noise") != nullptr;
+  if (cache.size() < 4096) {
+    cache.emplace(obj, noise);
+  }
+  return noise;
+}
 
 
 void OnPhotoGrabRequest() {
@@ -2998,6 +3723,11 @@ void CapturePfxConstants(uint8_t* base, uint32_t bank_ptr, uint32_t device,
     cap.ps_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     PerfClock::now().time_since_epoch())
                     .count();
+    if (pass == kPfxFisheye &&
+        (IsFisheyeNoiseShader(base, g_cur_ps_obj.load(std::memory_order_relaxed)) ||
+         IsFisheyeNoiseShader(base, g_cur_vs_obj.load(std::memory_order_relaxed)))) {
+      g_pfx_noise_cap = cap;
+    }
   } else {
     for (int r = 0; r < 8; ++r) {
       for (int i = 0; i < 4; ++i) {
@@ -3146,19 +3876,21 @@ uint32_t Phase2dFlags() {
 
 
 // Guest render thread only: per-object cached debug-path classifier
-// (same pattern as ClassifySplineShader).
-bool IsCasEditorPs(uint8_t* base, uint32_t obj) {
+// (same pattern as ClassifySplineShader). The same lookup tags the traffic
+// light lamp shaders (trafficlight_one/two_default*, see OnDrawDone's lamp
+// rows): bit 0 = CAS editor PS, bits 1-2 = traffic light family 1/2.
+uint8_t ClassifyBoundShader(uint8_t* base, uint32_t obj) {
   if (obj < 0x10000) {
-    return false;
+    return 0;
   }
-  static std::unordered_map<uint32_t, bool> cache;
+  static std::unordered_map<uint32_t, uint8_t> cache;
   auto it = cache.find(obj);
   if (it != cache.end()) {
     return it->second;
   }
   char text[97] = {};
   if (!GuestTryCopy(text, base + obj + 0x54, 96)) {
-    return false;  // not cached: unreadable now may be readable later
+    return 0;  // not cached: unreadable now may be readable later
   }
   text[96] = '\0';
   const char* leaf = std::strrchr(text, '\\');
@@ -3167,11 +3899,15 @@ bool IsCasEditorPs(uint8_t* base, uint32_t obj) {
       std::strstr(leaf, "_nis") != nullptr &&
       (std::strncmp(leaf, "cacstamp_", 9) == 0 || std::strncmp(leaf, "cac_", 4) == 0 ||
        std::strncmp(leaf, "defaultcharacter_", 17) == 0);
+  const uint8_t traffic = std::strncmp(leaf, "trafficlight_one_", 17) == 0   ? 1
+                          : std::strncmp(leaf, "trafficlight_two_", 17) == 0 ? 2
+                                                                             : 0;
+  const uint8_t tags = uint8_t((cas ? 1u : 0u) | (traffic << 1));
   if (cache.size() > 4096) {
     cache.clear();
   }
-  cache.emplace(obj, cas);
-  return cas;
+  cache.emplace(obj, tags);
+  return tags;
 }
 
 void OnSetShader(bool pixel, uint32_t obj) {
@@ -3182,7 +3918,10 @@ void OnSetShader(bool pixel, uint32_t obj) {
   // left the heartbeat dead (the *_nisPS debug paths arrive on the other
   // label), which blackholed the startup-flow editor.
   uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
-  if (base != nullptr && IsCasEditorPs(base, obj)) {
+  const uint8_t tags = base != nullptr ? ClassifyBoundShader(base, obj) : 0;
+  (pixel ? g_cur_ps_traffic : g_cur_vs_traffic).store(uint8_t(tags >> 1),
+                                                      std::memory_order_relaxed);
+  if ((tags & 1u) != 0) {
     g_cas_ps_last_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now().time_since_epoch())
                                .count(),
@@ -3191,7 +3930,7 @@ void OnSetShader(bool pixel, uint32_t obj) {
 }
 
 // The CAS editor is ON SCREEN now: its own "_nis" pixel shaders were set
-// within the last 0.5 s (see IsCasEditorPs). Consumed by the portrait-pass
+// within the last 0.5 s (see ClassifyBoundShader). Consumed by the portrait-pass
 // publish gate and the takeover gates; the STARTUP-flow editor's scene is
 // small (below warmup_min_items) and can look like a portrait pass, so the
 // gates need to know the editor is up.
@@ -3372,10 +4111,13 @@ void OnSetScissor(uint8_t* base, uint32_t rect_ptr) {
   }
 }
 
-// The character.hair pixel shader keeps the per-character hair color at PS
-// c17 (fixed layout for that shader; verified from recorded PS banks;
-// c16/c17 hold the dark ambient/diffuse hair color pair while other
-// registers carry lighting globals). Used as captured.
+// The character.hair pixel shader (cac_hair_defaultPS) keeps the
+// per-character hair color at PS c16 = i_modulateColor1 (its constant
+// table, out/research/log084/s3_disasm): the ucode multiplies the lit
+// diffuse by c16, while c17 = i_modulateColor2 tints only the strand
+// highlight. Reading c17 here tinted the legacy-path hair with its
+// highlight color (light hair in place of the chosen color). Used as
+// captured.
 void CaptureHairTint(uint8_t* base, DrawItem& item) {
   const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
   if (ps == 0) {
@@ -3383,7 +4125,7 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
   }
   float rgb[3];
   for (int i = 0; i < 3; ++i) {
-    rgb[i] = LoadGuestF32(base, ps + (17 * 4 + i) * 4);
+    rgb[i] = LoadGuestF32(base, ps + (16 * 4 + i) * 4);
     if (!(rgb[i] >= 0.0f && rgb[i] <= 4.0f)) {
       return;  // implausible bank contents; keep the previous/no tint
     }
@@ -3392,6 +4134,88 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
     item.tint[i] = rgb[i];
   }
   item.tint[3] = 1.0f;
+}
+
+// visualindicator_defaultPS rows (constant table, out/research/log084/
+// s3_disasm): g_envattributes c0..c2 (exposure c2.x), i_colortint c3,
+// m_params c4 (multiplier .y). Only trusted when this mesh's own draw
+// flushed the bank. Logged (bounded) so the Hall of Meat overlays can be
+// located and their states compared against the emulated frame.
+// cacstamp_skin tattoo-UV rows (see DrawItem::stamp_uv), read from the
+// accepted palette's bank right after the bone array. Remembered per mesh
+// so fixup/rescue copies that skip this capture still map the tattoo.
+std::mutex g_stamp_uv_mutex;
+std::unordered_map<uint32_t, std::array<float, 6>> g_stamp_uv;
+std::unordered_map<uint32_t, std::array<uint32_t, 12>> g_stamp_fetch;
+// defaulthom: the draw's own tf3 (i_diffuse) fetch words per HoM mesh.
+std::unordered_map<uint32_t, std::array<uint32_t, 6>> g_hom_fetch;
+void CaptureStampUv(uint8_t* base, uint32_t bank, uint32_t palette_base,
+                    DrawItem& item) {
+  if (std::strcmp(item.material_name, "character.skin") != 0 ||
+      palette_base == 0) {
+    return;
+  }
+  const uint32_t r0 = palette_base + 183u;
+  std::array<float, 6> m{};
+  for (int r = 0; r < 2; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      m[r * 3 + c] = LoadGuestF32(base, bank + ((r0 + uint32_t(r)) * 4 + uint32_t(c)) * 4);
+    }
+  }
+  bool ok = true;
+  for (float f : m) ok = ok && f > -64.0f && f < 64.0f;
+  ok = ok && std::fabs(m[0] * m[4] - m[1] * m[3]) > 1e-6f;
+  static std::atomic<uint32_t> logs{0};
+  if (REXCVAR_GET(skate3_native_render_scene_character_log) && logs.fetch_add(1, std::memory_order_relaxed) < 12) {
+    REXLOG_INFO("native-stamp: skin mesh={:08X} palette_base={} rows c{}..c{} = "
+                "({:.4f},{:.4f},{:.4f}) ({:.4f},{:.4f},{:.4f}) valid={} decal={:08X} "
+                "decal2={:08X}",
+                item.mesh, palette_base, r0, r0 + 1, m[0], m[1], m[2], m[3], m[4],
+                m[5], ok, item.decal_art, item.decal2_art);
+  }
+  if (!ok) {
+    return;
+  }
+  std::copy(m.begin(), m.end(), item.stamp_uv);
+  item.stamp_uv_valid = true;
+  std::lock_guard lock(g_stamp_uv_mutex);
+  if (g_stamp_uv.size() > 256) g_stamp_uv.clear();
+  g_stamp_uv[item.mesh] = m;
+}
+
+void CaptureIndicatorRows(uint8_t* base, DrawItem& item, bool own_bank) {
+  const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
+  if (ps == 0 || !own_bank) {
+    return;
+  }
+  float tint[4];
+  for (int i = 0; i < 4; ++i) {
+    tint[i] = LoadGuestF32(base, ps + (3 * 4 + i) * 4);
+  }
+  const float mult = LoadGuestF32(base, ps + (4 * 4 + 1) * 4);
+  const float expo = LoadGuestF32(base, ps + (2 * 4 + 0) * 4);
+  bool ok = mult > 0.0f && mult < 64.0f && expo > 0.05f && expo < 16.0f;
+  for (int i = 0; i < 4 && ok; ++i) {
+    ok = tint[i] >= 0.0f && tint[i] < 64.0f;
+  }
+  if (ok) {
+    std::copy_n(tint, 4, item.ind_tint);
+    item.ind_mult = mult;
+    item.ind_expo = expo;
+    item.ind_valid = true;
+  }
+  static std::mutex log_mutex;
+  static std::unordered_set<uint32_t> logged;
+  std::lock_guard lock(log_mutex);
+  if (logged.size() < 48 && logged.insert(item.mesh).second) {
+    REXLOG_INFO("native-indicator: mesh={:08X} ctx={:08X} material={} skinned={} "
+                "pending={} valid={} tint=({:.3f},{:.3f},{:.3f},{:.3f}) mult={:.3f} "
+                "expo={:.3f} world=({:.2f},{:.2f},{:.2f}) bbox=({:.2f},{:.2f},{:.2f})..({:.2f},{:.2f},{:.2f})",
+                item.mesh, item.ctx, item.material_name, item.skinned, item.pending, ok,
+                tint[0], tint[1], tint[2], tint[3], mult, expo, item.world[12],
+                item.world[13], item.world[14], item.bbox_min[0], item.bbox_min[1],
+                item.bbox_min[2], item.bbox_max[0], item.bbox_max[1], item.bbox_max[2]);
+  }
 }
 
 // Character-family lighting capture: reads the family-specific rows of the
@@ -3405,8 +4229,9 @@ void CaptureHairTint(uint8_t* base, DrawItem& item) {
 //   livingworld_stamp (fam 3): light c9, key c15, FLAT ambient = c19.w *
 //     (0.1, 0.175, 0.3) (shader literal), exposure c13.z, alpha c21.x, stamp
 //     recolor tints c22 (red mask) / c23 (blue mask).
-//   cac_hair (fam 4): light c4, key c16, ambient c14.w * 0.25, fresnel tint
-//     c17 with power c11.w, exposure c8.z, strand-alpha scale c15.x.
+//   cac_hair (fam 4): light c4, key (hair color) c16, ambient c14.w * 0.25,
+//     Kajiya-Kay strand-highlight tint c17 with power c11.w, world-shadow
+//     floor c3.w, exposure c8.z, strand-alpha scale c15.x.
 //   defaulthair (fam 5): light c4, key c15, ambient c14.w * 0.25, fresnel
 //     tint c10 with power c9.z, exposure c8.z, strand-alpha scale c16.x.
 //   vehicle (fam 6, character.livingworld_vehicles): light c9, key c15
@@ -3457,6 +4282,80 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   float* d = local;
   std::memset(local, 0, sizeof(local));
   uint8_t fam = item.char_family;
+  if (fam == 8) {
+    // Hall of Meat bones, defaulthom_defaultPS (constant table +
+    // ucode, out/research/log084/s3_disasm): i_boneClr c3 (the red/white
+    // break color), i_colorParams c4 (.x core mix, .y diffuse floor),
+    // m_params c1..c2 (c1.y multiplier, c2.w rim power), no exposure.
+    // Canonical rows: tintA = boneClr (w = 1), tintB.xy = colorParams,
+    // tintB.z = m_params[0].y, light.w = rim power, key.w = 1.
+    float clr[3];
+    bool ok = true;
+    for (int c = 0; c < 3; ++c) {
+      clr[c] = row(3u, uint32_t(c));
+      ok = ok && clr[c] >= 0.0f && clr[c] < 64.0f;
+    }
+    const float cp_x = row(4u, 0), cp_y = row(4u, 1);
+    const float m0y = row(1u, 1), pw = row(2u, 3);
+    ok = ok && cp_x >= 0.0f && cp_x < 64.0f && cp_y >= 0.0f && cp_y < 64.0f &&
+         m0y > 0.0f && m0y < 64.0f && pw >= 0.0f && pw < 512.0f;
+    static std::atomic<uint32_t> hom_logs{0};
+    if (REXCVAR_GET(skate3_native_render_scene_character_log) && hom_logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+      REXLOG_INFO("native-hom: mesh={:08X} boneClr=({:.3f},{:.3f},{:.3f}) colorParams=({:.3f},"
+                  "{:.3f}) m0y={:.3f} rim_pow={:.3f} valid={}",
+                  item.mesh, clr[0], clr[1], clr[2], cp_x, cp_y, m0y, pw, ok);
+    }
+    if (!ok) {
+      return;
+    }
+    // The draw's own i_diffuse (tf3) binding, as for the skin overlay: the
+    // bone art the game samples may not be the material channel's diffuse
+    // (run 090: pale pink patches where the core term lerps toward D^2).
+    {
+      const uint32_t device = g_device.load(std::memory_order_relaxed);
+      uint32_t w[6];
+      if (device != 0 && GuestTryCopy(w, REX_RAW_ADDR(device + 0x480 + 3 * 24), sizeof(w))) {
+        for (uint32_t& v : w) v = BSwap32(v);
+        if ((w[0] & 3u) == 2u && w[1] != 0) {
+          uint32_t mw1 = 0, mw2 = 0;
+          const bool mat_ok = item.diffuse_tex != 0 &&
+                              GuestTryLoadU32(base, item.diffuse_tex + 8 * 4, &mw1) &&
+                              GuestTryLoadU32(base, item.diffuse_tex + 9 * 4, &mw2);
+          std::lock_guard lock(g_stamp_uv_mutex);
+          if (g_hom_fetch.size() > 256) g_hom_fetch.clear();
+          auto& slot = g_hom_fetch[item.mesh];
+          const bool changed = slot[1] != w[1] || slot[2] != w[2];
+          std::copy_n(w, 6, slot.begin());
+          std::copy_n(w, 6, item.diffuse_fetch);
+          static std::atomic<uint32_t> tex_logs{0};
+          if (changed && REXCVAR_GET(skate3_native_render_scene_character_log) &&
+              tex_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+            REXLOG_INFO(
+                "native-hom-tex: mesh={:08X} tf3=[{:08X} {:08X} {:08X}] fmt={} {}x{} "
+                "material_diffuse={:08X} w1={:08X} {}x{} same={}",
+                item.mesh, w[0], w[1], w[2], w[1] & 0x3Fu, (w[2] & 0x1FFFu) + 1,
+                ((w[2] >> 13) & 0x1FFFu) + 1, item.diffuse_tex, mw1,
+                mat_ok ? (mw2 & 0x1FFFu) + 1 : 0u, mat_ok ? ((mw2 >> 13) & 0x1FFFu) + 1 : 0u,
+                mat_ok && (mw1 & 0x1FFFF000u) == (w[1] & 0x1FFFF000u));
+          }
+        }
+      }
+    }
+    d[3] = pw;
+    d[7] = 1.0f;
+    d[12 * 4 + 0] = clr[0];
+    d[12 * 4 + 1] = clr[1];
+    d[12 * 4 + 2] = clr[2];
+    d[12 * 4 + 3] = 1.0f;
+    d[13 * 4 + 0] = cp_x;
+    d[13 * 4 + 1] = cp_y;
+    d[13 * 4 + 2] = m0y;
+    d[14 * 4 + 0] = 1.0f;
+    d[14 * 4 + 1] = 8.0f;
+    std::memcpy(item.char_rows, local, sizeof(item.char_rows));
+    g_char_valid.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   // `plus` = register-row shift for the create-a-skater EDITOR compiles of
   // the fam-2 shaders (cacstamp_/cac_*_nisPS + the ropa variants): the whole
   // cacstamp layout sits ONE ROW HIGHER there: light c10, key c16, exposure
@@ -3568,6 +4467,18 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
         d[12 * 4 + 2] = tint[2];
         d[12 * 4 + 3] = 1.0f;
       }
+      // cacstamp second-stamp opacity i_params.z (c22.z; editor c23.z):
+      // cacstamp_skin_defaultPS blends the decal2 overlay by its alpha x
+      // this. Rides the flat-ambient red slot, which fams 1/2 never read
+      // (their ambient is the SH rows), so every row-cache restore keeps it.
+      const float op = row(22u + plus, 2);
+      d[2 * 4 + 0] = op >= 0.0f && op <= 1.0f ? op : 0.0f;
+      // Clothing dirt level i_params.y (c22.y): cac_cloth_defaultPS lerps the
+      // tinted diffuse toward its decal2 dirt texture by dirt.a x this (run
+      // 090: 0 -> 0.97 over repeated bails). Rides the flat-ambient green
+      // slot (unused by fams 1/2 like the red one above).
+      const float dirt = row(22u + plus, 1);
+      d[2 * 4 + 1] = dirt >= 0.0f && dirt <= 1.0f ? dirt : 0.0f;
     }
     // Material multiplier m_params[0].y (defaultcharacter c5.y / cacstamp
     // c14.y): the PS multiplies the lit color by it before the tone chain
@@ -3669,13 +4580,22 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     // Hair: flat ambient scalar + fresnel rim tint, strand-alpha scale.
     const float amb = row(14u, 3) * 0.25f;
     d[2 * 4 + 3] = std::clamp(amb, 0.0f, 4.0f);
-    d[3] = std::clamp(row(fam == 4 ? 11u : 9u, fam == 4 ? 3u : 2u), 1.0f, 64.0f);
+    // Highlight power: cac_hair's Kajiya-Kay exponent (c11.w, authored up
+    // to a few hundred) / defaulthair's fresnel power (c9.z).
+    d[3] = std::clamp(row(fam == 4 ? 11u : 9u, fam == 4 ? 3u : 2u), 1.0f,
+                      fam == 4 ? 512.0f : 64.0f);
     const uint32_t fres_r = fam == 4 ? 17u : 10u;
     for (int c = 0; c < 3; ++c) {
       d[13 * 4 + c] = std::clamp(row(fres_r, uint32_t(c)), 0.0f, 8.0f);
     }
     d[13 * 4 + 3] = std::clamp(row(fam == 4 ? 15u : 16u, 0), 0.0f, 4.0f);
     d[14 * 4 + 0] = 1.0f;
+    if (fam == 4) {
+      // cac_hair: the world-shadow floor g_CSMSelfBias.w (c3.w; the ucode
+      // takes max(shadow, c3.w)). Rides the fam-1/2-only lens-flag slot.
+      const float floor_w = row(3u, 3);
+      d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
+    }
   }
   d[14 * 4 + 1] = float(fam);
   // Frame-global character CSM receive biases: one row below the light row
@@ -3698,6 +4618,76 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   }
   std::memcpy(item.char_rows, local, sizeof(item.char_rows));
   g_char_valid.fetch_add(1, std::memory_order_relaxed);
+  // Cloth-family stamp evidence (cacstamp_cloth: tf5 graphic, tf6 dirt,
+  // dirt level i_params.y = c22.y; cac_cloth: tf5 dirt only): log the
+  // draw's bindings and level on change (bounded) to port the dirt layer.
+  if (fam == 2 && std::strcmp(item.material_name, "character.skin") != 0 &&
+      std::strcmp(item.material_name, "character.face") != 0) {
+    const uint32_t device = g_device.load(std::memory_order_relaxed);
+    uint32_t w[12];
+    if (device != 0 && GuestTryCopy(w, REX_RAW_ADDR(device + 0x480 + 5 * 24), sizeof(w))) {
+      for (uint32_t& v : w) v = BSwap32(v);
+      const float dirt = row(22u + plus, 1);
+      static std::mutex cl_mutex;
+      static std::unordered_map<uint32_t, std::pair<uint64_t, float>> last;
+      std::lock_guard lock(cl_mutex);
+      auto& l = last[item.mesh];
+      const uint64_t key = (uint64_t(w[1]) << 32) | w[7];
+      static std::atomic<uint32_t> cl_logs{0};
+      if ((l.first != key || std::fabs(l.second - dirt) > 0.02f) &&
+          REXCVAR_GET(skate3_native_render_scene_character_log) && cl_logs.fetch_add(1, std::memory_order_relaxed) < 96) {
+        REXLOG_INFO("native-cloth: mesh={:08X} material={} tf5=[{:08X} {:08X} {:08X}] "
+                    "tf6=[{:08X} {:08X} {:08X}] dirt={:.3f} decal={:08X} decal2={:08X}",
+                    item.mesh, item.material_name, w[0], w[1], w[2], w[6], w[7], w[8],
+                    dirt, item.decal_art, item.decal2_art);
+      }
+      l = {key, dirt};
+    }
+  }
+  // cacstamp_skin: record the draw's own stamp fetch slots (tf6 tattoo,
+  // tf7 overlay; same slots in the editor _nis compile). The rows just
+  // validated as this shader's bank, so the device fetch shadow holds this
+  // draw's bindings.
+  if (fam == 2 && std::strcmp(item.material_name, "character.skin") == 0) {
+    const uint32_t device = g_device.load(std::memory_order_relaxed);
+    uint32_t w[12];
+    if (device != 0 && GuestTryCopy(w, REX_RAW_ADDR(device + 0x480 + 6 * 24), sizeof(w))) {
+      for (uint32_t& v : w) v = BSwap32(v);
+      if ((w[0] & 3u) == 2u) {
+        std::copy_n(w, 12, item.stamp_fetch);
+        std::lock_guard lock(g_stamp_uv_mutex);
+        if (g_stamp_fetch.size() > 256) g_stamp_fetch.clear();
+        auto& slot = g_stamp_fetch[item.mesh];
+        static std::atomic<uint32_t> logs{0};
+        if (std::memcmp(slot.data(), w, sizeof(w)) != 0 &&
+            REXCVAR_GET(skate3_native_render_scene_character_log) && logs.fetch_add(1, std::memory_order_relaxed) < 24) {
+          REXLOG_INFO("native-stamp: skin mesh={:08X} draw tf6=[{:08X} {:08X} {:08X}] "
+                      "tf7=[{:08X} {:08X} {:08X}] channel decal={:08X} decal2={:08X} "
+                      "overlay_opacity={:.3f}",
+                      item.mesh, w[0], w[1], w[2], w[6], w[7], w[8], item.decal_art,
+                      item.decal2_art, local[2 * 4 + 0]);
+        }
+        std::copy_n(w, 12, slot.data());
+      }
+    }
+    // Overlay opacity (i_params.z) transitions: the bruise/scrape layer
+    // switches on at a bone break (bounded log).
+    {
+      static std::mutex op_mutex;
+      static std::unordered_map<uint32_t, float> last_op;
+      std::lock_guard lock(op_mutex);
+      float& prev = last_op[item.mesh];
+      const float op = local[2 * 4 + 0];
+      static std::atomic<uint32_t> op_logs{0};
+      if (std::fabs(op - prev) > 0.01f && REXCVAR_GET(skate3_native_render_scene_character_log) && op_logs.fetch_add(1) < 64) {
+        REXLOG_INFO("native-stamp: skin mesh={:08X} overlay opacity {:.3f} -> {:.3f} "
+                    "tf7=[{:08X} {:08X} {:08X}]",
+                    item.mesh, prev, op, item.stamp_fetch[6], item.stamp_fetch[7],
+                    item.stamp_fetch[8]);
+      }
+      prev = op;
+    }
+  }
   // Remember the validated rows per garment for the cross-frame fallback
   // (see g_char_rows_cache). Runaway-growth backstop only; mesh keys are
   // bounded by loaded character content in practice.
@@ -4117,10 +5107,88 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
     CaptureHairTint(base, item);
   }
   CaptureCharLighting(base, item);
+  // The refined home: the skin VS's tattoo-UV rows follow its bone array.
+  CaptureStampUv(base, bank, palette_base, item);
   return true;
 }
 
 uint64_t DrawSequence() { return g_draw_seq.load(std::memory_order_relaxed); }
+
+// Rigid character attachments (see skate3_native_render_scene_attach_bank_
+// world). The rigid capture resolves a bank-vs-instance disagreement
+// (> 0.25 m) in favor of the instance matrix: the prop wrong-clone rule.
+// A shoe hung on the foot bone moves > 0.25 m per tick while running, and
+// if its instance matrix is not rewritten every tick, that rule leaves the
+// shoe lying where the matrix was last stored. Per ctx, remember both
+// translations; the bank wins only when the instance matrix is frozen
+// (bit-stable) while the bank keeps moving. Every disagreement on these
+// pieces is logged (bounded) either way.
+struct AttachTrack {
+  float ctx_t[3] = {};
+  float bank_t[3] = {};
+  uint64_t frame = 0;
+  bool bank_moving = false;
+};
+std::mutex g_attach_mutex;
+std::unordered_map<uint32_t, AttachTrack> g_attach_track;
+bool IsCharAttachment(const DrawItem& item) {
+  return !item.skinned && item.ctx != 0 &&
+         std::strncmp(item.material_name, "character.", 10) == 0;
+}
+// Records this capture's pair; returns true when the bank should replace a
+// disagreeing instance world.
+bool AttachBankWins(const DrawItem& item, const float* bank_w, const float* ctx_w,
+                    bool disagree, const char* site) {
+  std::lock_guard lock(g_attach_mutex);
+  if (g_attach_track.size() > 1024) g_attach_track.clear();
+  AttachTrack& t = g_attach_track[item.ctx];
+  const bool have = t.frame != 0 && g_guest_frame - t.frame <= 8;
+  const auto dist = [](const float* a, const float* b) {
+    const float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+  };
+  const float ctx_move = have ? dist(ctx_w + 12, t.ctx_t) : -1.0f;
+  const float bank_move = have ? dist(bank_w + 12, t.bank_t) : -1.0f;
+  const bool frozen_ctx = have && ctx_move < 1e-4f && bank_move > 0.02f;
+  std::copy_n(ctx_w + 12, 3, t.ctx_t);
+  std::copy_n(bank_w + 12, 3, t.bank_t);
+  t.frame = g_guest_frame;
+  t.bank_moving = bank_move > 0.02f;
+  const bool bank_wins =
+      disagree && frozen_ctx && REXCVAR_GET(skate3_native_render_scene_attach_bank_world);
+  if (disagree) {
+    static std::atomic<uint32_t> logs{0};
+    const uint32_t n = logs.fetch_add(1, std::memory_order_relaxed);
+    if (n < 64 || (n & 255u) == 0) {
+      REXLOG_INFO(
+          "native-attach: site={} mesh={:08X} ctx={:08X} material={} "
+          "bank=({:.2f},{:.2f},{:.2f}) inst=({:.2f},{:.2f},{:.2f}) "
+          "bank_move={:.3f} inst_move={:.4f} use={} (n={})",
+          site, item.mesh, item.ctx, item.material_name, bank_w[12], bank_w[13],
+          bank_w[14], ctx_w[12], ctx_w[13], ctx_w[14], bank_move, ctx_move,
+          bank_wins ? "bank" : "inst", n);
+    }
+  }
+  return bank_wins;
+}
+
+// Bank-less capture of a character attachment: true when its instance
+// matrix is still the frozen one the tracker saw while the bank was moving,
+// i.e. adopting it would publish the left-behind pose; the caller defers
+// the item to the post-draw fixup (which sees the bank) instead.
+bool AttachCtxFrozen(const DrawItem& item, const float* ctx_w) {
+  if (!REXCVAR_GET(skate3_native_render_scene_attach_bank_world)) return false;
+  std::lock_guard lock(g_attach_mutex);
+  const auto it = g_attach_track.find(item.ctx);
+  if (it == g_attach_track.end() || g_guest_frame - it->second.frame > 8 ||
+      !it->second.bank_moving) {
+    return false;
+  }
+  const float dx = ctx_w[12] - it->second.ctx_t[0];
+  const float dy = ctx_w[13] - it->second.ctx_t[1];
+  const float dz = ctx_w[14] - it->second.ctx_t[2];
+  return dx * dx + dy * dy + dz * dz < 1e-8f;
+}
 
 uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
                              bool drew_inside) {
@@ -4164,11 +5232,14 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     // world path.
     const uint32_t record = REX_LOAD_U32(ctx);
     if (!GuestReadableApprox(base, record)) return 0;
-    const uint32_t mesh = REX_LOAD_U32(record);
-    if (!GuestReadableApprox(base, mesh)) return 0;
-    const uint32_t vdesc = REX_LOAD_U32(mesh + kMeshVertexDescriptor);
-    if (!GuestReadableApprox(base, vdesc)) return 0;
-    const uint32_t num_elements = REX_LOAD_U16(vdesc + 8);
+    uint32_t mesh = 0, vdesc = 0, vdesc_head = 0;
+    if (!GuestTryLoadU32(base, record, &mesh) || !GuestReadableApprox(base, mesh) ||
+        !GuestTryLoadU32(base, mesh + kMeshVertexDescriptor, &vdesc) ||
+        !GuestReadableApprox(base, vdesc) || StaleDrawChain(base, ctx, record, mesh, vdesc) ||
+        !GuestTryLoadU32(base, vdesc + 8, &vdesc_head)) {
+      return 0;
+    }
+    const uint32_t num_elements = vdesc_head >> 16;
     if (num_elements == 0 || num_elements > 32) return 0;
     bool have_bw = false;
     bool have_bi = false;
@@ -4196,6 +5267,21 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     return 0;
   }
   item.ctx = ctx;  // identity key for the palette serve / entity store
+  // Dynamic-material sightings (diagnostic, bounded): each distinct
+  // material the dynamic capture meets, logged once with its first sighting
+  // time, so transient content (the Hall of Meat bone overlays at a break)
+  // can be named from the log.
+  {
+    static std::mutex seen_mutex;
+    static std::unordered_set<std::string> seen;
+    std::lock_guard lock(seen_mutex);
+    if (REXCVAR_GET(skate3_native_render_scene_character_log) && seen.size() < 160 && seen.insert(item.material_name).second) {
+      REXLOG_INFO("native-material-seen: material={} mesh={:08X} ctx={:08X} skinned={} "
+                  "char_fam={} env_fam={} pos_fmt={} diffuse_guid={:016X} world_path={}",
+                  item.material_name, item.mesh, ctx, item.skinned, item.char_family,
+                  item.env_family, item.pos_fmt, item.diffuse_guid, world_path);
+    }
+  }
   // The bank only provably holds THIS mesh's constants when the last draw
   // that flushed it bound this mesh's buffers (see g_last_draw_ibvb);
   // `drew_inside` alone also accepted banks left by another entity's inline
@@ -4247,11 +5333,16 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
       const float dx = item.world[12] - ctx_world[12];
       const float dy = item.world[13] - ctx_world[13];
       const float dz = item.world[14] - ctx_world[14];
-      if (dx * dx + dy * dy + dz * dz > 0.0625f) {
+      const bool disagree = dx * dx + dy * dy + dz * dz > 0.0625f;
+      const bool keep_bank =
+          IsCharAttachment(item) &&
+          AttachBankWins(item, item.world, ctx_world, disagree, "capture");
+      if (disagree && !keep_bank) {
         std::memcpy(item.world, ctx_world, sizeof(ctx_world));
         g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
       }
-    } else if (have_ctx_world) {
+    } else if (have_ctx_world &&
+               !(IsCharAttachment(item) && AttachCtxFrozen(item, ctx_world))) {
       std::memcpy(item.world, ctx_world, sizeof(ctx_world));
       g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
     } else if (!bank_ok) {
@@ -4269,6 +5360,9 @@ uint32_t CaptureDynamicState(uint8_t* base, uint32_t ctx, bool world_path,
     }
   }
 
+  if (item.indicator) {
+    CaptureIndicatorRows(base, item, own_draw_last && !world_path);
+  }
   if (item.skinned) {
     // Copy the whole possible palette span (c4..c255 = 84 bones) verbatim:
     // 3 float4 rows per bone, column-vector affine [R | t], model space
@@ -4914,7 +6008,9 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
         // (-> no shadow at all). Discriminate on the family-specific rows:
         // c6 = unit sun direction with normalize(cross(c0,c3)) == -c6 (the
         // oblique projection axis), c7 = the camera position, c8 dim.
-        if (sane) {
+        if (!sane) {
+          g_rcv_capture_geo.fetch_add(1, std::memory_order_relaxed);
+        } else {
           const float cxx = rows[1] * rows[14] - rows[2] * rows[13];
           const float cxy = rows[2] * rows[12] - rows[0] * rows[14];
           const float cxz = rows[0] * rows[13] - rows[1] * rows[12];
@@ -4928,13 +6024,20 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           const float dcx = rows[28] - g_fog_cam[0];
           const float dcy = rows[29] - g_fog_cam[1];
           const float dcz = rows[30] - g_fog_cam[2];
-          sane = align < -0.9f && sn > 0.9f && sn < 1.1f &&
-                 dcx * dcx + dcy * dcy + dcz * dcz < 25.0f && rows[32] <= 0.4f &&
-                 rows[33] <= 0.4f && rows[34] <= 0.4f &&
-                 // c10.x = scene exposure, c11.y = material multiplier,
-                 // consumed by the exact world tone chain.
-                 rows[40] > 0.1f && rows[40] < 16.0f && rows[45] > 0.0f &&
-                 rows[45] < 16.0f;
+          const bool axis_ok = align < -0.9f && sn > 0.9f && sn < 1.1f;
+          const bool cam_ok = dcx * dcx + dcy * dcy + dcz * dcz < 25.0f;
+          const bool color_ok = rows[32] <= 0.4f && rows[33] <= 0.4f && rows[34] <= 0.4f;
+          // c10.x = scene exposure, c11.y = material multiplier, consumed by
+          // the exact world tone chain.
+          const bool tone_ok = rows[40] > 0.1f && rows[40] < 16.0f && rows[45] > 0.0f &&
+                               rows[45] < 16.0f;
+          sane = axis_ok && cam_ok && color_ok && tone_ok;
+          (!axis_ok    ? g_rcv_capture_axis
+           : !cam_ok   ? g_rcv_capture_cam
+           : !color_ok ? g_rcv_capture_color
+           : !tone_ok  ? g_rcv_capture_tone
+                       : g_rcv_capture_ok)
+              .fetch_add(1, std::memory_order_relaxed);
         }
         if (sane) {
           // Scene-exposure transition log (c10.x): the game's auto-exposure
@@ -5072,14 +6175,26 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       }
     }
   }
+  if (SceneEnabled()) {
+    for (const uint32_t obj : {g_cur_ps_obj.load(std::memory_order_relaxed),
+                               g_cur_vs_obj.load(std::memory_order_relaxed)}) {
+      const int slot = PfxOrderSlotOf(base, obj);
+      if (slot >= 0) {
+        g_pfx_order_frame[slot] = g_guest_frame;
+        g_pfx_order_seq[slot] = g_draw_seq.load(std::memory_order_relaxed);
+        break;
+      }
+    }
+  }
   // Photo-editor postfx capture (SOLE site): read the game's staging banks
   // at draw time, the same reads the F11 per-draw records use, verified
   // correct for every postfx pass in captures 1783957072/1783963636. The
   // former SetPending upload-time capture mixed neighbouring passes' rows
   // (the game stages the next pass's constants before rebinding shaders)
   // and has been removed.
-  if (flags2d == 0 && SceneEnabled() &&
-      g_photo_flow_frame.load(std::memory_order_relaxed)) {
+  // Also in gameplay: only the full-chain passes classify (ordinary play
+  // uses postfx_fast_uberPS), so this costs nothing outside slow motion.
+  if (flags2d == 0 && SceneEnabled()) {
     int pfx_pass = ClassifyPfxShader(base, g_cur_ps_obj.load(std::memory_order_relaxed));
     if (pfx_pass < 0) {
       pfx_pass = ClassifyPfxShader(base, g_cur_vs_obj.load(std::memory_order_relaxed));
@@ -5093,6 +6208,80 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       }
       if (vs_bank != 0) {
         CapturePfxConstants(base, vs_bank, dev, /*pixel=*/false);
+      }
+    }
+  } else if (SceneEnabled()) {
+    // Gameplay postfx probe (diagnostic, change-logged): the game still
+    // stages constants for its suppressed postfx draws. A Hall of Meat
+    // screen filter (desaturate / dim), if the game has one, shows up as a
+    // transition in these rows around a bone break. Run 090 logged nothing
+    // for postfx_uberPS / postfx_visualfxPS, so match by NAME: every pixel
+    // shader whose name carries postfx / bloom / visualfx / xray / desat,
+    // first sighting logged with its phase flags, rows c0..c11 on change.
+    // The OnSetShader pixel/vertex labels are SWAPPED (see OnSetShader), so
+    // both trackers are named. Every shader is census-logged once on first
+    // sighting (native-shader-seen, capped) so passes that only run in a
+    // mode (the left-trigger slow-motion bail filter) show up by timestamp.
+    const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+    static std::unordered_map<uint32_t, std::string> s_names;  // guest render thread
+    static std::atomic<uint32_t> s_census{0};
+    std::string* name = nullptr;
+    const uint32_t objs[2] = {g_cur_ps_obj.load(std::memory_order_relaxed),
+                              g_cur_vs_obj.load(std::memory_order_relaxed)};
+    for (const uint32_t obj : objs) {
+      if (obj == 0) continue;
+      auto nit = s_names.find(obj);
+      if (nit == s_names.end() && s_names.size() < 8192 && GuestReadableApprox(base, obj)) {
+        char text[112] = {};
+        for (int k = 0; k < 111; ++k) {
+          text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+          if (text[k] == 0) break;
+        }
+        std::string n(text);
+        const bool want = n.find("postfx") != std::string::npos ||
+                          n.find("bloom") != std::string::npos ||
+                          n.find("visualfx") != std::string::npos ||
+                          n.find("xray") != std::string::npos ||
+                          n.find("desat") != std::string::npos ||
+                          n.find("fisheye") != std::string::npos ||
+                          n.find("blur") != std::string::npos;
+        if (REXCVAR_GET(skate3_native_render_scene_postfx_log) && s_census.fetch_add(1, std::memory_order_relaxed) < 1200) {
+          REXLOG_INFO("native-shader-seen: obj={:08X} name={} flags2d={:X} func={} frame={}",
+                      obj, n, flags2d, func, g_guest_frame);
+        }
+        nit = s_names.emplace(obj, want ? n : std::string()).first;
+      }
+      if (nit != s_names.end() && !nit->second.empty() && name == nullptr) {
+        name = &nit->second;
+      }
+    }
+    if (name != nullptr && ps_bank != 0 && GuestReadableApprox(base, ps_bank)) {
+      float rows[12][4];
+      for (int r = 0; r < 12; ++r) {
+        for (int i = 0; i < 4; ++i) {
+          rows[r][i] = LoadGuestF32(base, ps_bank + uint32_t(r * 4 + i) * 4);
+        }
+      }
+      static std::unordered_map<std::string, std::array<float, 48>> s_last;
+      static std::atomic<uint32_t> s_logs{0};
+      auto [lit, fresh] = s_last.try_emplace(*name);
+      bool changed = fresh;
+      for (int k = 0; k < 48 && !changed; ++k) {
+        const float v = rows[k / 4][k % 4];
+        changed = !(std::fabs(v - lit->second[k]) <= 0.02f);
+      }
+      if (changed) {
+        std::memcpy(lit->second.data(), rows, sizeof(rows));
+        if (s_logs.fetch_add(1, std::memory_order_relaxed) < 1500) {
+          std::string txt;
+          for (int r = 0; r < 12; ++r) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), " c%d=(%.3f,%.3f,%.3f,%.3f)", r, rows[r][0],
+                          rows[r][1], rows[r][2], rows[r][3]);
+            txt += buf;
+          }
+          REXLOG_INFO("native-pfx-live: shader={} frame={}{}", *name, g_guest_frame, txt);
+        }
       }
     }
   }
@@ -5497,6 +6686,44 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
     return;  // palette fixup below matches indexed draws only
   }
   const uint64_t key = (uint64_t(cur_ib) << 32) | cur_vb;
+  // Traffic light lamp rows (FrameScene::traffic_rows): this draw runs a
+  // trafficlight_one/two shader (tagged at bind time; the buffer pair alone
+  // is no proof, streaming reuses those addresses). VS c7 = the game's lamp
+  // state for that family, PS c3.y = m_params[0].y, PS c2.x = the exposure.
+  // Run 122: the state cycles (2,0,0,0) -> (0,2,0,0) -> (0,0,2,2) in Skate 3
+  // districts and New San Van alike. Range-gated: a component is 0 (dark)
+  // or 2 (lit), the multiplier and exposure small positive scales.
+  if (flags2d == 0) {
+    uint8_t family = g_cur_vs_traffic.load(std::memory_order_relaxed);
+    if (family == 0) {
+      family = g_cur_ps_traffic.load(std::memory_order_relaxed);
+    }
+    const uint32_t ps_bank = g_ps_bank.load(std::memory_order_relaxed);
+    if (family != 0 && ps_bank != 0) {
+      float rows[6];
+      for (uint32_t i = 0; i < 4; ++i) {
+        rows[i] = LoadGuestF32(base, bank + (7 * 4 + i) * 4);
+      }
+      rows[4] = LoadGuestF32(base, ps_bank + (3 * 4 + 1) * 4);
+      rows[5] = LoadGuestF32(base, ps_bank + (2 * 4 + 0) * 4);
+      bool sane = rows[4] > 0.0f && rows[4] <= 64.0f && rows[5] > 0.01f && rows[5] < 64.0f;
+      for (int i = 0; i < 4 && sane; ++i) {
+        sane = rows[i] >= 0.0f && rows[i] <= 8.0f;
+      }
+      float* dst = g_traffic_rows[family - 1];
+      if (sane && std::memcmp(dst, rows, sizeof(rows)) != 0) {
+        static uint32_t changes = 0;
+        if (REXCVAR_GET(skate3_native_render_scene_capture_log) && (++changes <= 32 || (changes & (changes - 1)) == 0)) {
+          REXLOG_INFO("native-scene: traffic lights {} state ({:.0f}, {:.0f}, {:.0f}, {:.0f}) "
+                      "mult {:.3g} exposure {:.3g} (change {})",
+                      family == 1 ? "one" : "two", rows[0], rows[1], rows[2], rows[3], rows[4],
+                      rows[5], changes);
+        }
+        std::memcpy(dst, rows, sizeof(rows));
+        g_traffic_have[family - 1] = true;
+      }
+    }
+  }
   std::lock_guard<std::mutex> lock(g_palette_mutex);
   // Record this draw's texture fetch slots 3+4 (lightmap + diffuse on the
   // environment families) for the frame-end streamed-artwork diffuse
@@ -5744,7 +6971,10 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       const float dx = bank_world[12] - d.world[12];
       const float dy = bank_world[13] - d.world[13];
       const float dz = bank_world[14] - d.world[14];
-      if (dx * dx + dy * dy + dz * dz <= 0.0625f) {
+      const bool disagree = dx * dx + dy * dy + dz * dz > 0.0625f;
+      const bool keep_bank = IsCharAttachment(d) &&
+                             AttachBankWins(d, bank_world, d.world, disagree, "fixup");
+      if (!disagree || keep_bank) {
         std::memcpy(d.world, bank_world, sizeof(bank_world));
       } else {
         g_rigid_ctx_world.fetch_add(1, std::memory_order_relaxed);
@@ -5867,6 +7097,17 @@ struct CamPose {
 // all the sim stepping on the skater ("he definitively judders now").
 double g_smooth_play = 0.0;
 bool g_smooth_active = false;
+// Perf recorder telemetry (GetSmoothingTelemetry): the play clock's distance
+// from its lag target after this frame's update and the camera tick estimate.
+float g_smooth_err_ms = 0.0f;
+float g_smooth_period_ms = 0.0f;
+void GetSmoothingTelemetry(float* err_ms, float* period_ms) {
+  *err_ms = g_smooth_err_ms;
+  *period_ms = g_smooth_period_ms;
+}
+void GetFrameCamera(float out[3]) { std::memcpy(out, g_fog_cam, sizeof(g_fog_cam)); }
+int64_t g_frame_clock_ns = 0;  // see SetFrameClockNs
+void SetFrameClockNs(int64_t ns) { g_frame_clock_ns = ns; }
 // Last pose SmoothCamera produced (guest render thread), read by the
 // synthetic-pan probe (mode 3) to measure reconstruction error against the
 // known ideal pose.
@@ -5964,6 +7205,109 @@ bool ItemOutsideFrustum(const DrawItem& it, const float vp[16], float margin) {
   return CornersOutsideFrustum(corners, vp, margin);
 }
 
+// Missing-ground evidence is sampled only near the two repro sites. This is
+// downstream of guest submission/retention, not proof of collision residency.
+void TraceBamGroundScene(const FrameScene& scene, const float guest_vp[16]) {
+  if (!REXCVAR_GET(skate3_skate2_texture_probe) ||
+      !skate3::world_loading::IsSkate2Gameplay()) return;
+  const float x = scene.cam_pos[0], z = scene.cam_pos[2];
+  const unsigned group = x > 575 && x < 675 && z > 1040 && z < 1160 ? 3 :
+      (x > 1150 && x < 1320 && z > 820 && z < 1010 ? 4 : 0);
+  if (!group) return;
+  static std::array<std::chrono::steady_clock::time_point, 2> last{};
+  static std::array<std::unordered_set<uint64_t>, 2> logged;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last[group - 3] < std::chrono::seconds(2)) return;
+  last[group - 3] = now;
+  auto& seen = logged[group - 3];
+  unsigned total = 0, retained = 0, in_guest = 0, in_render = 0, emitted = 0;
+  for (const auto& item : scene.items) {
+    if (BamGeometryProbeGroup(item) != group) continue;
+    ++total;
+    retained += item.retained;
+    const bool outside_guest = ItemOutsideFrustum(item, guest_vp, 1.0f);
+    const bool outside_render = ItemOutsideFrustum(item, scene.view_proj, 1.0f);
+    in_guest += !outside_guest;
+    in_render += !outside_render;
+    const uint64_t key = SynPanItemKey(item);
+    if (seen.size() >= 512 || emitted >= 32 || !seen.insert(key).second) continue;
+    ++emitted;
+    REXLOG_INFO("world-ground-item: group={} frame={} key={:016X} mesh={:08X} guid={:016X} family={} material={} retained={} outside_guest={} outside_render={} pos_fmt={} bbox_min=({},{},{}) bbox_max=({},{},{}) world=[{},{},{},{};{},{},{},{};{},{},{},{};{},{},{},{}] ranges=[{}]",
+        group, g_guest_frame, key, item.mesh, item.diffuse_guid, item.env_family,
+        item.material_name, item.retained, outside_guest, outside_render, item.pos_fmt,
+        item.bbox_min[0], item.bbox_min[1], item.bbox_min[2],
+        item.bbox_max[0], item.bbox_max[1], item.bbox_max[2],
+        item.world[0], item.world[1], item.world[2], item.world[3],
+        item.world[4], item.world[5], item.world[6], item.world[7],
+        item.world[8], item.world[9], item.world[10], item.world[11],
+        item.world[12], item.world[13], item.world[14], item.world[15],
+        DescribeDrawRanges(item.draws));
+  }
+  const float* v = scene.view_proj;
+  REXLOG_INFO("world-ground-view: group={} frame={} cam=({},{},{}) backface_cull={} items={} retained={} in_guest={} in_render={} logged={} view_proj=[{},{},{},{};{},{},{},{};{},{},{},{};{},{},{},{}]",
+      group, g_guest_frame, x, scene.cam_pos[1], z,
+      REXCVAR_GET(skate3_native_render_scene_backface_cull),
+      total, retained, in_guest, in_render, seen.size(),
+      v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+      v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+}
+
+// Publication-stage evidence for log057: track selected original signs and
+// large objects (including possible backdrops). No geometry is retained or
+// culled here. Seen/missing edges distinguish submission changes from shading.
+void TraceBamVisualScene(const FrameScene& scene, const float guest_vp[16]) {
+  if (!REXCVAR_GET(skate3_skate2_texture_probe) ||
+      !skate3::world_loading::IsSkate2Gameplay()) return;
+  struct State { DrawItem item; uint64_t seen = 0, logged = 0, range_changes = 0; bool missing = false; };
+  static std::unordered_map<uint64_t, State> states;
+  static uint64_t window = 0;
+  static unsigned count = 0;
+  const uint64_t frame = g_guest_frame;
+  if (frame - window >= 120) { window = frame; count = 0; }
+  for (const DrawItem& item : scene.items) {
+    if (!IsBamVisualCandidate(item)) continue;
+    const uint64_t key = SynPanItemKey(item);
+    if (states.size() >= 2048 && !states.contains(key)) continue;
+    auto [it, inserted] = states.try_emplace(key);
+    auto& st = it->second;
+    const bool range_changed = !inserted && DrawRangesHash(st.item.draws) != DrawRangesHash(item.draws);
+    if (range_changed) ++st.range_changes;
+    const bool changed = inserted || st.missing || st.item.diffuse_tex != item.diffuse_tex ||
+        st.item.fingerprint != item.fingerprint || st.item.retained != item.retained ||
+        range_changed ||
+        std::memcmp(st.item.diffuse_fetch, item.diffuse_fetch, sizeof(item.diffuse_fetch)) != 0 ||
+        std::memcmp(st.item.decal_fetch, item.decal_fetch, sizeof(item.decal_fetch)) != 0;
+    st.seen = frame;
+    st.missing = false;
+    if (count < 64 && (changed || frame - st.logged >= 600)) {
+      ++count;
+      st.logged = frame;
+      const DrawEntry de = item.draws.empty() ? DrawEntry{} : item.draws.front();
+      REXLOG_INFO("world-visual-item: frame={} key={:016X} mesh={:08X} guid={:016X} retained={} family={} sky={} cam=({},{},{}) world=({},{},{}) bbox_min=({},{},{}) bbox_max=({},{},{}) outside_guest={} outside_render={} vb={:08X} ib={:08X} draws={} first=({},{},{}) diffuse={:08X} overrides=({:08X},{:08X}) ad_enabled={} material={} ranges=[{}] range_changes={}",
+          frame, key, item.mesh, item.diffuse_guid, item.retained, item.env_family, item.unlit,
+          scene.cam_pos[0], scene.cam_pos[1], scene.cam_pos[2], item.world[12], item.world[13], item.world[14],
+          item.bbox_min[0], item.bbox_min[1], item.bbox_min[2], item.bbox_max[0], item.bbox_max[1], item.bbox_max[2],
+          ItemOutsideFrustum(item, guest_vp, 1.0f), ItemOutsideFrustum(item, scene.view_proj, 1.0f),
+          item.vb_obj, item.ib_obj, item.draws.size(), de.base_vertex, de.start_index, de.index_count,
+          item.diffuse_tex, item.diffuse_fetch[1], item.decal_fetch[1], REXCVAR_GET(skate3_skate2_ad_overrides),
+          item.material_name, DescribeDrawRanges(item.draws), st.range_changes);
+    }
+    st.item = item;
+  }
+  for (auto it = states.begin(); it != states.end();) {
+    auto& st = it->second;
+    if (st.seen != frame && !st.missing && count < 64) {
+      ++count;
+      st.missing = true;
+      REXLOG_INFO("world-visual-missing: frame={} key={:016X} mesh={:08X} guid={:016X} age={} outside_guest={} outside_render={} cam=({},{},{})",
+          frame, it->first, st.item.mesh, st.item.diffuse_guid, frame - st.seen,
+          ItemOutsideFrustum(st.item, guest_vp, 1.0f), ItemOutsideFrustum(st.item, scene.view_proj, 1.0f),
+          scene.cam_pos[0], scene.cam_pos[1], scene.cam_pos[2]);
+    }
+    if (frame - st.seen > 1800) it = states.erase(it); else ++it;
+  }
+}
+
 // Axis-aligned cube of half-extent `half` around `center` against the
 // frustum, the skinned-item variant (a palette's world position lives in
 // its bone translations, not the identity item world).
@@ -6002,6 +7346,7 @@ std::atomic<bool> g_cam_sampler_started{false};
 std::atomic<uint64_t> g_cam_sampler_pushes{0};  // telemetry
 
 void CamSamplerLoop() {
+  skate3::perf_recorder::NameCurrentThread("Native camera sampler");
   float last_view[16] = {};
   double syn_next_emit = 0.0;
   int syn_cadence_i = 0;
@@ -6392,25 +7737,34 @@ bool LoadingOrFrontendActive() {
 // (newest - 2 periods). The bracketing ring samples are slerped at the
 // playback time; sample-time noise is absorbed by the slew instead of
 // feeding straight into the pose velocity.
-// Most recent camera sim-tick time (guest render thread only): entities that
-// changed pose this frame changed on the same sim tick; timestamping their
-// pose rings with it instead of the frame time avoids the same aliasing.
+// Sample time of THIS frame's camera (guest render thread only): entities
+// that changed pose this frame changed on the same sim tick; timestamping
+// their pose rings with it instead of the frame time avoids the same
+// aliasing. See the frame camera in SmoothCamera.
 double g_latest_cam_tick = 0.0;
 
+// `view` is this frame's camera as the build read it from guest memory at
+// host time `view_t`.
 bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp[16],
-                  const float raw_cam[3], double now, float vp_out[16],
+                  const float raw_cam[3], double view_t, double now, float vp_out[16],
                   float cam_out[3]) {
   constexpr int kRing = 64;  // ~1 kHz sampler: cover well past the lag window
   static CamPose s_ring[kRing];
+  static float s_ring_view[kRing][16];  // the raw view each ring pose came from
   static int s_count = 0;  // -1 = convention drift, never smooth this run
   static int s_newest = 0;
-  static float s_last_view[16] = {};
   static double s_period = 1.0 / 200.0;  // EMA of the guest camera tick
   static double s_play = 0.0;            // playback clock (guest-pose time axis)
   static double s_last_now = 0.0;
   static bool s_play_valid = false;
+  // Frame cameras the build added ahead of the sampler (see below), so the
+  // sampler's late copy of the same view can't re-time them.
+  constexpr int kBuilt = 4;
+  static float s_built_view[kBuilt][16];
+  static double s_built_t[kBuilt] = {};
+  static int s_built_next = 0;
 
-  const auto push_pose = [&](const CamPose& p) {
+  const auto push_pose = [&](const CamPose& p, const float raw_view[16]) {
     if (s_count < 0) {
       return;
     }
@@ -6438,7 +7792,16 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
       s_ring[s_newest] = p;
       s_count = std::min(s_count + 1, kRing);
     }
-    g_latest_cam_tick = p.t;
+    std::memcpy(s_ring_view[s_newest], raw_view, sizeof(s_ring_view[0]));
+  };
+  const auto pose_from_view = [](const float v[16], double t) {
+    CamPose p;
+    p.t = t;
+    QuatFromView(v, p.q);
+    for (int j = 0; j < 3; ++j) {
+      p.c[j] = -(v[12] * v[j * 4 + 0] + v[13] * v[j * 4 + 1] + v[14] * v[j * 4 + 2]);
+    }
+    return p;
   };
 
   // Primary source: the ~1 kHz sampler thread (precise timestamps: pose
@@ -6451,52 +7814,79 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
       s_pending.swap(g_cam_samples);
     }
     for (const RawCamSample& s : s_pending) {
-      CamPose p;
-      p.t = s.t;
-      QuatFromView(s.view, p.q);
-      for (int j = 0; j < 3; ++j) {
-        p.c[j] = -(s.view[12] * s.view[j * 4 + 0] + s.view[13] * s.view[j * 4 + 1] +
-                   s.view[14] * s.view[j * 4 + 2]);
+      bool built = false;
+      for (int k = 0; k < kBuilt && !built; ++k) {
+        built = s_built_t[k] != 0.0 && s.t - s_built_t[k] < 0.1 &&
+                std::memcmp(s_built_view[k], s.view, sizeof(s.view)) == 0;
       }
-      push_pose(p);
+      if (!built) {
+        push_pose(pose_from_view(s.view, s.t), s.view);
+      }
     }
     s_pending.clear();
   }
 
-  if (std::memcmp(s_last_view, view, sizeof(s_last_view)) != 0) {
-    std::memcpy(s_last_view, view, sizeof(s_last_view));
-    CamPose p;
-    p.t = now;
-    QuatFromView(view, p.q);
+  // One-shot reconstruction self-check: the rebuilt view_proj at this exact
+  // pose must match the guest's own (catches any convention drift).
+  static bool s_checked = false;
+  if (!s_checked) {
+    s_checked = true;
+    CamPose p = pose_from_view(view, view_t);
     std::memcpy(p.c, raw_cam, sizeof(p.c));
-    // One-shot reconstruction self-check: the rebuilt view_proj at this
-    // exact pose must match the guest's own (catches any convention drift).
-    static bool s_checked = false;
-    if (!s_checked) {
-      s_checked = true;
-      float test_vp[16], test_cam[3];
-      ComposeViewProj(p, proj, test_vp, test_cam);
-      float max_rel = 0.0f;
-      for (int i = 0; i < 16; ++i) {
-        const float mag = std::max(1.0f, std::fabs(raw_vp[i]));
-        max_rel = std::max(max_rel, std::fabs(test_vp[i] - raw_vp[i]) / mag);
-      }
-      REXLOG_INFO("native-scene: smooth-camera reconstruction check max_rel={:.6f}{}",
-                  max_rel, max_rel > 0.01f ? " (BAD - smoothing disabled this run)" : "");
-      if (max_rel > 0.01f) {
-        s_count = -1;
-      }
+    float test_vp[16], test_cam[3];
+    ComposeViewProj(p, proj, test_vp, test_cam);
+    float max_rel = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+      const float mag = std::max(1.0f, std::fabs(raw_vp[i]));
+      max_rel = std::max(max_rel, std::fabs(test_vp[i] - raw_vp[i]) / mag);
     }
-    // Fallback only: if the sampler has fed the ring recently, the frame-
-    // grid pose is a stale duplicate of a sampler pose; pushing it would
-    // corrupt the timestamps.
-    if (s_count >= 0 && (s_count == 0 || now - s_ring[s_newest].t > 0.05)) {
-      push_pose(p);
+    REXLOG_INFO("native-scene: smooth-camera reconstruction check max_rel={:.6f}{}",
+                max_rel, max_rel > 0.01f ? " (BAD - smoothing disabled this run)" : "");
+    if (max_rel > 0.01f) {
+      s_count = -1;
     }
   }
+
+  // This frame's camera and its sample time (g_latest_cam_tick, the stamp of
+  // the entity poses captured with it). The sampler polls every 1-2 ms, so a
+  // camera the game wrote just before the build can be missing from the
+  // ring; that happens when little render work separates the write from the
+  // build (the Stadium interior; pacing waits outside that window). The
+  // entity poses then took the PREVIOUS frame's stamp and were withheld as
+  // duplicates, and the doubled gap made a 60 Hz entity read as slower for a
+  // frame: the skater jumped a few ms back against the smooth camera, two or
+  // three times a second while skating. Such a frame camera joins the ring
+  // at the build's read time instead (never behind a newer sample), and the
+  // sampler's later copy of it is dropped above. With the sampler stalled
+  // this also keeps the ring fed at the frame rate.
+  double frame_tick = view_t;
+  if (s_count >= 0) {
+    bool found = false;
+    for (int i = 0, idx = s_newest; i < std::min(s_count, 8);
+         ++i, idx = (idx + kRing - 1) % kRing) {
+      if (std::memcmp(s_ring_view[idx], view, sizeof(s_ring_view[0])) == 0) {
+        frame_tick = s_ring[idx].t;
+        found = true;
+        break;
+      }
+    }
+    // Same plausibility gate as the sampler (perspective, unit rotation row).
+    const float r0n = view[0] * view[0] + view[1] * view[1] + view[2] * view[2];
+    if (!found && (s_count == 0 || view_t > s_ring[s_newest].t) &&
+        proj[2 * 4 + 3] == 1.0f && r0n >= 0.9f && r0n <= 1.1f &&
+        g_synpan_active.load(std::memory_order_relaxed) != 3) {
+      push_pose(pose_from_view(view, view_t), view);
+      std::memcpy(s_built_view[s_built_next], view, sizeof(s_built_view[0]));
+      s_built_t[s_built_next] = view_t;
+      s_built_next = (s_built_next + 1) % kBuilt;
+    }
+  }
+  g_latest_cam_tick = frame_tick;
+  g_smooth_period_ms = float(s_period * 1000.0);
   if (s_count < 3 || now - s_ring[s_newest].t > 0.1) {
     s_play_valid = false;
     g_smooth_active = false;
+    g_smooth_err_ms = 0.0f;
     return false;
   }
 
@@ -6531,6 +7921,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   // settles exactly onto the raw stop pose and every later handoff is
   // seamless.
   s_play = std::min(s_play, s_ring[s_newest].t);
+  g_smooth_err_ms = float((target - s_play) * 1000.0);
 
   // Evaluate the piecewise-linear pose signal at an arbitrary time by
   // bracketing in the ring (samples are time-ordered oldest -> newest) and
@@ -6656,11 +8047,12 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     int count = 0;
     int newest = 0;
     uint64_t seen = 0;
-    // EMA of this entity's own pose-change period. Characters/board update
-    // at the 60 Hz sim value cadence (~16.7 ms); traffic vehicles update
-    // SLOWER (their own sim rate); those entities need their evaluation
-    // point delayed by one own-period or the playback clock runs past
-    // their newest sample and they render raw stepped poses (see play_e).
+    // This entity's own pose-change period (mean spacing over the ring).
+    // Characters/board update at the 60 Hz sim value cadence (~16.7 ms);
+    // traffic vehicles update SLOWER (their own sim rate); those entities
+    // need their evaluation point delayed by one own-period or the playback
+    // clock runs past their newest sample and they render raw stepped poses
+    // (see play_e).
     double period = 0.0;
     // Per-bone skin-weighted vertex centroids in BIND space (w, x, y, z),
     // lazily computed from the mesh's own vertex buffer the first time a
@@ -7196,17 +8588,9 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       if (trk != nullptr) {
         trk->ing = 1;
       }
-      const double prev_t = h.count > 0 ? h.ring[h.newest].t : 0.0;
       h.newest = h.count == 0 ? 0 : (h.newest + 1) % kRing;
       DynPose& p = h.ring[h.newest];
       p.t = stamp;
-      if (prev_t > 0.0) {
-        // Track the entity's OWN pose-change period (see DynHist::period).
-        const double dt = p.t - prev_t;
-        if (dt > 0.0005 && dt < 0.1) {
-          h.period = h.period == 0.0 ? dt : h.period * 0.75 + dt * 0.25;
-        }
-      }
       p.b = item.bones;
       std::memcpy(p.w, item.world, sizeof(p.w));
       p.shape_seq = 0;
@@ -7216,6 +8600,15 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         p.shape_seq = sit != g_ropa_last_seq.end() ? sit->second : 0;
       }
       h.count = std::min(h.count + 1, kRing);
+      // The entity's OWN pose-change period (see DynHist::period): the mean
+      // spacing over the ring. A per-sample EMA read ONE missing pose (a
+      // doubled gap) as a slower entity and moved its playback point for a
+      // frame (see play_e); across the ring a single gap barely registers,
+      // while a vehicle's own slower rate still shows in full.
+      if (h.count >= 2) {
+        const double span = p.t - h.ring[(h.newest + kRing - h.count + 1) % kRing].t;
+        h.period = span / double(h.count - 1);
+      }
       if (skinned && !item.caster_bank && !item.retained) {
         h.last_persp_t = p.t;
       }
@@ -7289,9 +8682,11 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // motion, at the cost of that entity lagging one of ITS sim updates
     // behind the world, invisible for background traffic, and never
     // applied to 60 Hz entities (the skater/NPCs keep the shared clock).
-    const double play_e =
-        g_smooth_play -
-        (h.period > 0.020 ? std::min(h.period - 1.0 / 60.0, 0.1) : 0.0);
+    // The lead fades in between 18 and 22 ms of period, so an entity whose
+    // rate sits near that boundary never jumps by several ms in one frame.
+    const double lead = std::min(h.period - 1.0 / 60.0, 0.1) *
+                        std::clamp((h.period - 0.018) / 0.004, 0.0, 1.0);
+    const double play_e = g_smooth_play - lead;
     static std::vector<float> acc;  // guest render thread only
     float wacc[16] = {};
     bool ok = true;
@@ -8292,6 +9687,37 @@ void WidenPublishedCamera(FrameScene& scene, float scale) {
   }
 }
 
+// Published scenes hand their item storage back for the next build. A
+// scene holds records x 1,064 bytes of items, past 1 MB in dense New San
+// Van views, and the heap serves blocks that size straight from
+// VirtualAlloc: a fresh vector per frame mapped and zero-filled ~400 new
+// pages every frame (run 158: 13,000-23,000 page faults per second
+// whenever a view held ~1,000+ records) and unmapped them at release.
+std::mutex g_scene_items_pool_mutex;
+std::vector<std::vector<DrawItem>> g_scene_items_pool;  // guarded by the mutex
+
+std::vector<DrawItem> TakeSceneItems() {
+  std::lock_guard<std::mutex> lock(g_scene_items_pool_mutex);
+  if (g_scene_items_pool.empty()) {
+    return {};
+  }
+  std::vector<DrawItem> items = std::move(g_scene_items_pool.back());
+  g_scene_items_pool.pop_back();
+  return items;
+}
+
+// shared_ptr deleter for published scenes (whichever thread drops the last
+// reference: the builder replacing g_scene, or the renderer).
+void RecycleScene(const FrameScene* scene) {
+  std::vector<DrawItem> items = std::move(const_cast<FrameScene*>(scene)->items);
+  delete scene;
+  items.clear();  // keeps the capacity
+  std::lock_guard<std::mutex> lock(g_scene_items_pool_mutex);
+  if (g_scene_items_pool.size() < 4) {
+    g_scene_items_pool.push_back(std::move(items));
+  }
+}
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -8312,6 +9738,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   static uint64_t s_prev_build_ns = 0, s_prev_b2d_ns = 0, s_prev_bspl_ns = 0,
                   s_prev_bpal_ns = 0, s_prev_pal_tail_ns = 0, s_prev_cap_ns = 0;
   const auto build_t0 = PerfClock::now();
+  // Camera re-timing clock (see SetFrameClockNs).
+  const double frame_clock_s =
+      g_frame_clock_ns != 0
+          ? double(g_frame_clock_ns) * 1e-9
+          : std::chrono::duration<double>(build_t0.time_since_epoch()).count();
   if (s_last_frame_tp.time_since_epoch().count() != 0) {
     const uint64_t dt_ns = uint64_t(
         std::chrono::duration_cast<std::chrono::nanoseconds>(build_t0 - s_last_frame_tp)
@@ -8424,7 +9855,20 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   g_sky_seen_this_frame = false;
   const bool outline_edge_seen = g_outline_edge_seen;
   g_outline_edge_seen = false;
+  // Rate-limited diagnostics for a gameplay world that never publishes a scene.
+  const auto trace_capture = [&](const char* reason, uint32_t selected_view,
+                                  size_t items) {
+    if (!REXCVAR_GET(skate3_native_render_scene_capture_log)) return;
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(1)) return;
+    last = now;
+    REXLOG_INFO("native-scene capture: reason={} records={} view={:08X} items={} dynitems={} rej[chain={} geom={} draws={} bbox={}]",
+                reason, count, selected_view, items, dynitems.size(),
+                g_rej_chain.load(), g_rej_geom.load(), g_rej_draws.load(), g_rej_bbox.load());
+  };
   if (count == 0) {
+    trace_capture("no-records", 0, 0);
     return;
   }
 
@@ -8473,10 +9917,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
   if (view == 0) {
+    trace_capture("no-perspective-view", 0, 0);
     return;
   }
 
   FrameScene scene;
+  scene.items = TakeSceneItems();
   scene.items.reserve(count);
   std::unordered_set<uint32_t> seen;
   // Pre-size the per-frame bookkeeping: these fill with thousands of
@@ -8839,6 +10285,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // whose ctx did not publish this frame re-publishes with ITS OWN last
     // palette (<= 10 frames fresh), regardless of how many clones of the
     // mesh are alive.
+    const size_t rescue_first = scene.items.size();
     for (const auto& [ctxk, cand] : pending_skinned_by_ctx) {
       if (dyn_slot.find(ctxk) != dyn_slot.end()) {
         continue;  // this instance published live
@@ -8858,6 +10305,24 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       // publish the same instance this frame.
       dyn_slot.try_emplace(ctxk, scene.items.size() - 1);
       g_lw_ctx_rescued.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The authoritative serve above ran before these rescues existed, so a
+    // rescued piece kept its cached pose (up to 10 frames old) even when the
+    // game packed this frame's pose for it: the shoe (character.leather)
+    // froze in place while the running skater moved on (run 089 chardump:
+    // src=3 with a constant anchor at every detachment marker). Serve the
+    // rescued tail now and teach the ctx cache the fresh pose.
+    if (scene.items.size() > rescue_first) {
+      g_pal_served_frame +=
+          skate3::native_palette::ServeAuthoritativePalettes(base, scene, rescue_first);
+      for (size_t ri = rescue_first; ri < scene.items.size(); ++ri) {
+        const DrawItem& it = scene.items[ri];
+        if (it.dbg_src == 11 && it.ctx != 0) {
+          CachedBones& cb = g_bones_cache_ctx[it.ctx];
+          cb.bones = it.bones;
+          cb.frame = g_guest_frame;
+        }
+      }
     }
     // Rigid clone rescue: a piece whose world-bearing draw was missed this
     // frame (culled, or claimed by another clone of the mesh) re-publishes
@@ -9198,6 +10663,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  trace_capture(scene.items.empty() ? "empty-scene" : "scene-built", view, scene.items.size());
   if (scene.items.empty()) {
     return;
   }
@@ -9270,6 +10736,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   for (int i = 0; i < 16; ++i) {
     cam_view[i] = LoadGuestF32(base, viewcam + 0x20 + i * 4);
   }
+  const double cam_view_t =
+      std::chrono::duration<double>(PerfClock::now().time_since_epoch()).count();
   for (int j = 0; j < 3; ++j) {
     scene.cam_pos[j] =
         -(cam_view[12] * cam_view[j * 4 + 0] + cam_view[13] * cam_view[j * 4 + 1] +
@@ -9700,7 +11168,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       proj[i] = LoadGuestF32(base, viewcam + 0x60 + i * 4);
     }
     const double now_s =
-        std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+        frame_clock_s;
     // Auto-armed bone-signal recordings (diagnosis, see the cvar): first
     // window ~30 s after the scene comes up, re-armed every 90 s, 3 max.
     {
@@ -9768,8 +11236,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
     float smooth_vp[16], smooth_cam[3];
-    if (SmoothCamera(cam_view, proj, scene.view_proj, scene.cam_pos, now_s, smooth_vp,
-                     smooth_cam)) {
+    if (SmoothCamera(cam_view, proj, scene.view_proj, scene.cam_pos, cam_view_t, now_s,
+                     smooth_vp, smooth_cam)) {
       std::memcpy(scene.view_proj, smooth_vp, sizeof(smooth_vp));
       std::memcpy(scene.cam_pos, smooth_cam, sizeof(smooth_cam));
       // Keep the skater/NPCs/props in phase with the smoothed camera:
@@ -9861,11 +11329,21 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     g_retained_live.store(g_retained_items.size(), std::memory_order_relaxed);
   }
 
+  // Also remove any recently retained copies immediately on a hot toggle.
+  if (REXCVAR_GET(skate3_skate2_hide_inherited_backdrop) &&
+      skate3::world_loading::IsSkate2Gameplay()) {
+    std::erase_if(scene.items, [](const DrawItem& item) {
+      return skate3::world_loading::IsInheritedBackdrop(item.diffuse_guid, item.env_family);
+    });
+  }
+  TraceBamVisualScene(scene, guest_vp);
+  TraceBamGroundScene(scene, guest_vp);
+
   // Camera-signal recorder: per-frame raw + smoothed heading while the
   // window is open; write + reset when it closes (CamSigFrameTick).
   if (g_camsig_deadline.load(std::memory_order_relaxed) > 0.0) {
     const double rec_now =
-        std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+        frame_clock_s;
     float rot[16] = {};
     const float* smoothed = nullptr;
     if (g_smooth_active) {
@@ -9883,7 +11361,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // against the known ideal.
   {
     const double syn_now =
-        std::chrono::duration<double>(build_t0.time_since_epoch()).count();
+        frame_clock_s;
     int syn_mode =
         std::clamp(int(REXCVAR_GET(skate3_native_render_scene_synthetic_pan)), 0, 3);
     if (syn_mode == 3 && !REXCVAR_GET(skate3_native_render_scene_smooth_camera)) {
@@ -10078,6 +11556,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     std::memcpy(scene.scroll_rows, g_scroll_rows, sizeof(scene.scroll_rows));
     scene.scroll_valid = true;
   }
+  // Traffic lamp rows persist between captures: the state is global and the
+  // lamps are only drawn when the game draws them (which recaptures it).
+  for (int k = 0; k < 2; ++k) {
+    if (g_traffic_have[k]) {
+      std::memcpy(scene.traffic_rows[k], g_traffic_rows[k], sizeof(scene.traffic_rows[k]));
+      scene.traffic_valid[k] = true;
+    }
+  }
   if (g_shadow_have) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
@@ -10085,6 +11571,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // re-capture every frame, so anything past a couple of seconds means the
     // current venue's environment shader never produces a sane bank.
     scene.shadow_fresh = g_guest_frame - g_shadow_rows_frame <= 120;
+    scene.shadow_age = uint32_t(
+        std::min<uint64_t>(g_guest_frame - g_shadow_rows_frame, 0xFFFFFFFFu));
   }
   // Character CSM receive biases (see the header comment): frame-coherent,
   // served while fresh enough that a few capture-less frames don't flap the
@@ -10157,20 +11645,124 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // of draw suppression). The vignette and grain fetch words come from the
   // fisheye/uber fetch-shadow snapshots (slot 2 / slot 6 per the
   // ring-verified bindings).
-  if (uint8_t* pfx_base = g_guest_base.load(std::memory_order_relaxed);
-      pfx_base != nullptr && g_photo_flow_frame.load(std::memory_order_relaxed) &&
-      PhotoEditorSignal(pfx_base) != nullptr) {
+  // Gameplay: the same chain whenever the game ITSELF ran it moments ago (the
+  // left-trigger slow-motion bail camera; ordinary gameplay uses
+  // postfx_fast_uberPS, which no pass classifies as). A tight freshness
+  // window drops the chain within a few frames of the game leaving it.
+  uint8_t* const pfx_base = g_guest_base.load(std::memory_order_relaxed);
+  const bool pfx_editor = pfx_base != nullptr &&
+                          g_photo_flow_frame.load(std::memory_order_relaxed) &&
+                          PhotoEditorSignal(pfx_base) != nullptr;
+  const bool pfx_gameplay = pfx_base != nullptr && !pfx_editor &&
+                            !g_photo_flow_frame.load(std::memory_order_relaxed) &&
+                            REXCVAR_GET(skate3_native_render_scene_gameplay_postfx);
+  // Gameplay chain diagnostics (independent of the cvar): one dump at the
+  // start of each episode the game runs its full chain and one ~45 frames
+  // in: the live rows, the passes' bound fetch words (visualfx tf3 = the
+  // accumulation input natively fed black) and the draw order of the HoM
+  // bones against the chain.
+  if (pfx_base != nullptr && !pfx_editor) {
+    const int64_t dnow = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             PerfClock::now().time_since_epoch())
+                             .count();
+    const bool running = g_pfx_cap[kPfxVisualFx].ps_ns != 0 &&
+                         dnow - g_pfx_cap[kPfxVisualFx].ps_ns <= 150'000'000;
+    static uint64_t s_ep_last = 0, s_ep_start = 0;
+    static int s_ep_dumps = 0;
+    static std::atomic<uint32_t> s_diag_logs{0};
+    if (running) {
+      if (g_guest_frame - s_ep_last > 30) {
+        s_ep_start = g_guest_frame;
+        s_ep_dumps = 0;
+      }
+      s_ep_last = g_guest_frame;
+      const bool due = (s_ep_dumps == 0) ||
+                       (s_ep_dumps == 1 && g_guest_frame - s_ep_start >= 45);
+      if (due && REXCVAR_GET(skate3_native_render_scene_postfx_log) && s_diag_logs.fetch_add(1, std::memory_order_relaxed) < 48) {
+        ++s_ep_dumps;
+        const auto rows = [](const float (*r)[4], int n) {
+          std::string t;
+          for (int k = 0; k < n; ++k) {
+            char b[80];
+            std::snprintf(b, sizeof(b), " c%d=(%.3f,%.3f,%.3f,%.3f)", k, r[k][0], r[k][1],
+                          r[k][2], r[k][3]);
+            t += b;
+          }
+          return t;
+        };
+        const auto fetches = [](const uint32_t (*f)[6]) {
+          std::string t;
+          for (int k = 0; k < 8; ++k) {
+            char b[48];
+            std::snprintf(b, sizeof(b), " tf%d=%08X/%08X/%08X", k, f[k][0], f[k][1], f[k][2]);
+            t += b;
+          }
+          return t;
+        };
+        static const char* kNames[kPfxPassCount] = {"visualfx", "dofdown", "dofmb",
+                                                    "dof",      "uber",    "fisheye"};
+        for (int p = 0; p < kPfxPassCount; ++p) {
+          REXLOG_INFO("native-pfx-diag: frame={} +{} pass={} ps:{} vs:{} fetch:{}", g_guest_frame,
+                      g_guest_frame - s_ep_start, kNames[p],
+                      rows(g_pfx_cap[p].ps, p == kPfxVisualFx ? 17 : 12),
+                      rows(g_pfx_cap[p].vs, 4), fetches(g_pfx_cap[p].fetch));
+        }
+        static const char* kOrd[kOrdCount] = {"visualfx", "uber", "fisheye", "noise", "hom",
+                                              "projtex"};
+        std::string ord;
+        for (int k = 0; k < kOrdCount; ++k) {
+          char b[64];
+          std::snprintf(b, sizeof(b), " %s=f%llu/s%llu", kOrd[k],
+                        (unsigned long long)g_pfx_order_frame[k],
+                        (unsigned long long)g_pfx_order_seq[k]);
+          ord += b;
+        }
+        REXLOG_INFO("native-pfx-order: frame={}{}", g_guest_frame, ord);
+        // Ghost-trail check: character meshes published more than once this
+        // frame (stale clones would leave faded copies along the bail path).
+        std::unordered_map<uint32_t, int> per_mesh;
+        int chars = 0;
+        for (const DrawItem& it : scene.items) {
+          if (it.char_family == 0) continue;
+          ++chars;
+          ++per_mesh[it.mesh];
+        }
+        std::string dups;
+        for (const DrawItem& it : scene.items) {
+          if (it.char_family == 0 || per_mesh[it.mesh] < 2) continue;
+          char b[160];
+          std::snprintf(b, sizeof(b), " [%08X %s fam=%d src=%d fade=%d w=(%.2f,%.2f,%.2f)]",
+                        it.mesh, it.material_name, int(it.char_family), int(it.dbg_src),
+                        int(it.dyn_entity), it.bones.size() >= 12 ? it.bones[3] : it.world[12],
+                        it.bones.size() >= 12 ? it.bones[7] : it.world[13],
+                        it.bones.size() >= 12 ? it.bones[11] : it.world[14]);
+          if (dups.size() < 1500) dups += b;
+        }
+        REXLOG_INFO("native-pfx-chars: frame={} char_items={} dup_meshes:{}", g_guest_frame,
+                    chars, dups.empty() ? std::string(" none") : dups);
+      }
+    }
+  }
+  if (pfx_editor || pfx_gameplay) {
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                PerfClock::now().time_since_epoch())
                                .count();
+    const int64_t window_ns = pfx_editor ? 1'000'000'000 : 150'000'000;
     bool fresh = true;
     for (int p = 0; p < kPfxPassCount; ++p) {
-      if (g_pfx_cap[p].ps_ns == 0 || now_ns - g_pfx_cap[p].ps_ns > 1'000'000'000 ||
+      if (g_pfx_cap[p].ps_ns == 0 || now_ns - g_pfx_cap[p].ps_ns > window_ns ||
           !g_pfx_cap[p].vs_seen) {
         fresh = false;
       }
     }
-    if (!fresh) {
+    // Gameplay: silent when the chain is simply not running (every frame of
+    // normal play); the editor keeps its missing-pass diagnostic.
+    bool any_fresh = false;
+    for (int p = 0; p < kPfxPassCount; ++p) {
+      any_fresh = any_fresh ||
+                  (g_pfx_cap[p].ps_ns != 0 && now_ns - g_pfx_cap[p].ps_ns <= window_ns);
+    }
+    if (!fresh && (pfx_editor || any_fresh)) {
       // Name the missing pass(es), once per ~2 s while in the window.
       static int64_t s_diag_ns = 0;
       if (now_ns - s_diag_ns > 2'000'000'000) {
@@ -10199,6 +11791,43 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                   sizeof(scene.photo_fx.vignette_fetch));
       std::memcpy(scene.photo_fx.grain_fetch, g_pfx_cap[kPfxUber].fetch[6],
                   sizeof(scene.photo_fx.grain_fetch));
+      // fisheye_noise video look: rows c3..c6 + the noise texture (tf5),
+      // while the noise variant is drawing.
+      if (g_pfx_noise_cap.ps_ns != 0 && now_ns - g_pfx_noise_cap.ps_ns <= window_ns) {
+        scene.photo_fx.noise = true;
+        std::memcpy(scene.photo_fx.noise_rows, g_pfx_noise_cap.ps[3],
+                    sizeof(scene.photo_fx.noise_rows));
+        std::memcpy(scene.photo_fx.noise_fetch, g_pfx_noise_cap.fetch[5],
+                    sizeof(scene.photo_fx.noise_fetch));
+      }
+      // One line per gameplay episode (a gap of > 30 frames starts a new
+      // one), plus the first frame the noise variant joins it.
+      static std::atomic<uint32_t> s_gp_logs{0};
+      static uint64_t s_gp_last = 0;
+      static bool s_gp_noise = false;
+      const bool gp_new = pfx_gameplay && g_guest_frame - s_gp_last > 30;
+      if (gp_new) s_gp_noise = false;
+      const bool gp_noise_new = pfx_gameplay && scene.photo_fx.noise && !s_gp_noise;
+      if (pfx_gameplay) {
+        s_gp_last = g_guest_frame;
+        s_gp_noise = s_gp_noise || scene.photo_fx.noise;
+      }
+      if (gp_new || gp_noise_new) {
+        if (REXCVAR_GET(skate3_native_render_scene_postfx_log) && s_gp_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+          REXLOG_INFO(
+              "native-pfx-gameplay: chain {} frame={} uber c5=({:.3f},{:.3f},{:.3f},{:.3f}) "
+              "noise={} fade=({:.3f},{:.3f}) scroll=({:.3f},{:.3f},{:.3f},{:.3f}) "
+              "noise_tex=[{:08X} {:08X} {:08X}]",
+              pfx_gameplay ? "ON" : "editor", g_guest_frame, g_pfx_cap[kPfxUber].ps[5][0],
+              g_pfx_cap[kPfxUber].ps[5][1], g_pfx_cap[kPfxUber].ps[5][2],
+              g_pfx_cap[kPfxUber].ps[5][3], scene.photo_fx.noise,
+              scene.photo_fx.noise_rows[1][0], scene.photo_fx.noise_rows[1][1],
+              scene.photo_fx.noise_rows[0][0], scene.photo_fx.noise_rows[0][1],
+              scene.photo_fx.noise_rows[0][2], scene.photo_fx.noise_rows[0][3],
+              scene.photo_fx.noise_fetch[0], scene.photo_fx.noise_fetch[1],
+              scene.photo_fx.noise_fetch[2]);
+        }
+      }
       static bool s_pfx_logged = false;
       if (!s_pfx_logged) {
         s_pfx_logged = true;
@@ -10411,6 +12040,38 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       return;
     }
   }
+  // Tattoo-UV rows (DrawItem::stamp_uv) for skin copies that reached the
+  // scene without their own palette capture (fixups, rescues, retained).
+  {
+    std::lock_guard lock(g_stamp_uv_mutex);
+    if (!g_stamp_uv.empty() || !g_stamp_fetch.empty()) {
+      for (DrawItem& item : scene.items) {
+        if (item.char_family != 2) continue;
+        if (!item.stamp_uv_valid) {
+          const auto it = g_stamp_uv.find(item.mesh);
+          if (it != g_stamp_uv.end()) {
+            std::copy(it->second.begin(), it->second.end(), item.stamp_uv);
+            item.stamp_uv_valid = true;
+          }
+        }
+        if (item.stamp_fetch[1] == 0) {
+          const auto ft = g_stamp_fetch.find(item.mesh);
+          if (ft != g_stamp_fetch.end()) {
+            std::copy(ft->second.begin(), ft->second.end(), item.stamp_fetch);
+          }
+        }
+      }
+    }
+    if (!g_hom_fetch.empty()) {
+      for (DrawItem& item : scene.items) {
+        if (item.char_family != 8 || item.diffuse_fetch[1] != 0) continue;
+        const auto ft = g_hom_fetch.find(item.mesh);
+        if (ft != g_hom_fetch.end()) {
+          std::copy(ft->second.begin(), ft->second.end(), item.diffuse_fetch);
+        }
+      }
+    }
+  }
   // Game shadow-pass parity (see g_frame_ortho_ctx): mark the items whose
   // ctx the game submitted through an ortho caster bank. Runs after every
   // item source (merge, rescues, gap fill) and is OR-only. The ortho
@@ -10448,7 +12109,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                           std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
-  g_scene = std::make_shared<const FrameScene>(std::move(scene));
+  g_scene = std::shared_ptr<const FrameScene>(new FrameScene(std::move(scene)), RecycleScene);
 }
 
 // StartRecording / WriteRecording: native/skate3_native_diagnostics.cpp.

@@ -13,7 +13,21 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
   float3 vd = -normalize(i.rpos);
   float3 lin;
   float out_a = 1.0;
-  if (fam > 5.5) {
+  if (fam > 7.5) {
+    // Hall of Meat x-ray bones, exact from defaulthom_defaultPS (ucode +
+    // constant table, out/research/log084/s3_disasm): unlit.
+    //   tinted = max(D^2, colorParams.y) * boneClr
+    //   rim    = (1 - sat(N.V))^m_params[1].w
+    //   col    = tinted + D^2 (1 - rim) colorParams.x * (D^2 - tinted)
+    // times m_params[0].y, fixed exposure 1. ch_tintA = boneClr,
+    // ch_tintB.xyz = (colorParams.x, colorParams.y, m_params[0].y),
+    // ch_light.w = the rim power.
+    float3 tinted = max(dlin, ch_tintB.y) * ch_tintA.rgb;
+    float rim = pow(max(1.0 - saturate(dot(vd, cn)), 1e-6), ch_light.w);
+    float3 core = dlin * (1.0 - rim) * ch_tintB.x;
+    lin = (tinted + core * (dlin - tinted)) * ch_tintB.z;
+    return ToneOut(lin, 1.0, false);
+  } else if (fam > 5.5) {
     // Traffic vehicles (vehicle.fx fam 6 body / vehicle_glass.fx fam 7
     // windows, disassembled from vehicle_defaultPS): paint recolor where
     // the diffuse green channel is below the mask threshold (red-channel
@@ -43,7 +57,10 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
     // map = the emulated car).
     float3 vn = cn;
     if (overlay.z > 0.5) {
-      float2 nm = macro.Sample(smp, i.uv).rg * 2.0 - 1.0;
+      // Imported DXT5nm uses AG; retail DXN uses RG. overlay.w is
+      // selected from the resolved texture format in New San Van only.
+      float4 normal_sample = macro.Sample(smp, i.uv);
+      float2 nm = (overlay.w > 0.5 ? normal_sample.ag : normal_sample.rg) * 2.0 - 1.0;
       float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
       float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
       float3 dp2p = cross(dp2, cn), dp1p = cross(cn, dp1);
@@ -69,11 +86,46 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
     // diffuse fetch (linear-space decode), alpha included; raw alpha
     // over-specs ~5x and mottles the body panels.
     float gloss = fam < 6.5 ? albedo.a * albedo.a : 1.0;
-    lin = sel * (ch_key.rgb * vndl + ch_amb.rgb) +
-          (spec * ch_sh[0].rgb + cube) * fres * gloss;
+    // Original vehicle.fx shadows direct diffuse and key specular;
+    // ambient and the environment reflection remain independent of it.
+    float vehicle_shadow = 1.0;
+    if (overlay.w > 0.5) {
+      vehicle_shadow = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy),
+                           SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy));
+    }
+    lin = sel * (ch_key.rgb * vndl * vehicle_shadow + ch_amb.rgb) +
+          (spec * ch_sh[0].rgb * vehicle_shadow + cube) * fres * gloss;
     out_a = ch_misc.x;
+  } else if (fam > 3.5 && fam < 4.5) {
+    // CAC player hair, exact from cac_hair_defaultPS (ucode + constant
+    // table, out/research/log084/s3_disasm; same body as Skate 2's
+    // cac_hair.fx source):
+    //   D^2 * [ c16 * (sat(0.75 N.L + 0.25) * shadow + c14.w/4)
+    //         + c17 * sinTH^c11.w * sat(1.75 N.L + 0.25) * shadow ]
+    // N = the DXN normal map on the strand frame, T.H = the Kajiya-Kay
+    // strand term along the tangent (H = normalize(V + L)), shadow =
+    // max(world shadow, c3.w). The world shadow is the baked building/tree
+    // shade (our native static sun map); hair takes no CSM. The previous
+    // port used defaulthair's fresnel rim here and no shadow at all, so
+    // hair stayed fully lit in shade and read far lighter than its color.
+    float3 htt, hbb;
+    ScreenTangentFrame(cn, i.rpos, i.uv, htt, hbb);
+    float3 hn = cn;
+    if (overlay.z > 0.5) {
+      float2 nm = macro.SampleBias(smp, i.uv, misc.y).ag * 2.0 - 1.0;
+      hn = normalize(nm.x * htt + nm.y * hbb +
+                     cn * sqrt(saturate(1.0 - dot(nm, nm))));
+    }
+    float hndl = dot(hn, ch_light.xyz);
+    float3 hh = normalize(vd + ch_light.xyz);
+    float th = dot(normalize(htt), hh);
+    float strand = pow(max(sqrt(saturate(1.0 - th * th)), 1e-6), ch_light.w);
+    float hs = max(SampleStaticSun(i.rpos + cam_pos.xyz, hn, i.pos.xy), ch_misc.z);
+    lin = dlin * (ch_key.rgb * (saturate(hndl * 0.75 + 0.25) * hs + ch_amb.w) +
+                  ch_tintB.rgb * strand * saturate(hndl * 1.75 + 0.25) * hs);
+    out_a = saturate(decal_art.Sample(smp, i.uv2).r * ch_tintB.w);
   } else if (fam > 3.5) {
-    // Hair (cac_hair / defaulthair): key on a wrapped N.L ramp + flat
+    // NPC hair (defaulthair): key on a wrapped N.L ramp + flat
     // ambient, fresnel rim tint on a steeper ramp; strand coverage from
     // the mesh's "alpha" channel at the raw second texcoord (bound at t4)
     // - alpha-blended in the sorted sub-pass (hair drawn opaque is the
@@ -138,6 +190,39 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
                     SampleStaticSun(i.rpos + cam_pos.xyz, vn, i.pos.xy));
     if (ch_tintA.w > 0.0) {
       dlin *= ch_tintA.rgb;
+    }
+    // CAC skin stamps (cacstamp_skin_defaultPS; misc.z flags staged only on
+    // that layout): the composed tattoo texture at the second texcoord
+    // multiplies by lerp(1, rgb, a); the second overlay (first texcoord)
+    // blends over by its alpha x i_params.z (misc.w). Stamp colors are used
+    // as fetched (the ucode does not square them).
+    if (misc.z > 0.5) {
+      uint sf = (uint)(misc.z + 0.5);
+      if ((sf & 1u) != 0u) {
+        // Tattoo uv = the VS rows (c190/c191) applied to (uv1, 1): row 0 in
+        // mat_tint.xyz, row 1 in (overlay.xy, mat_tint.w).
+        float3 u1 = float3(i.uv2, 1.0);
+        float2 tuv = float2(dot(u1, mat_tint.xyz),
+                            dot(u1, float3(overlay.xy, mat_tint.w)));
+        // Address mode (flags 4 edge / 16 border, else wrap) from the
+        // draw's fetch constant; the atlas covers only part of the uv range
+        // (wrap tiled stray tattoos across the body). Border = transparent
+        // outside [0,1], the multiply's neutral.
+        float4 tat = (sf & 20u) != 0u ? detail_map.Sample(smp_clamp, tuv)
+                                      : detail_map.Sample(smp, tuv);
+        if ((sf & 16u) != 0u && any(saturate(tuv) != tuv)) {
+          tat.a = 0.0;
+        }
+        dlin *= lerp(float3(1.0, 1.0, 1.0), tat.rgb, tat.a);
+      }
+      if ((sf & 2u) != 0u) {
+        float4 ov2 = (sf & 40u) != 0u ? spec2_map.Sample(smp_clamp, i.uv)
+                                      : spec2_map.Sample(smp, i.uv);
+        if ((sf & 32u) != 0u && any(saturate(i.uv) != i.uv)) {
+          ov2.a = 0.0;
+        }
+        dlin = lerp(dlin, ov2.rgb, ov2.a * misc.w);
+      }
     }
     float3 irr = saturate(
         ch_sh[0].rgb + vn.x * ch_sh[1].rgb + vn.y * ch_sh[2].rgb +

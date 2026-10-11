@@ -92,4 +92,28 @@ cbuffer S : register(b1) {
   // kRatioInner/kRatioMid constants), w = tile size in pixels (tap
   // clamping).
   float4 nsm_p2;
+  // Skate 2 PCA water animation. Separate from the captured S3 ocean rows.
+  float4 s2_pca[7]; // mean, R0, R1, G0, G1, B0, B1 (cb[164..191])
+  // Skate 2 vertex animation (vertexanimate.fx flags / treeanimate.fx
+  // trees), read by vs_main: x = g_fAnimationTime (seconds), y = enable
+  // (New San Van only) (cb[192..195]); then m_params[0..2] of
+  // animated.flag (rows 0-2) and animated.tree (rows 3-5) (cb[196..219]).
+  float4 s2_anim_t;
+  float4 s2_anim[6];
+  // Scene options (cb[220..223]): x = smooth lightmap reconstruction
+  // (cubic B-spline over the baked lighting atlas, see SampleWorldLightmap),
+  // y = cube LOD bias log2(render height / 640) for Skate2SpecTerm, z = the
+  // static sun strength WITHOUT the venue factor (Stadium crowd seating),
+  // w = the Skate 2 ocean's low-angle reflection rise kept
+  // (skate3_skate2_ocean_glare; 1 = Skate 2's original Fresnel).
+  float4 scene_opts;
+  // New San Vanelona at night (cb[224..227]): xyz = linear factor on the
+  // world's baked light, matched to the Sanitarium's night lightmaps (see
+  // kNightGrade); w > 0.5 enables. Zero outside night mode and New San Van.
+  float4 night_grade;
 };
+// The night factor for baked and pre-lit world light (1 when off). Applied
+// after the shadow clamp, so live shadows keep their daylight contrast.
+float3 NightGrade() {
+  return night_grade.w > 0.5 ? night_grade.xyz : float3(1.0, 1.0, 1.0);
+}

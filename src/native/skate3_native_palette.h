@@ -56,9 +56,11 @@ uint32_t ExchangePackOwner(uint32_t entity);
 // Called from BuildFrameScene while the frame's items are finalized:
 // replaces each mapped skinned character item's captured bank palette with
 // its instance's own packed rows. Served items get dbg_src=11 and
-// caster_bank=false. Returns the number of items served.
+// caster_bank=false. Returns the number of items served. first_item limits
+// the pass to scene.items[first_item..] (the post-rescue re-serve).
 uint32_t ServeAuthoritativePalettes(uint8_t* base,
-                                    skate3::native_scene::FrameScene& scene);
+                                    skate3::native_scene::FrameScene& scene,
+                                    size_t first_item = 0);
 
 // Called from BuildFrameScene at the frame tail: rotates this frame's
 // snapshots into the previous-frame slot (draws of frame N may consume the

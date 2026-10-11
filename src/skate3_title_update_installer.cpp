@@ -680,6 +680,12 @@ bool DownloadAndStageTitleUpdate(const std::filesystem::path& game_root,
 
 }  // namespace
 
+bool DownloadTitleUpdateForSetup(const std::filesystem::path& staging,
+                                  std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total,
+                                  std::string& error) {
+  return DownloadAndStageTitleUpdate(staging, copied, total, error);
+}
+
 bool IsTitleUpdateInstalled(const std::filesystem::path& game_root) {
   for (const auto& payload : kPayloads) {
     const auto staged = game_root / std::filesystem::path(std::string(payload.staged_path));
@@ -785,8 +791,8 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
   options.fetch_working_status = "Downloading Title Update 3...";
   options.install_working_status = "Installing the title update...";
   options.done_status = "Title Update 3 installed.";
-  options.done_button_label = "Start Game";
-  options.launching_status = "Starting the game...";
+  options.done_button_label = "Continue";
+  options.launching_status = "Continuing setup...";
 
   auto fetch = [game_root](std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
                            std::string& error) {

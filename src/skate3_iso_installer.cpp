@@ -10,13 +10,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include <rex/logging.h>
-#include <rex/ui/overlay/install_wizard_overlay.h>
+#include <rex/ui/overlay/acquire_wizard_overlay.h>
 #include <rex/ui/windowed_app_context.h>
 
 #if defined(_WIN32)
@@ -72,7 +73,8 @@ bool IsUnsafeIsoPath(std::string_view path) {
       end = path.size();
     }
     auto component = path.substr(start, end - start);
-    if (component.empty() || component == "." || component == "..") {
+    if (component.empty() || component == "." || component == ".." ||
+        component.find_first_of(":\\") != std::string_view::npos) {
       return true;
     }
     if (end == path.size()) {
@@ -207,6 +209,11 @@ class XboxIsoReader {
       return false;
     }
 
+    // IsGameInstalled uses default.xex as its completion sentinel. Write it
+    // last so interrupted ISO extraction re-enters setup on the next launch.
+    std::stable_sort(entries_.begin(), entries_.end(), [](const auto& a, const auto& b) {
+      return (ToLower(a.path) == "default.xex") < (ToLower(b.path) == "default.xex");
+    });
     return true;
   }
 
@@ -215,6 +222,35 @@ class XboxIsoReader {
     return std::any_of(entries_.begin(), entries_.end(), [&](const IsoEntry& entry) {
       return ToLower(entry.path) == wanted;
     });
+  }
+
+  bool VerifyTitle(uint32_t expected, std::string& error) {
+    const auto it = std::find_if(entries_.begin(), entries_.end(), [](const auto& e) {
+      return ToLower(e.path) == "default.xex";
+    });
+    auto be32 = [](const uint8_t* p) {
+      return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+    std::array<uint8_t, 24> header{};
+    if (it != entries_.end() && it->size >= header.size() &&
+        ReadAt(it->offset, header.data(), header.size()) &&
+        std::string_view(reinterpret_cast<char*>(header.data()), 4) == "XEX2") {
+      const uint32_t count = be32(header.data() + 20);
+      if (count <= (it->size - 24) / 8 && count <= 4096) {
+        for (uint32_t n = 0; n < count; ++n) {
+          std::array<uint8_t, 8> optional{};
+          if (!ReadAt(it->offset + 24 + n * 8, optional.data(), optional.size())) break;
+          if (be32(optional.data()) != 0x00040006) continue;
+          const uint64_t offset = be32(optional.data() + 4);
+          std::array<uint8_t, 24> execution{};
+          if (offset + execution.size() <= it->size &&
+              ReadAt(it->offset + offset, execution.data(), execution.size()) &&
+              be32(execution.data() + 12) == expected) return true;
+        }
+      }
+    }
+    error = expected == 0x4541087F ? "Select a Skate 2 Xbox 360 ISO." : "Select a Skate 3 Xbox 360 ISO.";
+    return false;
   }
 
   uint64_t TotalSize() const {
@@ -248,7 +284,9 @@ class XboxIsoReader {
         return false;
       }
 
-      std::ofstream out(target, std::ios::binary | std::ios::trunc);
+      const bool sentinel = ToLower(entry.path) == "default.xex";
+      const auto writing = sentinel ? target.parent_path() / "default.xex.installing" : target;
+      std::ofstream out(writing, std::ios::binary | std::ios::trunc);
       if (!out) {
         error = "Unable to create " + entry.path + ".";
         return false;
@@ -270,6 +308,15 @@ class XboxIsoReader {
         remaining -= chunk;
         read_offset += chunk;
         copied_bytes.fetch_add(chunk, std::memory_order_relaxed);
+      }
+      out.close();
+      if (!out) {
+        error = "Failed to finish writing " + entry.path + ".";
+        return false;
+      }
+      if (sentinel) {
+        std::filesystem::rename(writing, target, ec);
+        if (ec) { error = "Unable to complete ISO installation: " + ec.message(); return false; }
       }
     }
 
@@ -298,6 +345,8 @@ class XboxIsoReader {
     pending.push_back({directory_offset, 0, prefix});
     std::array<uint8_t, 14> header{};
     size_t visited = 0;
+    std::set<uint64_t> visited_offsets;
+    std::set<std::string> paths;
 
     while (!pending.empty()) {
       auto node = std::move(pending.back());
@@ -308,7 +357,8 @@ class XboxIsoReader {
       }
 
       const uint64_t entry_offset = node.directory_offset + node.node_offset;
-      if (!ReadAt(entry_offset, header.data(), header.size())) {
+      if (!visited_offsets.insert(entry_offset).second ||
+          !ReadAt(entry_offset, header.data(), header.size())) {
         error = "Failed to read an ISO directory entry.";
         return false;
       }
@@ -339,6 +389,12 @@ class XboxIsoReader {
 
       const bool is_directory = (attributes & 0x10) != 0;
       const std::string full_path = node.prefix + name;
+      if (IsUnsafeIsoPath(full_path) || name.find('\0') != std::string::npos ||
+          !paths.insert(ToLower(full_path)).second ||
+          game_offset + uint64_t(sector) * kSectorSize + length > file_size_) {
+        error = "The ISO contains an unsafe, duplicate, or truncated entry.";
+        return false;
+      }
       if (is_directory) {
         if (length != 0) {
           pending.push_back({game_offset + uint64_t(sector) * kSectorSize, 0, full_path + "/"});
@@ -359,6 +415,20 @@ class XboxIsoReader {
 
 }  // namespace
 
+bool ValidateXboxIso(const std::filesystem::path& source, uint32_t title, std::string& error) {
+  XboxIsoReader iso;
+  return iso.Open(source, error) && iso.VerifyTitle(title, error);
+}
+
+bool ExtractXboxIso(const std::filesystem::path& source, const std::filesystem::path& target,
+                    uint32_t expected_title, std::atomic<uint64_t>& copied,
+                    std::atomic<uint64_t>& total, std::string& error) {
+  XboxIsoReader iso;
+  if (!iso.Open(source, error) || !iso.VerifyTitle(expected_title, error)) return false;
+  total = iso.TotalSize();
+  return iso.ExtractAll(target, copied, error);
+}
+
 bool IsGameInstalled(const std::filesystem::path& game_root) {
   return std::filesystem::is_regular_file(game_root / std::string(kDefaultXex));
 }
@@ -375,7 +445,7 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
                              std::atomic<uint64_t>& copied_bytes,
                              std::atomic<uint64_t>& total_bytes, std::string& error) {
     XboxIsoReader iso;
-    if (!iso.Open(source, error)) {
+    if (!iso.Open(source, error) || !iso.VerifyTitle(0x454108E6, error)) {
       return false;
     }
     total_bytes = iso.TotalSize();
@@ -389,10 +459,18 @@ void ShowRexglueIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig r
     return true;
   };
 
-  new rex::ui::InstallWizardDialog(
-      drawer, "Setup", "Game Files",
-      "Skate 3 game files were not found. Select your Xbox 360 ISO to install them.",
-      game_root.string(), std::move(pick_source), std::move(install),
+  rex::ui::AcquireWizardDialog::Options options;
+  options.title = "Setup";
+  options.section_label = "Skate 3";
+  options.intro = "Select your Skate 3 Xbox 360 ISO to install its files.";
+  options.target_directory = game_root.string();
+  options.pick_button_label = "Select ISO";
+  options.install_working_status = "Extracting Skate 3...";
+  options.done_status = "Skate 3 files installed.";
+  options.done_button_label = "Continue";
+  options.launching_status = "Continuing setup...";
+  new rex::ui::AcquireWizardDialog(
+      drawer, std::move(options), {}, std::move(pick_source), std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
         if (complete) {
           complete(std::move(runtime_paths));
@@ -416,7 +494,7 @@ bool RunRexglueIsoInstallWizardBlocking(rex::ui::WindowedAppContext& app_context
                      const std::filesystem::path& source, std::atomic<uint64_t>& copied_bytes,
                      std::atomic<uint64_t>& total_bytes, std::string& error) {
     XboxIsoReader iso;
-    if (!iso.Open(source, error)) {
+    if (!iso.Open(source, error) || !iso.VerifyTitle(0x454108E6, error)) {
       return false;
     }
     total_bytes = iso.TotalSize();

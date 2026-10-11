@@ -1,0 +1,4 @@
+Recast Navigation v1.6.0
+https://github.com/recastnavigation/recastnavigation/tree/v1.6.0
+Archive SHA256 d48ca0121962fa0639502c0f56c4e3ae72f98e55d88727225444f500775c0074
+Only the unmodified Recast mesh-building module and license are vendored.

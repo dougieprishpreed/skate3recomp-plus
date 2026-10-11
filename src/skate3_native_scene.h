@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <string>
 
 namespace skate3::native_scene {
 
@@ -20,7 +21,26 @@ struct DrawEntry {
   uint32_t index_count;
 };
 
+inline std::string DescribeDrawRanges(const std::vector<DrawEntry>& draws) {
+  std::string result;
+  for (const auto& d : draws) {
+    if (!result.empty()) result += ";";
+    result += std::to_string(d.prim) + "," + std::to_string(d.base_vertex) + "," +
+              std::to_string(d.start_index) + "," + std::to_string(d.index_count);
+  }
+  return result;
+}
+
+inline uint64_t DrawRangesHash(const std::vector<DrawEntry>& draws) {
+  uint64_t hash = 14695981039346656037ull;
+  for (const auto& d : draws)
+    for (uint32_t word : {d.prim, d.base_vertex, d.start_index, d.index_count})
+      hash = (hash ^ word) * 1099511628211ull;
+  return hash;
+}
+
 struct DrawItem {
+  char material_name[40] = {};
   // Guest MeshContext this item was captured from (0 for frame-end world
   // items served from the item cache). Identity key for the palette serve
   // and the entity store: the owning cModelInstance is resolved backward by
@@ -42,7 +62,15 @@ struct DrawItem {
   uint32_t ib_addr;   // guest address of raw index data (u16 big-endian)
   uint32_t vb_bytes;
   uint32_t ib_count;
+  uint64_t diffuse_guid = 0;  // Original material identity for BAM visual diagnostics.
   uint32_t diffuse_tex;   // guest renderengine::Texture address (0 = none)
+  uint32_t chromaticity_tex = 0;
+  float mono_lightmap_dot[4] = {};
+  bool packed_lightmap = false;
+  // Declared texture channels (non-zero GUID) whose texture object is not
+  // resolvable yet, the game binding streamed textures a few frames after
+  // first draw: 1 diffuse, 2 lightmap, 4 chromaticity.
+  uint8_t tex_missing = 0;
   uint32_t lightmap_tex;  // guest renderengine::Texture address (0 = none)
   // Streamed-artwork diffuse override (event posters): the Massive ad
   // system rebinds the diffuse fetch slot at draw time with the current
@@ -218,8 +246,80 @@ struct DrawItem {
   // 12 = incandescent.default, 13 = environment.reflective_trans
   // (transparentenvironmentreflective: blended glass, alpha sub-pass),
   // 14 = incandescent.backlituvscroll (scrollincandescent: the emissive
-  // time-scrolled LED chyron band).
+  // time-scrolled LED chyron band), 15 = Skate 2 animated.flag.
+  // New San Van only (ApplySkate2Material, per frame): 16 = Skate 2
+  // incandescent effects (baseincandescent / zbiasincandescent(backlit) /
+  // transparentincandescent / videoscreen), 17 = glare.default (glare.fx
+  // camera-facing lamp halo), 18 = godray.spotlight (godrayspotlight.fx).
+  // Every world: 20 = trafficlight.one/.two (the signal lamps, see
+  // traffic_light).
   uint8_t env_family = 0;
+  // trafficlight.one / trafficlight.two = 1 / 2: which of the game's two lamp
+  // state vectors (g_TrafficLightsStatus_1/_2) drives this lamp mesh (see
+  // FrameScene::traffic_rows). 0 = not a traffic light.
+  uint8_t traffic_light = 0;
+  // Skate 2 effect state (New San Van only, see ApplySkate2Material).
+  // s2_blend: 0 = opaque, 1 = additive + z-write + material depth bias
+  // (zbiasincandescent), 2 = additive + z-write (transparentincandescent),
+  // 3 = additive, no z-write, uncull(ed) (glare), 4 = additive, no z-write,
+  // cull FRONT (godrayspotlight), 5 = straight alpha blend by the diffuse
+  // alpha + z-write + material depth bias, lit with shadow receive
+  // (decal.default = decalzbias.fx overlay prints).
+  uint8_t s2_blend = 0;
+  // Original S2 m_params[0].x (lightmap lerp weight) / .y (multiplier) of
+  // the incandescent effects, and the technique's alpha-test reference
+  // (0 = none).
+  float s2_lm_weight = 0.0f;
+  float s2_mult = 0.0f;
+  float s2_alpha_ref = 0.0f;
+  // incandescent.videoscreen (the Stadium jumbotrons): the diffuse slot
+  // shows the looped jumbotron clip instead of the placeholder art.
+  bool s2_video = false;
+  // Skate 2 material whose effect never alpha-tests (baseenvironment and
+  // friends): drawn opaque whatever the diffuse alpha holds.
+  bool s2_no_alpha_test = false;
+  // Skate 2 environment.transparent (transparentenvironment.fx): blended
+  // with the game's z-write + cull FRONT state (pso_s2_trans).
+  bool s2_trans_zwrite = false;
+  // Skate 2 effect whose PS ends in GetSpecularTerm (baseenvironment,
+  // decalenvironment, building_ceiling_worldspace, transparentenvironment):
+  // phong vs the real sun plus the `environment` cube reflection, both
+  // fresnel-weighted (skate3_skate2_env_specular).
+  bool s2_env = false;
+  // glareScale channel constant (glare.fx sprite size in meters).
+  float glare_scale = 0.0f;
+  // building_ceiling_worldspace (building.default): the "diffuse2" interior
+  // ceiling texture seen through the window glass and the
+  // floorHeightMeters / floorCount channel constants.
+  uint32_t diffuse2_tex = 0;
+  float floor_height = 0.0f;
+  float floor_count = 0.0f;
+  // cacstamp_skin (CAC player skin) stamp layers: the "decal" channel
+  // (decal_art: the composed tattoo texture at the second texcoord) and
+  // "decal2" (a second overlay at the first texcoord, blended by its alpha
+  // x i_params.z, captured into char_rows[2].x).
+  uint32_t decal2_art = 0;
+  // cacstamp_skin_defaultVS maps the second texcoord through two VS rows
+  // after the bone array (main pass c190/c191): tattoo uv = (dot((u,v,1),
+  // row0.xyz), dot((u,v,1), row1.xyz)). Captured with the palette.
+  float stamp_uv[6] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+  bool stamp_uv_valid = false;
+  // The texture fetch words the game actually bound at this skin's main
+  // draw for tf6 (tattoo, words 0-5) and tf7 (overlay, words 6-11), read
+  // from the device fetch shadow when the cacstamp rows validate. Zero =
+  // not captured (the channel textures serve). Their clamp fields also
+  // give the sampler address mode.
+  uint32_t stamp_fetch[12] = {};
+  // visualindicator.* (visualindicator_defaultPS: the Hall of Meat bone
+  // overlays): unlit D^2 x i_colortint (c3) x m_params[0].y (c4.y), the
+  // world fog and exposure g_envattributes[2].x (c2.x), alpha = D.a x
+  // tint.a, alpha-blended. Family 19; rows captured from the draw's PS bank
+  // (ind_valid = they passed the range gates).
+  bool indicator = false;
+  bool ind_valid = false;
+  float ind_tint[4] = {};
+  float ind_mult = 0.0f;
+  float ind_expo = 0.0f;
   // dynamicobject.fx family (movable props: dispensers, dumpsters, benches,
   // cans, ...). 0 = not a dynamic object, 1 = dynamicobject.default,
   // 2 = dynamicobject.alphatest. These are rigid model-space props with per-
@@ -299,6 +399,59 @@ struct DrawItem {
   std::vector<DrawEntry> draws;
 };
 
+// Log057 source inventory: signs involved in billboard/artwork comparisons.
+inline bool IsBamVisualSign(const DrawItem& item) {
+  if (uint32_t(item.diffuse_guid) != 0x03E3870A) return false;
+  const uint32_t id = uint32_t(item.diffuse_guid >> 32);
+  return (id >= 0x72A2 && id <= 0x72A8) || id == 0x730A ||
+      id == 0x574F || id == 0x5750 || id == 0x64F0 || id == 0x7314 ||
+      id == 0x7312 || id == 0x72D7 || id == 0x72E0;
+}
+inline bool IsBamVisualCandidate(const DrawItem& item) {
+  if (item.skinned || item.dyn_entity) return false;
+  if (item.diffuse_guid == 0x0000552F03E3870Aull ||
+      item.diffuse_guid == 0x0000553203E3870Aull) return true;
+  if (IsBamVisualSign(item) || item.unlit || item.env_family == 11) return true;
+  for (int k = 0; k < 3; ++k)
+    if (item.bbox_max[k] - item.bbox_min[k] > 300.0f) return true;
+  return false;
+}
+
+// Diagnostic regions only; these never change visibility or render state.
+// Transform the local bounds so translated/rotated static instances participate.
+inline unsigned BamGeometryProbeGroup(const DrawItem& item) {
+  if (item.skinned || item.dyn_entity) return 0;
+  // Include ocean materials with no diffuse channel. The old diffuse-GUID
+  // filter captured a different small pond, not necessarily Lake Sherwin.
+  float lo[3], hi[3];
+  for (int k = 0; k < 3; ++k) {
+    lo[k] = hi[k] = item.world[12 + k];
+    for (int j = 0; j < 3; ++j) {
+      const float a = item.bbox_min[j] * item.world[j * 4 + k];
+      const float b = item.bbox_max[j] * item.world[j * 4 + k];
+      lo[k] += a < b ? a : b;
+      hi[k] += a < b ? b : a;
+    }
+    // Exclude sky/backdrop-scale bounds from local evidence budgets.
+    if (hi[k] - lo[k] > 1000.0f) return item.water ? 5 : 0;
+  }
+  // Lake Sherwin approach in run 076: independent diagnostic budget for
+  // large, nearly horizontal surfaces, even if classified as non-water.
+  if (lo[0] < 900 && hi[0] > 620 && lo[2] < 870 && hi[2] > 560 &&
+      lo[1] < -35 && hi[1] > -75 && hi[1] - lo[1] < 4 &&
+      hi[0] - lo[0] > 15 && hi[2] - lo[2] > 15) return 6;
+  if (item.water) return 5;
+  if (lo[0] < 655 && hi[0] > 590 && lo[1] < -40 && hi[1] > -70 &&
+      lo[2] < 1140 && hi[2] > 1060) return 3;
+  if (lo[0] < 1300 && hi[0] > 1170 && lo[1] < 5 && hi[1] > -45 &&
+      lo[2] < 990 && hi[2] > 840) return 4;
+  if (lo[0] < 420 && hi[0] > 365 && lo[1] < 15 && hi[1] > -25 &&
+      lo[2] < 165 && hi[2] > 110) return 2;
+  if (lo[0] < 605 && hi[0] > 580 && lo[1] < -40 && hi[1] > -50 &&
+      lo[2] < 700 && hi[2] > 621) return 1;
+  return IsBamVisualSign(item) ? 1 : 0;
+}
+
 struct FrameScene {
   uint64_t generation = 0;
   float view_proj[16] = {};
@@ -328,6 +481,9 @@ struct FrameScene {
   // sun-derived features (the native static sun-shadow map) must stand down
   // there instead of shading a sunless interior with an outdoor sun.
   bool shadow_fresh = false;
+  // Guest frames since those rows were last captured (0 = this frame);
+  // the static sun-shadow gate and its flash diagnostics key on it.
+  uint32_t shadow_age = 0;
   // Extended to c0..c11: c10.x = scene exposure (2.5), c11.y = the material
   // multiplier (1.0), consumed by the exact world-shading tone chain.
   float shadow_rows[48] = {};
@@ -366,6 +522,15 @@ struct FrameScene {
   // Consumed by the fam-14 branch (the scrolling LED chyron).
   bool scroll_valid = false;
   float scroll_rows[2] = {};
+  // trafficlight.one / .two rows, per family, captured from the draws that
+  // run the lamp shaders (debug-path classified at bind time): [0..3] = the
+  // game's lamp state g_TrafficLightsStatus_1/_2 (VS c7; one vector per
+  // family, shared by every light of that family; a component above 1 lights
+  // the lamps that index it), [4] = the material multiplier m_params[0].y
+  // (PS c3.y), [5] = the exposure g_envattributes[2].x (PS c2.x). Consumed
+  // by the fam-20 branch (vs_main picks the lit or unlit lamp UV).
+  bool traffic_valid[2] = {};
+  float traffic_rows[2][6] = {};
   // dynamicobject.fx frame-global lighting rows, captured from a
   // dynamicobject/alphatestdynamicobject PS bank (debug-path classified):
   // [0..2] sun direction (PS c9), [3] scene exposure (c13.x),
@@ -435,6 +600,11 @@ struct FrameScene {
     float vs[6][8][4] = {};
     uint32_t vignette_fetch[6] = {};
     uint32_t grain_fetch[6] = {};
+    // postfx_basictex_fisheye_noisePS (slow-motion bail video look):
+    // f_NoiseScroll c3, f_NoiseFade c4, f_NoiseDotP1/P2 c5/c6, tf5.
+    bool noise = false;
+    float noise_rows[4][4] = {};
+    uint32_t noise_fetch[6] = {};
   };
   PhotoFx photo_fx;
   std::vector<DrawItem> items;
@@ -549,6 +719,10 @@ void AddGuestOcclSkipped(uint32_t n);
 // Called from the cProcessArenaAsset::RegisterTexture hook: guid -> guest
 // renderengine::Texture object.
 void OnRegisterTexture(uint64_t guid, uint32_t texture);
+// Called from the texture removal notification (8279F188 -> 8280AAF0) while
+// a Skate 2 world is active: forgets guid -> texture when it still names the
+// unloaded object, so the registry never hands back freed memory.
+void OnUnregisterTexture(uint64_t guid, uint32_t texture);
 
 // Queue one mesh for the prewarm decode workers (guest thread; deduped per
 // load).
@@ -719,6 +893,14 @@ void RecordCameraSignal(double seconds);
 // artifact frame against its neighbors names exactly which item appeared /
 // vanished / changed textures during a 1-2 frame flash no capture can catch.
 void RequestSceneRingDump();
+// Logs every character piece near the camera for the next few rendered
+// frames (native-chardump lines: world anchor, capture source, freshness).
+void RequestCharDump();
+// User log marker (F10 / Insert): on the next render the renderer logs its
+// per-frame lighting history for the ~10 s before the press (native vs
+// yielded frames, the static sun-shadow gate and strength, map rebuilds)
+// and writes the whole ~30 s ring to logs/light_history_<marker>_<ts>.csv.
+void RequestLightHistory(uint32_t marker);
 
 // Bone-signal recorder (wheel-guard diagnosis): for `seconds`, records every
 // raw entity pose (ring pushes: bone palettes / rigid worlds, timestamps)
@@ -727,5 +909,23 @@ void RequestSceneRingDump();
 // offline analysis replays candidate guard strategies against the real
 // board data.
 void RecordBoneSignal(double seconds);
+
+// Performance recorder probes (skate3_perf_recorder.h). Decode-worker queue
+// depths: speculative prewarm backlog, draw-path misses, dynamic-payload
+// jobs, finished results awaiting commit (any thread; brief locks).
+void GetDecodeQueueDepths(uint32_t out[4]);
+// Camera smoothing clock of the last guest frame: the play clock's distance
+// from its lag target (positive = behind) and the estimated guest camera
+// tick, in milliseconds (guest render thread).
+void GetSmoothingTelemetry(float* err_ms, float* period_ms);
+// World position of the camera the last built frame scene used (guest render
+// thread).
+void GetFrameCamera(float out[3]);
+// Steady-clock time (ns since the clock's epoch) the next BuildFrameScene's
+// camera re-timing treats as "now": the frame pacer's beat plus the average
+// beat-to-build offset, so the smoothed camera advances evenly per frame
+// although the build runs a variable time into each frame. 0 = the build's
+// own start time (guest render thread).
+void SetFrameClockNs(int64_t ns);
 
 }  // namespace skate3::native_scene

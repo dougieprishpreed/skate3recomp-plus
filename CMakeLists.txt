@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 2.0.0 LANGUAGES CXX)
+project(skate3 VERSION 0.1 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -23,11 +23,8 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(cmake/Skate3Version.cmake)
-
-skate3_resolve_version(SKATE3_FULL_VERSION
-    FLOOR_VERSION ${PROJECT_VERSION}
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+# This fork has its own release sequence; upstream v2 tags do not set its version.
+set(SKATE3_FULL_VERSION "${PROJECT_VERSION}")
 string(REGEX REPLACE "-.*$" "" SKATE3_NUMERIC_VERSION "${SKATE3_FULL_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
@@ -230,10 +227,10 @@ set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "Enable lightweight rexglue perf
 if(WIN32)
     set(REXGLUE_RUNTIME_RC_VERSION "${SKATE3_RC_VERSION}")
     set(REXGLUE_RUNTIME_RC_VERSION_STRING "${SKATE3_FULL_VERSION}")
-    set(REXGLUE_RUNTIME_RC_PRODUCT_NAME "Skate3Recomp")
-    set(REXGLUE_RUNTIME_RC_COMPANY "Skate3Recomp project")
-    set(REXGLUE_RUNTIME_RC_DESCRIPTION "Skate3Recomp guest runtime")
-    set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp contributors")
+    set(REXGLUE_RUNTIME_RC_PRODUCT_NAME "Skate 3 Recompiled+")
+    set(REXGLUE_RUNTIME_RC_COMPANY "Skate 3 Recompiled+ project")
+    set(REXGLUE_RUNTIME_RC_DESCRIPTION "Skate 3 Recompiled+ guest runtime")
+    set(REXGLUE_RUNTIME_RC_COPYRIGHT "(c) Skate3Recomp and Skate 3 Recompiled+ contributors")
 endif()
 
 include(cmake/RexGlue.cmake)
@@ -242,10 +239,17 @@ include(cmake/CodegenTargets.cmake)
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
+    src/skate3_cheats.cpp
     src/skate3_demo_path.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
     src/skate3_iso_installer.cpp
+    src/skate3_nsv_installer.cpp
+    src/skate3_setup_sources.cpp
+    src/skate3_setup_dialog.cpp
+    src/skate3_jumbotron.cpp
+    src/skate3_menu_probe.cpp
+    src/skate3_nsv_menu.cpp
     src/native/skate3_native_diagnostics.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
@@ -256,10 +260,13 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_native_scene.cpp
     src/skate3_native_scene_gpu.cpp
     src/skate3_native_scene_post.cpp
+    src/skate3_perf_recorder.cpp
     src/skate3_screenshot.cpp
     src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
+    src/skate3_world_loading.cpp
+    src/skate3_pedestrian_speech.cpp
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )
@@ -376,6 +383,14 @@ add_custom_target(skate3_stage_runtime_library
 )
 add_dependencies(skate3 skate3_stage_runtime_library)
 
+add_custom_target(skate3_stage_default_settings
+    COMMAND "${CMAKE_COMMAND}"
+        "-DSKATE3_BUILD_ROOT=$<TARGET_FILE_DIR:skate3>"
+        "-DSKATE3_DEFAULT_SETTINGS=${CMAKE_CURRENT_SOURCE_DIR}/config/release-defaults.toml"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageDefaultSettings.cmake"
+    VERBATIM)
+add_dependencies(skate3 skate3_stage_default_settings)
+
 if(NOT SKATE3_EFFECTIVE_TITLE_UPDATE_PACKAGE STREQUAL "")
     add_custom_target(skate3_stage_title_update_patches
         COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -396,4 +411,33 @@ if(MSVC)
     target_compile_options(skate3 PRIVATE /utf-8)
 else()
     target_compile_options(skate3 PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
+endif()
+
+# Ship the private preparation runtime with the Windows release.
+if(WIN32)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    find_program(SKATE3_INSTALLER_FFMPEG NAMES ffmpeg HINTS "C:/ffmpeg" REQUIRED)
+    add_custom_target(skate3_stage_nsv_installer
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/package_nsv_installer.py"
+            --output "$<TARGET_FILE_DIR:skate3>/installer"
+            --ffmpeg "${SKATE3_INSTALLER_FFMPEG}"
+            --nav-baker "$<TARGET_FILE:nsv_nav_bake>"
+        VERBATIM)
+    add_dependencies(skate3 skate3_stage_nsv_installer)
+    add_executable(skate3_content_tool EXCLUDE_FROM_ALL
+        tools/skate3_content_tool.cpp src/skate3_iso_installer.cpp src/skate3_nsv_installer.cpp
+        src/skate3_setup_sources.cpp src/skate3_title_update_installer.cpp
+        third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp)
+    target_include_directories(skate3_content_tool PRIVATE src "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(skate3_content_tool PRIVATE rex::runtime comdlg32 winhttp)
+endif()
+
+# Offline collision rasterization only; runtime navigation stays in the guest.
+file(GLOB NSV_RECAST_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/recast/Recast/Source/*.cpp")
+add_executable(nsv_nav_bake EXCLUDE_FROM_ALL tools/nsv_nav_bake.cpp ${NSV_RECAST_SOURCES})
+target_include_directories(nsv_nav_bake PRIVATE third_party/recast/Recast/Include)
+
+if(WIN32)
+    add_dependencies(skate3_stage_nsv_installer nsv_nav_bake)
 endif()

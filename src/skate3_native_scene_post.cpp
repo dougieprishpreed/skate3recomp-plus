@@ -668,7 +668,8 @@ bool EnsureSsrPipeline(const NativeGuestOutputRenderContext& context) {
     pso.depth_clip = true;
     pso.depth.test_enable = true;
     pso.depth.write_enable = true;
-    pso.depth.func = nrhi::CompareFunc::kLess;
+    // Scene VS with the main pass's reversed-Z constants.
+    pso.depth.func = kReversedZ ? nrhi::CompareFunc::kGreater : nrhi::CompareFunc::kLess;
     pso.dsv_format = nrhi::Format::kD32_FLOAT;
     pso.rtv_format = nrhi::Format::kR16G16B16A16_FLOAT;
     g_r.pso_ssr_gbuf = device->CreateGraphicsPipeline(pso);
@@ -733,7 +734,7 @@ bool EnsureSsrTargets(const NativeGuestOutputRenderContext& context) {
     dd.format = nrhi::Format::kD32_FLOAT;
     dd.usage = nrhi::kTextureUsageDepthStencil;
     dd.initial_state = nrhi::ResourceState::kDepthWrite;
-    dd.clear_depth = 1.0f;
+    dd.clear_depth = kReversedZ ? 0.0f : 1.0f;
     g_r.ssr_gbuf_depth = device->CreateTexture(dd);
     if (g_r.ssr_gbuf_depth == nullptr) {
       g_r.ssr_failed = true;
@@ -1350,13 +1351,13 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
                         g_r.world_shadow_in_srv)
                            ? g_r.world_shadow_srv
                            : g_r.white.srv);
-    // t4 = the native static sun-shadow atlas (the scene pass's t10) when
-    // rendered this frame; the march prefers it over the ws map inside its
+    // t4 = the native static sun-shadow atlas (the scene pass's t10) while
+    // the frame's static term is active (g_r.nsm_active, the same decision
+    // as the b1 nsm rows); the march prefers it over the ws map inside its
     // coverage so static shafts follow the true material-sun axis. The b1
-    // nsm rows are zeroed when the map is invalid, so the white fallback is
+    // nsm rows are zeroed when the term is off, so the white fallback is
     // never actually compared.
-    cmd->SetTexture(5, (g_r.static_sun_valid && g_r.static_sun_in_srv &&
-                        g_r.static_sun_srv != nullptr)
+    cmd->SetTexture(5, (g_r.nsm_active && g_r.static_sun_srv != nullptr)
                            ? g_r.static_sun_srv
                            : g_r.white.srv);
     cmd->Draw(3, 0);
@@ -1391,9 +1392,13 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
   g_r.vol_rows[5] = 0.0f;
   g_r.vol_rows[6] = 0.0f;
   g_r.vol_rows[7] = shaft_plane ? shaft_int : 0.0f;
-  g_r.vol_rows[8] = scene.fog_color[0] * expo;
-  g_r.vol_rows[9] = scene.fog_color[1] * expo;
-  g_r.vol_rows[10] = scene.fog_color[2] * expo;
+  // New San Vanelona at night: the haze is the sun's in-scatter, dimmed with
+  // the world's light (NightGrade; 1 otherwise).
+  float night[3];
+  NightGrade(night);
+  g_r.vol_rows[8] = scene.fog_color[0] * expo * night[0];
+  g_r.vol_rows[9] = scene.fog_color[1] * expo * night[1];
+  g_r.vol_rows[10] = scene.fog_color[2] * expo * night[2];
   g_r.vol_rows[11] = haze_int;
   g_r.vol_rows[12] = sun_view[0];
   g_r.vol_rows[13] = sun_view[1];
@@ -1418,7 +1423,7 @@ bool ApplyVolumetricPass(const NativeGuestOutputRenderContext& context,
         scene.shadow_valid ? 1 : 0, g_r.shadow_srv_final != nullptr ? 1 : 0,
         g_r.shadow_in_srv_state ? 1 : 0, inv_ok ? 1 : 0,
         g_r.world_shadow_in_srv ? 1 : 0,
-        (g_r.static_sun_valid && g_r.static_sun_in_srv) ? 1 : 0,
+        g_r.nsm_active ? 1 : 0,
         g_r.vol_tex != nullptr ? 1 : 0,
         g_r.vol_rows[8], g_r.vol_rows[9], g_r.vol_rows[10], expo, sun_view[0],
         sun_view[1], sun_view[2], lin_ready ? "ao" : "own");

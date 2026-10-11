@@ -1,5 +1,7 @@
 #include "skate3_native_render.h"
 
+#include "skate3_perf_recorder.h"
+
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -20,10 +23,12 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <dwmapi.h>
 #endif
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
 REXCVAR_DEFINE_BOOL(skate3_native_render, true, "Skate 3",
@@ -58,8 +63,20 @@ REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
                     "below it). The margin must also absorb swap-to-present "
                     "jitter: presents run with tearing allowed, so a present "
                     "landing inside the panel's minimum refresh period tears even "
-                    "under VRR. Overrides skate3_guest_fps_cap while the display "
-                    "refresh is known.")
+                    "under VRR. With tearing off, Auto paces at the refresh rate "
+                    "instead: phase-locked to the blanks under mailbox presentation "
+                    "(see skate3_guest_present_margin_ms), or left to the display "
+                    "under FIFO (the presenter backpressures guest frames). Overrides "
+                    "skate3_guest_fps_cap while the display refresh is known.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_guest_present_margin_ms, 4.0, "Skate 3",
+                      "Auto frame pacing with VRR / Tearing off (mailbox presentation): "
+                      "how long before a vertical blank each frame should finish on "
+                      "the GPU. Lower = less input latency, but it must cover the "
+                      "frame-to-frame variation of the render pipeline, or frames "
+                      "miss their blank and show as a repeated frame followed by a "
+                      "skipped one.")
+    .range(1.0, 12.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
@@ -227,33 +244,146 @@ void OnClothDraw(uint8_t* base, uint32_t r4, uint32_t r5, uint32_t r6, uint32_t 
   g_current_frame.push_back({3, key, 0, dyn});
 }
 
-// Precise guest frame pacing (see skate3_guest_fps_cap): called on the guest
-// render thread at the swap boundary. Absolute-schedule pacing (target +=
-// interval) so sleep jitter never accumulates; resyncs when the guest falls
-// more than one interval behind (loads, hitches).
-void PaceGuestFrame() {
-  double cap = REXCVAR_GET(skate3_guest_fps_cap);
-  if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
-    // Refresh-derived cap (see the cvar). Falls through to the explicit cap
-    // while the platform hasn't reported a refresh rate.
-    const double auto_cap = double(rex::ui::Window::AutoFrameCapHz(
-        rex::ui::Window::CachedDisplayRefreshHz()));
-    if (auto_cap > 0.0) {
-      cap = auto_cap;
+// The display's refresh grid in steady_clock nanoseconds: the period and any
+// one blank. Windows: DWM's composition timing (the primary display; the
+// caller checks the rate against the window's display), re-read every
+// ~0.5 s. The period is exact, so an older blank stays on the grid.
+struct VblankGrid {
+  int64_t period_ns = 0;
+  int64_t blank_ns = 0;
+};
+bool QueryVblankGrid(VblankGrid* out) {
+#if defined(_WIN32)
+  using Fn = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
+  static const Fn query = [] {
+    const HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    return dwm ? reinterpret_cast<Fn>(GetProcAddress(dwm, "DwmGetCompositionTimingInfo"))
+               : nullptr;
+  }();
+  static const int64_t qpc_hz = [] {
+    LARGE_INTEGER f;
+    return QueryPerformanceFrequency(&f) ? int64_t(f.QuadPart) : int64_t(0);
+  }();
+  static VblankGrid s_grid;
+  static std::chrono::steady_clock::time_point s_next_query{};
+  if (query == nullptr || qpc_hz <= 0) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= s_next_query) {
+    s_next_query = now + std::chrono::milliseconds(500);
+    DWM_TIMING_INFO info = {};
+    info.cbSize = sizeof(info);
+    // Same conversion as the MSVC steady_clock (QPC, epoch at 0).
+    const auto qpc_to_ns = [](uint64_t qpc) {
+      return int64_t(qpc / uint64_t(qpc_hz)) * 1'000'000'000 +
+             int64_t(qpc % uint64_t(qpc_hz)) * 1'000'000'000 / qpc_hz;
+    };
+    if (SUCCEEDED(query(nullptr, &info)) && info.qpcRefreshPeriod != 0 && info.qpcVBlank != 0) {
+      s_grid.period_ns = qpc_to_ns(info.qpcRefreshPeriod);
+      s_grid.blank_ns = qpc_to_ns(info.qpcVBlank);
+    } else {
+      s_grid = {};
     }
   }
-  static std::chrono::steady_clock::time_point s_next{};
+  *out = s_grid;
+  return s_grid.period_ns > 0;
+#else
+  (void)out;
+  return false;
+#endif
+}
+
+// Pacing state shared with OnFrameEnd (guest render thread): the last
+// pacing wait (reported with the next frame) and the scheduled start of the
+// frame being produced (0 = unpaced; see SetFrameClockNs).
+uint64_t g_last_pace_ns = 0;
+int64_t g_frame_beat_ns = 0;
+
+// Guest frame pacing (see skate3_guest_fps_cap): called on the guest render
+// thread right after the swap is issued, so the wait delays the start of the
+// next frame rather than a finished one. Absolute-schedule pacing (target +=
+// interval) so sleep jitter never accumulates; resyncs when the guest falls
+// more than one interval behind (loads, hitches). Returns the nanoseconds it
+// waited (the frame's headroom under the cap; 0 = the guest is the limit).
+//
+// Auto by presentation (rex::ui::Presenter::GetHostPresentSync):
+// - FIFO: no timer; the display paces guest frames through the presenter's
+//   backpressure.
+// - Mailbox (VRR / Tearing off): the refresh rate, phase-locked to the
+//   blanks: every frame should finish on the GPU
+//   skate3_guest_present_margin_ms before a blank (LastGuestFrameReady). A
+//   free-running timer at the refresh rate sits at an arbitrary phase; near a
+//   blank, frame-to-frame jitter becomes repeat + drop pairs (the periodic
+//   micro-hitch). Display-paced FIFO avoids that but queues frames (~2
+//   refreshes of added latency).
+// - Tearing / unknown: the VRR recipe (see skate3_guest_fps_cap_auto).
+uint64_t PaceGuestFrame() {
+  using Clock = std::chrono::steady_clock;
+  using rex::ui::Presenter;
+  double cap = REXCVAR_GET(skate3_guest_fps_cap);
+  VblankGrid grid;
+  bool synced = false;
+  if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
+    const double refresh_hz = rex::ui::Window::CachedDisplayRefreshHz();
+    switch (Presenter::GetHostPresentSync()) {
+      case Presenter::HostPresentSync::kFifo:
+        cap = 0.0;
+        break;
+      case Presenter::HostPresentSync::kMailbox:
+        if (refresh_hz > 0.0) {
+          cap = refresh_hz;
+          synced = QueryVblankGrid(&grid) &&
+                   std::abs(1e9 / double(grid.period_ns) - refresh_hz) < refresh_hz * 0.01;
+        }
+        break;
+      default: {
+        // Falls through to the explicit cap while the platform hasn't
+        // reported a refresh rate.
+        const double auto_cap = double(rex::ui::Window::AutoFrameCapHz(refresh_hz));
+        if (auto_cap > 0.0) {
+          cap = auto_cap;
+        }
+        break;
+      }
+    }
+  }
+  static Clock::time_point s_next{};
+  static uint64_t s_ready_seq = 0;
+  g_frame_beat_ns = 0;
   if (cap < 1.0) {
     s_next = {};
-    return;
+    return 0;
   }
-  const auto interval =
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::duration<double>(1.0 / cap));
-  const auto now = std::chrono::steady_clock::now();
+  const Clock::duration interval =
+      synced ? std::chrono::duration_cast<Clock::duration>(
+                   std::chrono::nanoseconds(grid.period_ns))
+             : std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / cap));
+  const auto now = Clock::now();
   if (s_next.time_since_epoch().count() == 0 || now > s_next + interval) {
     s_next = now + interval;
-    return;
+    return 0;
+  }
+  if (synced) {
+    int64_t ready_ns = 0;
+    const uint64_t seq = Presenter::LastGuestFrameReady(&ready_ns);
+    if (seq != 0 && seq != s_ready_seq) {
+      s_ready_seq = seq;
+      const int64_t period = grid.period_ns;
+      int64_t phase = (ready_ns - grid.blank_ns) % period;  // since the last blank
+      if (phase < 0) {
+        phase += period;
+      }
+      const int64_t margin = int64_t(REXCVAR_GET(skate3_guest_present_margin_ms) * 1e6);
+      int64_t error = phase - (period - margin);  // > 0: later than the target
+      if (error < -period / 2) {
+        error += period;  // just past a blank: it missed that one
+      }
+      // An eighth of the error per frame, at most half a millisecond: rides
+      // out frame-to-frame noise while tracking the pipeline's drift.
+      s_next -= std::chrono::duration_cast<Clock::duration>(
+          std::chrono::nanoseconds(std::clamp<int64_t>(error / 8, -500'000, 500'000)));
+    }
   }
   // Coarse sleep to ~1.5 ms before the target, then spin for precision.
   while (true) {
@@ -267,11 +397,18 @@ void PaceGuestFrame() {
       std::this_thread::yield();
     }
   }
+  g_frame_beat_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(s_next.time_since_epoch()).count();
   s_next += interval;
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - now)
+                      .count());
 }
 
+void OnSwapIssued() { g_last_pace_ns = PaceGuestFrame(); }
+
 void OnFrameEnd(uint8_t* base) {
-  PaceGuestFrame();
+  const uint64_t pace_ns = g_last_pace_ns;
   // EMULATED-mode guest frame breakdown (emulated gameplay once regressed
   // from 140 to 66 fps while native stayed at cap; the native-scene perf
   // line only prints while the native renderer is active, so emulated
@@ -302,12 +439,31 @@ void OnFrameEnd(uint8_t* base) {
   const size_t mesh_count = g_current_frame.size();
 
   const auto bd_build0 = Clock::now();
+  // Even camera re-timing: the build runs a variable time into each frame
+  // (the guest's render work), so give it the paced frame's beat plus the
+  // average beat-to-build offset instead of its own start time.
+  {
+    static double s_build_offset_ns = 0.0;
+    int64_t frame_clock_ns = 0;
+    if (g_frame_beat_ns != 0) {
+      const double offset = double(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(bd_build0.time_since_epoch())
+              .count() -
+          g_frame_beat_ns);
+      if (offset >= 0.0 && offset < 100e6) {
+        s_build_offset_ns =
+            s_build_offset_ns == 0.0 ? offset : s_build_offset_ns * 0.95 + offset * 0.05;
+        frame_clock_ns = g_frame_beat_ns + int64_t(s_build_offset_ns);
+      }
+    }
+    skate3::native_scene::SetFrameClockNs(frame_clock_ns);
+  }
   skate3::native_scene::BuildFrameScene(base, g_current_frame.data(),
                                         g_current_frame.size());
+  const auto bd_build1 = Clock::now();
   if (emu_profile) {
-    const double bns = std::chrono::duration<double, std::nano>(Clock::now() -
-                                                                bd_build0)
-                           .count();
+    const double bns =
+        std::chrono::duration<double, std::nano>(bd_build1 - bd_build0).count();
     s_bd_build_ns += bns;
     s_bd_build_max = std::max(s_bd_build_max, bns);
     if (++s_bd_frames >= 600) {
@@ -362,6 +518,16 @@ void OnFrameEnd(uint8_t* base) {
                                            g_current_frame);
 
   g_current_frame.clear();
+
+  float smooth_err_ms = 0.0f, smooth_period_ms = 0.0f;
+  skate3::native_scene::GetSmoothingTelemetry(&smooth_err_ms, &smooth_period_ms);
+  float cam[3] = {};
+  skate3::native_scene::GetFrameCamera(cam);
+  skate3::perf_recorder::OnGuestFrame(
+      pace_ns,
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(bd_build1 - bd_build0)
+                   .count()),
+      uint32_t(mesh_count), smooth_err_ms, smooth_period_ms, cam);
 }
 
 }  // namespace
@@ -430,12 +596,17 @@ extern "C" REX_FUNC(sub_827FAF50) {
 }
 
 
-// Guest D3D Swap: frame boundary.
+// Guest D3D Swap: frame boundary. The frame goes out first; pacing then
+// delays the start of the next one (see PaceGuestFrame).
 extern "C" REX_FUNC(sub_82B82E08) {
-  if (skate3::native_render::Enabled()) {
+  const bool native = skate3::native_render::Enabled();
+  if (native) {
     skate3::native_render::OnFrameEnd(base);
   }
   __imp__sub_82B82E08(ctx, base);
+  if (native) {
+    skate3::native_render::OnSwapIssued();
+  }
 }
 
 // cProcessArenaAsset::RegisterTexture(cAssetList*, cAssetID,

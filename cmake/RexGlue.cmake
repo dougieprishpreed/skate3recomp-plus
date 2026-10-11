@@ -1,6 +1,18 @@
 set(REXSDK_VERSION "" CACHE STRING "Override rexglue SDK package version")
 
 if(REXSDK_DIR AND EXISTS "${REXSDK_DIR}/CMakeLists.txt")
+    # Verify the fork's recorded SDK edits before compiling.
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/apply_sdk_patches.py"
+            --sdk "${REXSDK_DIR}" --check
+        RESULT_VARIABLE _skate3_sdk_patch_result
+        OUTPUT_VARIABLE _skate3_sdk_patch_output
+        ERROR_VARIABLE _skate3_sdk_patch_error)
+    if(NOT _skate3_sdk_patch_result EQUAL 0)
+        message(FATAL_ERROR "${_skate3_sdk_patch_error}")
+    endif()
+    message(STATUS "${_skate3_sdk_patch_output}")
     add_subdirectory("${REXSDK_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/rexglue-sdk")
     message(STATUS "Using rexglue SDK source tree: ${REXSDK_DIR}")
 else()
