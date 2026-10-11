@@ -7,7 +7,8 @@ Visit Skate 2's iconic city from the in-game locations menu of Skate 3.
 - 25 spawn locations
 - distant backdrop assets, skybox, clouds, water shader
 - animated vegetation, fountains, water surfaces, flags
-- emissive lights, neon signs, storefront glass, reflective skyscrapers
+- emissive lights, neon signs
+- storefront glass, reflective skyscrapers
 - transparent objects with correct properties, like the sails in Waterfront
 - jumbotron video and indoor lighting in S.V. Stadium
 - ambient audio around city, audio emitters like waves and birds
