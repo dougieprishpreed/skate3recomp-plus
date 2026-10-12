@@ -1,6 +1,6 @@
 # Windows build instructions
 
-These instructions build Skate 3 Recompiled+ v0.1 from source on Windows.
+These instructions build Skate 3 Recompiled+ v0.1a from source on Windows.
 Open an **x64 Native Tools Command Prompt for Visual Studio 2022**, then run
 `powershell` to use the commands below in that environment. Install Visual Studio's
 Desktop development with C++ workload and Windows SDK, LLVM/Clang 18 or newer,
@@ -64,7 +64,7 @@ Copy this prompt into your coding agent. It will need access to your Windows
 computer and the paths to your extracted Skate 3 disc, TU3 package and FFmpeg.
 
 ```text
-Build and package Skate 3 Recompiled+ v0.1 on this Windows computer from
+Build and package Skate 3 Recompiled+ v0.1a on this Windows computer from
 https://github.com/dougieprishpreed/skate3recomp-plus.
 
 Read BUILDING.md and follow its Windows instructions. Check that Git, the

@@ -89,6 +89,8 @@ struct MeshBuffers {
   // (weight > 0), -1 when none; the detached-piece detector's bone anchor.
   int16_t bone_lo = -1;
   int16_t bone_hi = -1;
+  // Missing-normal NSV body repair, reported only by the manual character dump.
+  uint32_t generated_normals = 0;
   // ROPA only: the decoded vertex array (num_verts x 14 floats, the scene
   // VS layout) retained for draw-time shape blending onto the play clock.
   std::vector<float> ropa_verts;
@@ -560,12 +562,9 @@ struct RendererState {
   // environment.transparent sub-pass: straight alpha blend, depth test on,
   // z-write OFF; items drawn back-to-front after all opaque items.
   nrhi::Pipeline* pso_transparent = nullptr;
-  // Entity-fade variant of the transparent PSO: same straight alpha blend
-  // but z-write ON. A fading character/vehicle is a solid object at partial
-  // opacity; z-write-off blending composites every overlapping piece (skin
-  // under clothes, far-side doors/wheels through the body shell) into an
-  // x-ray. With depth writes the nearest surface wins and each pixel blends
-  // once, matching the game's main-pass fade.
+  // Resolve body visibility before applying uniform opacity.
+  nrhi::Pipeline* pso_fade_depth = nullptr;
+  // Shade only samples at the established body depth.
   nrhi::Pipeline* pso_fade = nullptr;
   // Hair sub-passes: transparent blend state with cull BACK / cull FRONT
   // (the game's cac_hair/defaulthair two-pass draw order).

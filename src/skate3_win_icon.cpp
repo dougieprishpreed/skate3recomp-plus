@@ -1,4 +1,4 @@
-// Application icon from the user's own game files, see skate3_win_icon.h.
+// Prefer the embedded app icon; game-data fallback is described in skate3_win_icon.h.
 
 #include "skate3_win_icon.h"
 
@@ -318,6 +318,29 @@ void EnsureExeIconResource(const std::vector<uint8_t>& png) {
 
 void ApplyGameIconFromGameData(const std::filesystem::path& game_data_root,
                                void* native_window_handle) {
+  // Release builds embed MAINICON. Use it for the window as well as Explorer,
+  // before considering legacy game-data extraction or executable self-patching.
+  const HMODULE module = GetModuleHandleW(nullptr);
+  if (FindResourceW(module, L"MAINICON",
+                    reinterpret_cast<LPCWSTR>(RT_GROUP_ICON)) != nullptr) {
+    HWND hwnd = static_cast<HWND>(native_window_handle);
+    if (hwnd != nullptr) {
+      for (const auto kind : {ICON_BIG, ICON_SMALL}) {
+        const bool is_small_icon = kind == ICON_SMALL;
+        HICON icon = static_cast<HICON>(LoadImageW(
+            module, L"MAINICON", IMAGE_ICON,
+            GetSystemMetrics(is_small_icon ? SM_CXSMICON : SM_CXICON),
+            GetSystemMetrics(is_small_icon ? SM_CYSMICON : SM_CYICON), LR_SHARED));
+        if (icon != nullptr) {
+          DWORD_PTR unused = 0;
+          SendMessageTimeoutW(hwnd, WM_SETICON, kind,
+                              reinterpret_cast<LPARAM>(icon), SMTO_NORMAL,
+                              2000, &unused);
+        }
+      }
+    }
+    return;
+  }
   std::filesystem::path nxeart = game_data_root / "nxeart";
   std::error_code ec;
   if (!std::filesystem::exists(nxeart, ec)) {

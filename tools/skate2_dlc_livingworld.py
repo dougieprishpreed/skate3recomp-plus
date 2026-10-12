@@ -425,7 +425,7 @@ def refine_boundary_lane(lane,raster,core):
     return original
 
 
-def driving_routes(areas,mesh,driveable=None,boundary=False):
+def _driving_candidates(areas,mesh,driveable=None,boundary=False):
     street=np.concatenate((areas['road'],areas['crosswalk']))
     if not len(street):return [],dict(candidates=0,rejected=0)
     if driveable is not None and not len(driveable):return [],dict(candidates=0,rejected=0)
@@ -485,11 +485,71 @@ def driving_routes(areas,mesh,driveable=None,boundary=False):
                 else:details.append(dict(stage='curve-support-or-collision',point=lane[0].tolist()))
         # The center continuation is a fallback only when both offset lanes
         # cannot pass car clearance. Do not overlap it with a valid offset.
-    if not routes and not boundary and driveable is not None:
-        return driving_routes(areas,mesh,driveable,True)
     return routes,dict(candidates=len(cycles)*(1 if boundary else 3),
                        rejected=len(cycles)*(1 if boundary else 3)-len(routes),
                        boundary_continuations=boundary,details=details)
+
+
+def route_coverage(routes,core):
+    """Supported pavement reached by a qualified lane, not candidate length.
+
+    Bound the survey to 16K deterministic floor probes. Nine samples per
+    Hermite segment resolve the four-metre decimation without trusting chords.
+    The 3.5m radius covers the lane and its adjacent opposing lane; broad
+    asphalt areas do not force cars onto every square metre of pavement.
+    """
+    ij=np.argwhere(np.isfinite(core.y))
+    ij=ij[::max(1,int(np.ceil(len(ij)/16000)))]
+    probes=np.column_stack((ij[:,0]+core.origin[0],core.y[ij[:,0],ij[:,1]],ij[:,1]+core.origin[1]))
+    if not routes:return dict(probes=len(probes),covered=0)
+    samples=np.concatenate([curve_samples(r)[0][:,:-1].reshape(-1,3) for r in routes])
+    covered=0
+    for i in range(0,len(probes),64):
+        d=probes[i:i+64,None]-samples[None]
+        covered+=int((np.einsum('ijk,ijk->ij',d,d).min(1)<=3.5**2).sum())
+    return dict(probes=len(probes),covered=covered)
+
+
+def separate_circuits(routes):
+    """Reject boundary alternatives whose 3.5m lanes cross or double back.
+
+    Local neighbours on the same circuit are expected to touch. Compare
+    portions at least 20m apart along the circuit, including its closing
+    seam, and every pair of independent circuits. This is a bake check;
+    vehicle following and collision responses remain native.
+    """
+    samples=[curve_samples(r)[0][:,:-1].reshape(-1,3) for r in routes]
+    for i,s in enumerate(samples):
+        arc=np.r_[0,np.cumsum(np.linalg.norm(np.diff(s,axis=0),axis=1))]
+        total=arc[-1]+np.linalg.norm(s[-1]-s[0])
+        for at in range(0,len(s),64):
+            d=s[at:at+64,None]-s[None]
+            gap=np.abs(arc[at:at+64,None]-arc[None]);gap=np.minimum(gap,total-gap)
+            if ((np.einsum('ijk,ijk->ij',d,d)<3.5**2)&(gap>=20)).any():return False
+            for t in samples[:i]:
+                d=s[at:at+64,None]-t[None]
+                if (np.einsum('ijk,ijk->ij',d,d)<3.5**2).any():return False
+    return True
+
+
+def driving_routes(areas,mesh,driveable=None,boundary=False):
+    if boundary:return _driving_candidates(areas,mesh,driveable,True)
+    routes,survey=_driving_candidates(areas,mesh,driveable)
+    if driveable is None or not len(driveable):return routes,survey
+    alternatives,alternative_survey=_driving_candidates(areas,mesh,driveable,True)
+    core=StreetRaster(driveable)
+    primary=route_coverage(routes,core);alternative=route_coverage(alternatives,core)
+    # A closed loop somewhere in a connected component must not suppress
+    # supported branches elsewhere. Prefer a complete supported contour when
+    # it adds at least five percent of the surveyed pavement; retain existing
+    # lanes for insignificant differences and reject intersecting alternatives.
+    gain=alternative['covered']-primary['covered']
+    select=bool(alternatives) and (not routes or gain>=max(1,primary['probes']*.05))
+    separated=separate_circuits(alternatives) if select else None
+    if select and separated:routes,survey=alternatives,alternative_survey
+    survey.update(selection='supported-coverage-v5',skeleton_coverage=primary,
+                  boundary_coverage=alternative,boundary_separate=separated)
+    return routes,survey
 
 
 def rain_resource(routes,identity):
@@ -577,7 +637,7 @@ def road_asset(template,routes,identity):
 def prepare_livingworld(stream,source,ocean_model,helper,scratch):
     name=stream.name
     if name not in STREAMS:raise ValueError('DLC actor preparation outside requested Classic streams')
-    if any((stream/f'LIVINGWORLD_COMPLETE_V{v}').exists() for v in (1,2,3)):
+    if any((stream/f'LIVINGWORLD_COMPLETE_V{v}').exists() for v in (1,2,3,4,5)):
         raise ValueError('DLC actors require fresh unpublished stream')
     schema=templates(source)
     areas=pedestrian_surface_triangles(stream,ocean_model,True);mesh=collision(stream)
@@ -609,14 +669,14 @@ def prepare_livingworld(stream,source,ocean_model,helper,scratch):
         struct.pack_into('>I',sf,24,count);struct.pack_into('>3I',row,16,128,len(sf)-128,count)
         path.write_bytes(sf)
     cmap_path.write_bytes(make_catalog(cmap[:32],cells));toc_path.write_bytes(make_catalog(toc[:24],rows))
-    result=dict(version=4,stream=name,census_cells=paint_cells,npc_value=32,vehicle_value=247,
+    result=dict(version=5,stream=name,census_cells=paint_cells,npc_value=32,vehicle_value=247,
                 census_tiles=sum(map(len,paint.values())),census_grid=128,
                 source_census=False,source_traffic=False,street_survey=survey,
                 roads=len(routes),superroads=len(routes),lane_segments=sum(len(r) for r in routes),
                 routes=[r.tolist() for r in routes],traffic_audio='shared original 10 banks',
                 pedestrian_speech='shared original bank4',traffic_distance='cumulative-segment-end',
                 traffic_curves='native-left-up-and-distance-table-v3',
-                traffic_routes='supported-boundary-refinement-v4')
+                traffic_routes='supported-coverage-v5')
     (stream/'livingworld.json').write_bytes((json.dumps(result,indent=2)+'\n').encode())
-    (stream/'LIVINGWORLD_COMPLETE_V4').write_bytes(f'NSV_DLC_LIVINGWORLD_V4\n{paint_cells} {len(routes)}\n'.encode())
+    (stream/'LIVINGWORLD_COMPLETE_V5').write_bytes(f'NSV_DLC_LIVINGWORLD_V5\n{paint_cells} {len(routes)}\n'.encode())
     return result

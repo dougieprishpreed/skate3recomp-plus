@@ -139,9 +139,9 @@ bool IsNewSanVanInstalled(const fs::path& app_root, const fs::path& content_root
       "world-support-gvr-v1/NAVIGATION_COMPLETE_V4", "proxy-v1/manifest.json",
       "sky-water-v1/SKY_WATER_COMPLETE_V1", "jumbotron/attract.s2jv",
       "dlc-maps-v1/DLC_MAPS_COMPLETE_V1",
-      "dlc-maps-v1/DLC_School/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_School/LIVINGWORLD_COMPLETE_V4",
-      "dlc-maps-v1/DLC_Community_Center/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Community_Center/LIVINGWORLD_COMPLETE_V4",
-      "dlc-maps-v1/DLC_Parkade/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Parkade/LIVINGWORLD_COMPLETE_V4",
+      "dlc-maps-v1/DLC_School/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_School/LIVINGWORLD_COMPLETE_V5",
+      "dlc-maps-v1/DLC_Community_Center/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Community_Center/LIVINGWORLD_COMPLETE_V5",
+      "dlc-maps-v1/DLC_Parkade/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Parkade/LIVINGWORLD_COMPLETE_V5",
       "audio-v1/AUDIO_COMPLETE_V2",
       "livingworld-v1/LIVINGWORLD_COMPLETE_V1", "nsv_spawns.txt"};
   for (auto name : required) if (!fs::is_regular_file(mods / name)) return false;

@@ -17,6 +17,8 @@ bool ArmMenuSpawn(uint8_t* base, const std::string& label, const std::string& st
 // Before the retail location teleport: leaving New San Van must reload.
 void BeforeRetailTeleport(uint8_t* base, uint64_t world);
 bool IsSkate2Gameplay();
+// Rare debug capture: guarded read-only state/streaming snapshots, no guest calls.
+void LogFreezeSnapshot();
 bool OriginalPedestriansActive();
 // New San Vanelona sky choice: after Install, copies the selected sky's two
 // dome textures into guest memory for the native renderer: Skate 3's

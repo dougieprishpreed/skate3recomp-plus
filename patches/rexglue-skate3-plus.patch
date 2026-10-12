@@ -1,18 +1,19 @@
 diff --git a/include/rex/graphics/native_rhi.h b/include/rex/graphics/native_rhi.h
-index d2bdcd4..0a12dbb 100644
+index d2bdcd4..cbfc0de 100644
 --- a/include/rex/graphics/native_rhi.h
 +++ b/include/rex/graphics/native_rhi.h
-@@ -140,6 +140,9 @@ enum class CompareFunc : uint32_t {
+@@ -140,6 +140,10 @@ enum class CompareFunc : uint32_t {
    kAlways = 0,
    kLess,
    kLessEqual,
 +  // Reversed-Z depth (near = 1). Appended: existing values are unchanged.
 +  kGreater,
 +  kGreaterEqual,
++  kEqual,
  };
  
  enum class CullMode : uint32_t {
-@@ -378,6 +381,9 @@ struct GraphicsPipelineDesc {
+@@ -378,6 +382,9 @@ struct GraphicsPipelineDesc {
    DepthStateDesc depth;
    CullMode cull = CullMode::kNone;
    bool depth_clip = true;
@@ -306,7 +307,7 @@ index b56664b..2918210 100644
    }
    return was_resolved;
 diff --git a/src/graphics/d3d12/native_rhi_d3d12.cpp b/src/graphics/d3d12/native_rhi_d3d12.cpp
-index cc9175e..6da78f7 100644
+index cc9175e..9ced9ea 100644
 --- a/src/graphics/d3d12/native_rhi_d3d12.cpp
 +++ b/src/graphics/d3d12/native_rhi_d3d12.cpp
 @@ -17,6 +17,7 @@
@@ -317,7 +318,7 @@ index cc9175e..6da78f7 100644
  #include <unordered_set>
  #include <utility>
  #include <vector>
-@@ -260,6 +261,10 @@ D3D12_COMPARISON_FUNC ToCompare(nrhi::CompareFunc func) {
+@@ -260,6 +261,12 @@ D3D12_COMPARISON_FUNC ToCompare(nrhi::CompareFunc func) {
        return D3D12_COMPARISON_FUNC_LESS;
      case nrhi::CompareFunc::kLessEqual:
        return D3D12_COMPARISON_FUNC_LESS_EQUAL;
@@ -325,10 +326,12 @@ index cc9175e..6da78f7 100644
 +      return D3D12_COMPARISON_FUNC_GREATER;
 +    case nrhi::CompareFunc::kGreaterEqual:
 +      return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
++    case nrhi::CompareFunc::kEqual:
++      return D3D12_COMPARISON_FUNC_EQUAL;
      case nrhi::CompareFunc::kAlways:
      default:
        return D3D12_COMPARISON_FUNC_ALWAYS;
-@@ -302,6 +307,13 @@ class NrTextureViewD3D12 : public nrhi::TextureView {
+@@ -302,6 +309,13 @@ class NrTextureViewD3D12 : public nrhi::TextureView {
    // SRV descriptor is copied from here into shader-visible binding slots.
    uint32_t staging_slot = ~0u;
    NrTextureD3D12* texture = nullptr;
@@ -342,7 +345,7 @@ index cc9175e..6da78f7 100644
  };
  
  class NrBindingLayoutD3D12 : public nrhi::BindingLayout {
-@@ -652,30 +664,26 @@ class NrDeviceD3D12 : public nrhi::Device {
+@@ -652,30 +666,26 @@ class NrDeviceD3D12 : public nrhi::Device {
      if (view == nullptr) return;
      // Destruction is batched: the view object stays allocated (so its
      // address cannot be reused while stale binding-cache keys still hold it)
@@ -383,7 +386,7 @@ index cc9175e..6da78f7 100644
        staging_slots_.Retire(v->staging_slot, 1, submission);
        delete v;
      }
-@@ -883,6 +891,8 @@ class NrDeviceD3D12 : public nrhi::Device {
+@@ -883,6 +893,8 @@ class NrDeviceD3D12 : public nrhi::Device {
                                    : desc.cull == nrhi::CullMode::kBack ? D3D12_CULL_MODE_BACK
                                                                         : D3D12_CULL_MODE_NONE;
      pd.RasterizerState.DepthClipEnable = desc.depth_clip;
@@ -392,7 +395,7 @@ index cc9175e..6da78f7 100644
      pd.DepthStencilState.DepthEnable = desc.depth.test_enable;
      pd.DepthStencilState.DepthWriteMask = desc.depth.write_enable
                                                ? D3D12_DEPTH_WRITE_MASK_ALL
-@@ -1098,6 +1108,24 @@ class NrDeviceD3D12 : public nrhi::Device {
+@@ -1098,6 +1110,24 @@ class NrDeviceD3D12 : public nrhi::Device {
                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
        }
        it = bindings_.emplace(key, Binding{first_slot, count}).first;
@@ -417,7 +420,7 @@ index cc9175e..6da78f7 100644
      }
      *gpu_out = SrvGpuHandle(it->second.first_slot);
      return true;
-@@ -1223,6 +1251,9 @@ class NrDeviceD3D12 : public nrhi::Device {
+@@ -1223,6 +1253,9 @@ class NrDeviceD3D12 : public nrhi::Device {
    SlotAllocator dsv_slots_;
    std::vector<RetiredObject> retired_;
    std::map<BindingKey, Binding> bindings_;
@@ -447,7 +450,7 @@ index 69863ce..ed44128 100644
    // waiting hangs the device forever if any query in the range never gets its
    // timestamp written (this happened with bucket timestamps at 3x resolution
 diff --git a/src/graphics/vulkan/native_rhi_vulkan.cpp b/src/graphics/vulkan/native_rhi_vulkan.cpp
-index 28fd5b0..0f4c4c2 100644
+index 28fd5b0..77808e6 100644
 --- a/src/graphics/vulkan/native_rhi_vulkan.cpp
 +++ b/src/graphics/vulkan/native_rhi_vulkan.cpp
 @@ -30,10 +30,13 @@
@@ -464,7 +467,7 @@ index 28fd5b0..0f4c4c2 100644
  #include <unordered_set>
  #include <utility>
  #include <vector>
-@@ -229,6 +232,10 @@ VkCompareOp ToVkCompare(nrhi::CompareFunc func) {
+@@ -229,6 +232,12 @@ VkCompareOp ToVkCompare(nrhi::CompareFunc func) {
        return VK_COMPARE_OP_LESS;
      case nrhi::CompareFunc::kLessEqual:
        return VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -472,10 +475,12 @@ index 28fd5b0..0f4c4c2 100644
 +      return VK_COMPARE_OP_GREATER;
 +    case nrhi::CompareFunc::kGreaterEqual:
 +      return VK_COMPARE_OP_GREATER_OR_EQUAL;
++    case nrhi::CompareFunc::kEqual:
++      return VK_COMPARE_OP_EQUAL;
      case nrhi::CompareFunc::kAlways:
      default:
        return VK_COMPARE_OP_ALWAYS;
-@@ -298,6 +305,13 @@ class NrTextureViewVulkan : public nrhi::TextureView {
+@@ -298,6 +307,13 @@ class NrTextureViewVulkan : public nrhi::TextureView {
   public:
    VkImageView view = VK_NULL_HANDLE;
    NrTextureVulkan* texture = nullptr;
@@ -489,7 +494,7 @@ index 28fd5b0..0f4c4c2 100644
  };
  
  class NrBindingLayoutVulkan : public nrhi::BindingLayout {
-@@ -358,6 +372,8 @@ class NrPipelineVulkan : public nrhi::Pipeline {
+@@ -358,6 +374,8 @@ class NrPipelineVulkan : public nrhi::Pipeline {
    nrhi::DepthStateDesc depth;
    nrhi::CullMode cull = nrhi::CullMode::kNone;
    bool depth_clip = true;
@@ -498,7 +503,7 @@ index 28fd5b0..0f4c4c2 100644
    Format rtv_format = Format::kUnknown;
    Format dsv_format = Format::kUnknown;
    uint32_t sample_count = 1;
-@@ -519,6 +535,7 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -519,6 +537,7 @@ class NrDeviceVulkan : public nrhi::Device {
      // Thread-safe allocator: nrhi creation APIs are called from decode
      // worker threads concurrently with the render thread.
      allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device_, /*externally_synchronized=*/false);
@@ -506,7 +511,7 @@ index 28fd5b0..0f4c4c2 100644
  
      // The internal root-constant ring UBO: kRingRegions regions cycled by
      // frame index (deeper than the CP's 3 frames in flight), persistently
-@@ -553,6 +570,16 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -553,6 +572,16 @@ class NrDeviceVulkan : public nrhi::Device {
      const VkDevice device = vulkan_device_->device();
      FlushDissolvedViews();
      DrainRetired(~0ull);
@@ -523,7 +528,7 @@ index 28fd5b0..0f4c4c2 100644
      for (auto& entry : set0_sets_) {
        dfn.vkFreeDescriptorSets(device, entry.second.pool, 1, &entry.second.set);
      }
-@@ -907,10 +934,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -907,10 +936,9 @@ class NrDeviceVulkan : public nrhi::Device {
      if (view == nullptr) return;
      // Destruction is batched: the view object stays allocated (so its
      // address cannot be reused by a new view while stale cache keys still
@@ -537,7 +542,7 @@ index 28fd5b0..0f4c4c2 100644
      auto* v = static_cast<NrTextureViewVulkan*>(view);
      {
        std::lock_guard<std::mutex> lock(mutex_);
-@@ -921,31 +947,23 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -921,31 +949,23 @@ class NrDeviceVulkan : public nrhi::Device {
  
    // Render thread, once per frame (and at device destruction): retire every
    // cached texture descriptor set referencing a view destroyed since the
@@ -580,7 +585,7 @@ index 28fd5b0..0f4c4c2 100644
        RetiredObject r;
        r.submission = submission;
        r.view = v->view;
-@@ -1223,6 +1241,8 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1223,6 +1243,8 @@ class NrDeviceVulkan : public nrhi::Device {
      pipeline->depth = desc.depth;
      pipeline->cull = desc.cull;
      pipeline->depth_clip = desc.depth_clip;
@@ -589,7 +594,7 @@ index 28fd5b0..0f4c4c2 100644
      pipeline->rtv_format = desc.rtv_format;
      pipeline->dsv_format = desc.dsv_format;
      pipeline->sample_count = desc.sample_count;
-@@ -1274,10 +1294,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1274,10 +1296,9 @@ class NrDeviceVulkan : public nrhi::Device {
      FlushDissolvedViews();
      {
        std::lock_guard<std::mutex> lock(mutex_);
@@ -603,7 +608,7 @@ index 28fd5b0..0f4c4c2 100644
        DrainRetired(cp_->GetCompletedSubmission(), 256);
      }
      ++frame_index_;
-@@ -1298,18 +1317,21 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1298,18 +1319,21 @@ class NrDeviceVulkan : public nrhi::Device {
                               (unsigned long long)(budgets[i].budget >> 20));
        }
        size_t retired_backlog = 0;
@@ -627,7 +632,7 @@ index 28fd5b0..0f4c4c2 100644
      }
      ring_region_base_ = uint32_t(frame_index_ % kRingRegions) * kRingRegionSize;
      ring_region_offset_ = 0;
-@@ -1705,7 +1727,24 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1705,7 +1729,24 @@ class NrDeviceVulkan : public nrhi::Device {
      }
      vulkan_device_->functions().vkUpdateDescriptorSets(vulkan_device_->device(), count, writes, 0,
                                                         nullptr);
@@ -653,7 +658,7 @@ index 28fd5b0..0f4c4c2 100644
      return entry.set;
    }
  
-@@ -1846,29 +1885,78 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1846,29 +1887,78 @@ class NrDeviceVulkan : public nrhi::Device {
      retired_.push_back(r);
    }
  
@@ -749,7 +754,7 @@ index 28fd5b0..0f4c4c2 100644
    }
  
    void DestroyGuestOutputWrapper(NrTextureVulkan* wrapper) {
-@@ -2028,6 +2116,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -2028,6 +2118,9 @@ class NrDeviceVulkan : public nrhi::Device {
      // winding is unchanged.
      raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
      raster.lineWidth = 1.0f;
@@ -759,7 +764,7 @@ index 28fd5b0..0f4c4c2 100644
  
      VkPipelineMultisampleStateCreateInfo multisample = {};
      multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-@@ -2130,6 +2221,14 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -2130,6 +2223,14 @@ class NrDeviceVulkan : public nrhi::Device {
    // destruction are thread-safe); the caches below are render-thread-only.
    std::mutex mutex_;
    std::vector<RetiredObject> retired_;
@@ -774,7 +779,7 @@ index 28fd5b0..0f4c4c2 100644
    // Every app-created object still alive (inserted at Create*, erased at
    // DestroyDeferred). The app holds its caches (meshes, texture store,
    // rings, PSOs) across the whole session and has no device-teardown
-@@ -2152,6 +2251,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -2152,6 +2253,9 @@ class NrDeviceVulkan : public nrhi::Device {
    std::vector<VkDescriptorPool> descriptor_pools_;
    std::map<Set0Key, SetEntry> set0_sets_;
    std::map<TableKey, SetEntry> table_sets_;

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import numpy as np
-from skate2_dlc_livingworld import rain_resource,StreetRaster,prepare_livingworld,driving_routes,curve_samples,census_tiles,native_lane_normals,refine_boundary_lane
+from skate2_dlc_livingworld import rain_resource,StreetRaster,prepare_livingworld,driving_routes,curve_samples,census_tiles,native_lane_normals,refine_boundary_lane,separate_circuits
 from skate2_pedestrian_areas import area_material,rain_footprints
 from skate2_navigation import bake_cell
 from navpower_resource import read_rw_object
@@ -113,6 +113,40 @@ class DlcTests(unittest.TestCase):
         routes,_=driving_routes({'road':roads,'crosswalk':np.empty((0,3,3))},roads,np.empty((0,3,3)))
         self.assertEqual(routes,[])
         with self.assertRaises(ValueError):prepare_livingworld(Path('DLC_MaloofMoneyCup'),None,None,None,None)
+
+    def test_closed_loop_does_not_suppress_supported_branch(self):
+        # A loop and a long connected dead-end street: previously one valid
+        # loop suppressed all boundary continuations on the branch.
+        street=np.array(floor(-60,-60,60,-40)+floor(-60,40,60,60)+
+                        floor(-60,-40,-40,40)+floor(40,-40,60,40)+
+                        floor(60,-12,200,12),np.float32)
+        # The surveyed car floor has clearance from the authored kerb.
+        raster=StreetRaster(street);mask=np.isfinite(raster.y)
+        for _ in range(3):
+            padded=np.pad(mask,1)
+            mask &= padded[:-2,1:-1]&padded[2:,1:-1]&padded[1:-1,:-2]&padded[1:-1,2:]
+        clear=[]
+        for x,row in enumerate(mask):
+            changes=np.diff(np.r_[False,row,False].astype(int))
+            for a,b in zip(np.flatnonzero(changes==1),np.flatnonzero(changes==-1)):
+                clear.extend(floor(x+raster.origin[0]-.5,a+raster.origin[1]-.5,
+                                   x+raster.origin[0]+.5,b+raster.origin[1]-.5))
+        routes,survey=driving_routes({'road':street,'crosswalk':np.empty((0,3,3))},street,np.array(clear,np.float32))
+        self.assertTrue(survey['boundary_continuations'])
+        self.assertTrue(survey['boundary_separate'])
+        self.assertGreater(survey['boundary_coverage']['covered'],survey['skeleton_coverage']['covered'])
+        self.assertGreater(max(r[:,0].max() for r in routes),190)
+        for r in routes:
+            for samples in curve_samples(r):
+                self.assertTrue(np.isfinite(StreetRaster(street).height(samples.reshape(-1,3))).all())
+
+    def test_independent_circuits_reject_crossing_and_overlapping_lanes(self):
+        angles=np.linspace(0,2*np.pi,100,endpoint=False)
+        loop=np.column_stack((20*np.cos(angles),np.zeros(len(angles)),20*np.sin(angles)))
+        self.assertTrue(separate_circuits([loop]))
+        self.assertTrue(separate_circuits([loop,loop+[50.,0.,0.]]))
+        self.assertFalse(separate_circuits([loop,loop+[10.,0.,0.]]))
+        self.assertFalse(separate_circuits([loop,loop[::-1]]))
 
     def test_turnaround_corner_refinement_retains_supported_ribbon(self):
         raster=StreetRaster(np.array(floor(-40,-10,40,10),np.float32))

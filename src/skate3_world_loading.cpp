@@ -5,6 +5,7 @@
 #include "skate3_pedestrian_speech.h"
 #include "skate3_menu_probe.h"
 #include "skate3_perf_recorder.h"
+#include "skate3_freeze_capture.h"
 #include "skate3_release_budget.h"
 #include "skate3_stream_pump.h"
 #include "skate3_sim_extent.h"
@@ -99,6 +100,9 @@ std::atomic<bool> skate2_ready{false};
 std::atomic<bool> load_requested{false};
 std::atomic<bool> skate2_loading{false};
 std::atomic<bool> bam_gameplay{false};
+// Debug-only snapshots; never retain or dereference a guest resource unguarded.
+std::atomic<uint8_t*> freeze_base{nullptr};
+std::atomic<uint32_t> freeze_gameplay{0}, freeze_stream_manager{0}, freeze_pause_result{~0u};
 std::atomic<uint64_t> template_world{0};
 // Steady-clock ticks after which an armed template_world whose world load
 // never started is dropped, so a later retail load of it stays retail.
@@ -717,11 +721,11 @@ void skate3::world_loading::Install(rex::filesystem::VirtualFileSystem* vfs,
           uint32_t cells = 0, polygons = 0, census = 0, roads = 0;
           std::string nav_magic, actor_magic, extra;
           std::ifstream nav(entry.path() / "NAVIGATION_COMPLETE_V4");
-          std::ifstream actors(entry.path() / "LIVINGWORLD_COMPLETE_V4");
+          std::ifstream actors(entry.path() / "LIVINGWORLD_COMPLETE_V5");
           const bool ready = classic && bool(nav >> nav_magic >> cells >> polygons) &&
               nav_magic == "NSV_NAVIGATION_V4" && cells > 0 && cells <= 4096 &&
               polygons > 0 && polygons <= 1000000 && !(nav >> extra) &&
-              bool(actors >> actor_magic >> census >> roads) && actor_magic == "NSV_DLC_LIVINGWORLD_V4" &&
+              bool(actors >> actor_magic >> census >> roads) && actor_magic == "NSV_DLC_LIVINGWORLD_V5" &&
               census > 0 && census <= 4096 && roads > 0 && roads <= 4096 && !(actors >> extra);
           skate2_navigation_ready.push_back(ready);
           skate2_actor_streams.push_back(ready);
@@ -1346,6 +1350,12 @@ void skate3::world_loading::BeforeRetailTeleport(uint8_t* base, uint64_t world) 
 extern "C" REX_FUNC(sub_8270C890) {
   if (ctx.r4.u32 == 0 || ctx.r4.u32 == 1) bam_gameplay.store(skate2_loading.load());
   else if (ctx.r4.u32 == 4) bam_gameplay.store(false);
+  skate3::freeze_capture::GameplayUpdate freeze_update(ctx.r4.u32 == 1);
+  if (ctx.r4.u32 == 1 && skate3::freeze_capture::Enabled() &&
+      skate3::world_loading::IsSkate2Gameplay()) {
+    freeze_base.store(base);
+    freeze_gameplay.store(ctx.r3.u32);
+  }
   if (ctx.r4.u32 == 1) PollSkyWater(ctx, base);
   if (ctx.r4.u32 == 1) HoldCareerAutosave(base, true);
   if (ctx.r4.u32 == 1 && template_world.load() && template_deadline.load() &&
@@ -1755,6 +1765,10 @@ double StreamMilliseconds(std::chrono::steady_clock::duration duration) {
 }
 template <typename Context>
 void ProcessWorldReleases(Context& ctx, uint8_t* base) {
+  if (skate3::freeze_capture::Enabled() && skate3::world_loading::IsSkate2Gameplay()) {
+    freeze_base.store(base);
+    freeze_stream_manager.store(ctx.r3.u32);
+  }
   // Only the normal gameplay updater, before its stream scheduler. Other
   // worlds/callers retain the original one-batch behavior.
   if (!skate3::world_loading::IsSkate2Gameplay() ||
@@ -2389,6 +2403,17 @@ extern "C" REX_FUNC(sub_8247A4B8) {
                   StreamWord(base, monitor, 28));
       last = now;
     }
+  }
+}
+
+// Keep the actual native wait result for the rare freeze snapshot.
+extern "C" REX_FUNC(sub_82478B30) {
+  const uint32_t manager = ctx.r3.u32;
+  __imp__sub_82478B30(ctx, base);
+  if (skate3::freeze_capture::Enabled() && skate3::world_loading::IsSkate2Gameplay()) {
+    freeze_base.store(base);
+    freeze_stream_manager.store(manager);
+    freeze_pause_result.store(ctx.r3.u32 & 255);
   }
 }
 
@@ -4019,3 +4044,42 @@ bool skate3::world_loading::DomeSkyTextures(uint32_t* diffuse, uint32_t* specula
 }
 
 bool skate3::world_loading::NightSky() { return night_sky.load(std::memory_order_acquire); }
+
+// Only emitted during a debug freeze capture, after every sampled thread was
+// resumed. These guarded, bounded reads may race workers; record their values
+// without treating them as authoritative or changing native readiness.
+void skate3::world_loading::LogFreezeSnapshot() {
+  uint8_t* base = freeze_base.load();
+  if (!base || !IsSkate2Gameplay() || !skate3::freeze_capture::Enabled()) return;
+  const uint32_t self = freeze_gameplay.load(), manager = freeze_stream_manager.load();
+  const int stream = loaded_stream.load();
+  REXLOG_WARN("sim-freeze: world stream={} gameplay={:08X} world={:016X} loading={:016X} state_bytes={:08X},{:08X} manager={:08X} native_wait={} snapshot=racy",
+              stream >= 0 && stream < int(skate2_streams.size()) ? skate2_streams[stream] : "unknown",
+              self, StreamId(base, kWorldState, 48), StreamId(base, kWorldState, 40),
+              StreamWord(base, self, 44), StreamWord(base, self, 48), manager, freeze_pause_result.load());
+  if (manager < 0x10000 || manager > 0xfffc0000) return;
+  const uint32_t sys = manager + 61008;
+  const auto release = ReadReleaseSnapshot(base, manager);
+  REXLOG_WARN("sim-freeze: streaming sim_loads={} sim_unloads={} operation={:016X} load={:016X} unload={:016X} release_target={} submitted={} processed={} retired={} epoch={} oldest_epoch={}",
+              StreamVectorCount(base, sys, 124, 32), StreamVectorCount(base, sys, 172, 32),
+              StreamId(base, sys, 71408), StreamId(base, sys, 71416), StreamId(base, sys, 71424),
+              StreamWord(base, sys, 71468), release.submitted, release.processed,
+              release.retired, release.epoch, release.oldest_epoch);
+  for (uint32_t expected = 0; expected < 3; ++expected) {
+    const uint32_t monitor = StreamWord(base, manager, 133000 + 4 * expected);
+    if (monitor < 0x10000 || monitor > 0xffff0000 || StreamWord(base, monitor, 32) != expected) continue;
+    const uint32_t count = StreamWord(base, monitor, 1400);
+    REXLOG_WARN("sim-freeze: monitor kind={} wait={} cells={} ready={} bytes={}",
+                expected, StreamWord(base, monitor, 28), count,
+                StreamWord(base, monitor, 340), StreamWord(base, monitor, 348));
+    if (count > 64) continue;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t cell = StreamWord(base, monitor, 384 + 16 * i);
+      if (cell < 0x10000 || cell > 0xffffff00) continue;
+      const uint32_t flags = StreamWord(base, cell, 116);
+      REXLOG_WARN("sim-freeze: cell kind={} id={:016X} state={} category={} bytes={}",
+                  expected, StreamId(base, cell, 64), (flags >> 8) & 255,
+                  flags >> 24, StreamWord(base, cell, 104));
+    }
+  }
+}

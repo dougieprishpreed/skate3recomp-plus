@@ -30,6 +30,7 @@
 #endif
 
 #include "skate3_perf_recorder.h"
+#include "skate3_freeze_capture.h"
 
 #include "native/skate3_native_guest_read.h"
 #include "skate3_native_scene.h"
@@ -351,6 +352,7 @@ void RequestCapture() {
 }
 
 void SetPresenter(rex::ui::Presenter* presenter) {
+  if (!presenter) skate3::freeze_capture::Shutdown();
   std::lock_guard<std::mutex> lock(PresenterMutex());
   g_presenter = presenter;
 }
@@ -1250,6 +1252,8 @@ void SamplerLoop() {
     render0 = render1;
     g_ticks.Push(t);
     const int64_t c4 = NowUs();
+    skate3::freeze_capture::Poll(now - g_last_native_us.load(std::memory_order_relaxed) < 1'000'000,
+                                 t.render_paused != 0);
     cost_threads_us += double(c1 - c0);
     cost_proc_us += double(c2 - c1) + double(c4 - c3);
     cost_gpu_us += double(c3 - c2);

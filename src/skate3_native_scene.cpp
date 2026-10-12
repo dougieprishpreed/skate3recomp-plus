@@ -1268,6 +1268,9 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_perf_log, false, "Skate 3",
                     "Log periodic native-renderer performance breakdown lines "
                     "(see skate3_native_render_scene_perf_interval)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_pedestrian_diagnostics, false, "Skate 3",
+                    "Include New San Van pedestrian rows and shader banks in manual Insert/F10 captures")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_character_log, false, "Skate 3",
                     "Log character shading diagnostics: Hall of Meat bone overlay rows "
                     "and textures (native-hom), skin stamp rows and decals "
@@ -3352,11 +3355,17 @@ void RequestSceneRingDump() {
   g_scene_ring_dump.store(true, std::memory_order_release);
 }
 void RequestCharDump() {
+  g_ped_bank_dump_budget.store(48, std::memory_order_release);
   g_char_dump_frames.store(4, std::memory_order_release);
 }
 void RequestLightHistory(uint32_t marker) {
   g_light_history_marker.store(std::max(marker, 1u), std::memory_order_release);
   g_pick_request.store(true, std::memory_order_release);
+  if (REXCVAR_GET(skate3_skate2_pedestrian_diagnostics) &&
+      skate3::world_loading::IsSkate2Gameplay()) {
+    RequestCharDump();
+    REXLOG_INFO("native-peddump: marker={} armed frames=4 bank_budget=48", marker);
+  }
 }
 void FlushMeshCache() { g_flush_meshes.store(true, std::memory_order_relaxed); }
 
@@ -4355,6 +4364,33 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     std::memcpy(item.char_rows, local, sizeof(item.char_rows));
     g_char_valid.fetch_add(1, std::memory_order_relaxed);
     return;
+  }
+  // Manual comparison of distant/near pedestrians. This observes the bank
+  // at the existing capture point and does not choose a new shading layout.
+  // No shader-label reads or bank logging outside the four requested frames.
+  if (fam == 3 && skate3::world_loading::IsSkate2Gameplay() &&
+      g_char_dump_frames.load(std::memory_order_acquire) > 0 &&
+      g_ped_bank_dump_budget.load(std::memory_order_relaxed) > 0 &&
+      g_ped_bank_dump_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+    char names[2][256]{};
+    const uint32_t objects[2] = {g_cur_ps_obj.load(std::memory_order_relaxed),
+                               g_cur_vs_obj.load(std::memory_order_relaxed)};
+    for (int i = 0; i < 2; ++i) {
+      if (objects[i]) GuestTryReadString(base, objects[i] + 0x54, names[i], sizeof(names[i]));
+    }
+    REXLOG_INFO(
+        "native-pedbank: mesh={:08X} ctx={:08X} material={} labels=[{}][{}] "
+        "c3w={:.3f} c6z={:.3f} c7y={:.3f} c9=({:.3f},{:.3f},{:.3f},{:.3f}) "
+        "c12w={:.3f} c13zw=({:.3f},{:.3f}) c14x={:.3f} "
+        "c15=({:.3f},{:.3f},{:.3f}) c16=({:.3f},{:.3f},{:.3f}) "
+        "c19w={:.3f} c21x={:.3f} c22=({:.3f},{:.3f},{:.3f}) "
+        "c23=({:.3f},{:.3f},{:.3f})",
+        item.mesh, item.ctx, item.material_name, names[0], names[1],
+        row(3,3), row(6,2), row(7,1), row(9,0), row(9,1), row(9,2), row(9,3),
+        row(12,3), row(13,2), row(13,3), row(14,0),
+        row(15,0), row(15,1), row(15,2), row(16,0), row(16,1), row(16,2),
+        row(19,3), row(21,0), row(22,0), row(22,1), row(22,2),
+        row(23,0), row(23,1), row(23,2));
   }
   // `plus` = register-row shift for the create-a-skater EDITOR compiles of
   // the fam-2 shaders (cacstamp_/cac_*_nisPS + the ropa variants): the whole

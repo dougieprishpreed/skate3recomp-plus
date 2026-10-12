@@ -1,13 +1,14 @@
-Welcome to New San Van.
+Welcome to New San Vanelona.
 
-Visit the city from the in-game locations menu of Skate 3; it's at the bottom of the list.
+Visit Skate 2's iconic city from the in-game locations menu of Skate 3.
 
 Complete with:
 
 -25 spawn locations
 -distant backdrop assets, skybox, clouds, water shader
 -animated vegetation, fountains, water surfaces, flags
--emissive lights, neon signs, storefront glass, reflective skyscrapers
+-emissive lights, neon signs
+-storefront glass, reflective skyscrapers
 -transparent objects with correct properties, like the sails in Waterfront
 -jumbotron video and indoor lighting in S.V. Stadium
 -ambient audio around city, audio emitters like waves and birds
@@ -28,7 +29,8 @@ Many native renderer issues have also been resolved. These fixes affect all Skat
 -feet no longer detach during forward man
 -tattoos, dirt on clothes, scrapes on knees are all visible now
 -enabled traffic lights in Skate 3 and New San Van
--original static effect on teleporting to placed marker
+-original static effect on returning to placed marker
+-no visible seams on player when returning to placed marker
 
 Open the imgui interface with RB+Start or ESC and look in the World menu for:
 

@@ -2,6 +2,7 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
+#include "skate3_freeze_capture.h"
 #include "skate3_iso_installer.h"
 #include "skate3_nsv_installer.h"
 #include "skate3_jumbotron.h"
@@ -756,10 +757,8 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
 #endif
 #endif
 #if defined(_WIN32)
-  // Window/taskbar + Explorer icon sourced from the user's OWN game art at
-  // runtime (game/nxeart); the shipped exe and the repo carry no EA
-  // artwork (see skate3_win_icon.h). Game files are guaranteed installed by
-  // this point on Windows (the install wizards above run blocking).
+  // Use the embedded release icon for the window/taskbar. Builds without
+  // MAINICON retain the game-data fallback (see skate3_win_icon.h).
   skate3::ApplyGameIconFromGameData(
       runtime_paths.game_data_root,
       window() ? window()->GetNativeWindowHandle() : nullptr);
@@ -830,6 +829,10 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_perf_capture", "Home",
                         "Save performance capture", [] {
                           skate3::perf_recorder::RequestCapture();
+                        });
+  rex::ui::RegisterBind("bind_skate3_freeze_capture", "Delete",
+                        "Save New San Van freeze thread capture", [] {
+                          skate3::freeze_capture::Request();
                         });
   skate3::perf_recorder::SetPresenter(drawer->presenter());
   skate3::perf_recorder::NameCurrentThread("Host UI");

@@ -728,6 +728,8 @@ inline std::atomic<bool> g_scene_ring_dump{false};
 // User-marker character dump (RequestCharDump): rendered frames left to log
 // every character piece near the camera (the detached-shoe hunt).
 inline std::atomic<int> g_char_dump_frames{0};
+// Extra guest-bank samples only while a user-requested dump is active.
+inline std::atomic<int> g_ped_bank_dump_budget{0};
 
 // ---- User-marker lighting history (RequestLightHistory) ----
 // One record per RenderScene call (one presented frame), always on: the path

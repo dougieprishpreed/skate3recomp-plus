@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 0.1 LANGUAGES CXX)
+project(skate3 VERSION 0.1.1 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -24,8 +24,8 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "${PROJECT_VERSION}")
-string(REGEX REPLACE "-.*$" "" SKATE3_NUMERIC_VERSION "${SKATE3_FULL_VERSION}")
+set(SKATE3_FULL_VERSION "0.1a")
+set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
 string(REPLACE "." ";" SKATE3_RC_VERSION_PARTS "${SKATE3_NUMERIC_VERSION}")
@@ -261,6 +261,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_native_scene_gpu.cpp
     src/skate3_native_scene_post.cpp
     src/skate3_perf_recorder.cpp
+    src/skate3_freeze_capture.cpp
     src/skate3_screenshot.cpp
     src/skate3_shader_disasm.cpp
     src/skate3_title_update_installer.cpp
@@ -287,6 +288,7 @@ if(WIN32)
         COPYONLY
     )
     target_link_options(skate3 PRIVATE LINKER:/MANIFESTINPUT:skate3_app.manifest)
+    set(SKATE3_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/packaging/release.ico")
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/src/skate3.rc.in
         ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc
