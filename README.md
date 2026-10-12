@@ -29,7 +29,8 @@ Many native renderer issues have also been resolved. These fixes affect all Skat
 - feet no longer detach during forward man
 - tattoos, dirt on clothes, scrapes on knees are all visible now
 - enabled traffic lights in Skate 3 and New San Van
-- original static effect on teleporting to placed marker
+- original static effect on returning to placed marker
+- no visible seams on player when returning to placed marker
 
 Open the imgui interface with **RB+Start** or **ESC** and look in the **World** menu for:
 
