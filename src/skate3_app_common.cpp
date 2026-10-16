@@ -5,6 +5,7 @@
 #include "skate3_freeze_capture.h"
 #include "skate3_iso_installer.h"
 #include "skate3_nsv_installer.h"
+#include "skate3_install_paths.h"
 #include "skate3_jumbotron.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
@@ -91,6 +92,7 @@ extern const rex::PPCImageInfo eawebkit_PPCImageConfig;
 extern "C" REX_FUNC(__restgprlr_19);
 
 // Defined in skate3_native_scene.cpp; toggled by the showcase hotkey below.
+REXCVAR_DECLARE(std::string, log_file);
 REXCVAR_DECLARE(bool, skate3_native_render_capture_hotkeys);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_showcase);
 // Defined in skate3_native_scene.cpp; the freecam hotkey below toggles it,
@@ -370,11 +372,26 @@ void ConfigureSkate3UserPaths(rex::PathConfig& paths, std::filesystem::path& set
   const auto resolved_user_root = ResolveSkate3UserRoot(paths);
 
   paths.user_data_root = resolved_user_root;
+#if !defined(_WIN32)
+  // Installed content and settings must survive replacing a read-only app bundle.
+  if (paths.game_data_root.empty()) paths.game_data_root = resolved_user_root / "game";
+#endif
   if (original_cache_root.empty() || original_cache_root == old_cache_root) {
     paths.cache_root = resolved_user_root / "cache";
   }
   settings_path = resolved_user_root / std::string(kSettingsFilename);
   profiles_path = skate3::ProfilesFilePath(resolved_user_root);
+#if !defined(_WIN32)
+  std::filesystem::create_directories(resolved_user_root);
+  const auto defaults = skate3::SetupResourceRoot() / "settings.toml";
+  if (!std::filesystem::exists(settings_path) && std::filesystem::is_regular_file(defaults))
+    std::filesystem::copy_file(defaults, settings_path);
+  if (REXCVAR_GET(log_file).empty()) {
+    const auto logs = resolved_user_root / "logs";
+    std::filesystem::create_directories(logs);
+    rex::cvar::SetFlagByName("log_file", rex::path_to_utf8(logs / "skate3.log"));
+  }
+#endif
 }
 
 bool ConfigContainsAnyKey(const toml::table& table, std::initializer_list<std::string_view> keys) {
@@ -682,80 +699,23 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   auto runtime_paths = defaults;
   runtime_paths.game_data_root = ResolveRuntimeGameDataRoot(runtime_paths);
   runtime_paths.config_path.clear();
-#if defined(_WIN32)
   if (!skate3::IsGameInstalled(runtime_paths.game_data_root) ||
       !skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root) ||
-      !skate3::IsNewSanVanInstalled(rex::filesystem::GetAppRootFolder(), runtime_paths.user_data_root)) {
+      !skate3::IsNewSanVanInstalled(skate3::ContentInstallRoot(runtime_paths.user_data_root),
+                                  runtime_paths.user_data_root)) {
+#if defined(_WIN32)
     if (!skate3::RunNewSanVanSetup(app_context(), window(), imgui_drawer(), runtime_paths,
                                    user_settings_path_)) {
       app_context().QuitFromUIThread();
       return std::nullopt;
     }
-  }
 #else
-  if (!skate3::IsGameInstalled(runtime_paths.game_data_root)) {
-    REXLOG_INFO("Game files not found at {}; launching rexglue ISO installer",
-                runtime_paths.game_data_root.string());
-#if defined(__APPLE__)
-    if (const char* automated_iso = std::getenv("SKATE3_INSTALL_ISO");
-        automated_iso == nullptr || *automated_iso == '\0') {
-#if SKATE3_HAS_TITLE_UPDATE
-      // Chain the title update wizard after the ISO install completes.
-      auto resume_after_title_update =
-          [this, resume = std::move(resume)](rex::PathConfig paths) mutable {
-            if (!skate3::IsTitleUpdateInstalled(paths.game_data_root)) {
-              skate3::ShowTitleUpdateInstallWizard(imgui_drawer(), std::move(paths),
-                                                   std::move(resume));
-              return;
-            }
-            resume(std::move(paths));
-          };
-      skate3::ShowRexglueIsoInstallWizard(imgui_drawer(), std::move(runtime_paths),
-                                          std::move(resume_after_title_update));
-#else
-      skate3::ShowRexglueIsoInstallWizard(imgui_drawer(), std::move(runtime_paths),
-                                          std::move(resume));
+    // Let GTK/Cocoa keep pumping while the shared wizard and worker run.
+    skate3::ShowNewSanVanSetup(app_context(), imgui_drawer(), std::move(runtime_paths),
+                              user_settings_path_, std::move(resume));
+    return std::nullopt;
 #endif
-      return std::nullopt;
-    }
-#endif
-    rex::PathConfig installed_paths;
-    const bool installed = skate3::RunRexglueIsoInstallWizardBlocking(
-        app_context(), window(), imgui_drawer(), runtime_paths, installed_paths);
-    if (!installed) {
-      app_context().QuitFromUIThread();
-      return std::nullopt;
-    }
-    runtime_paths = std::move(installed_paths);
   }
-
-#if SKATE3_HAS_TITLE_UPDATE
-  // This build executes Title Update 3 code; the game cannot boot without the
-  // TU payloads staged next to the installed game files. Existing installs
-  // from releases that predate TU support land here with the game present but
-  // the title update missing.
-  if (!skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root)) {
-    REXLOG_INFO("Skate 3 Title Update 3 not staged at {}; launching title update installer",
-                runtime_paths.game_data_root.string());
-#if defined(__APPLE__)
-    if (const char* automated_tu = std::getenv("SKATE3_INSTALL_TU");
-        automated_tu == nullptr || *automated_tu == '\0') {
-      skate3::ShowTitleUpdateInstallWizard(imgui_drawer(), std::move(runtime_paths),
-                                           std::move(resume));
-      return std::nullopt;
-    }
-#endif
-    rex::PathConfig tu_paths;
-    const bool tu_installed = skate3::RunTitleUpdateInstallWizardBlocking(
-        app_context(), window(), imgui_drawer(), runtime_paths, tu_paths);
-    if (!tu_installed) {
-      app_context().QuitFromUIThread();
-      return std::nullopt;
-    }
-    runtime_paths = std::move(tu_paths);
-  }
-#endif
-#endif
 #if defined(_WIN32)
   // Use the embedded release icon for the window/taskbar. Builds without
   // MAINICON retain the game-data fallback (see skate3_win_icon.h).
@@ -898,10 +858,10 @@ void Skate3BaseApp::OnPostSetup() {
   }
   InstallDlcPackages();
   InstallRecipeOverlay();
-  skate3::world_loading::Install(runtime()->file_system(), rex::filesystem::GetAppRootFolder());
+  skate3::world_loading::Install(runtime()->file_system(), skate3::ContentInstallRoot(runtime()->user_data_root()));
   skate3::world_loading::PrepareSky(runtime()->game_data_root(), runtime()->user_data_root());
-  skate3::nsv_menu::Install(rex::filesystem::GetAppRootFolder());
-  skate3::jumbotron::Install(rex::filesystem::GetAppRootFolder());
+  skate3::nsv_menu::Install(skate3::ContentInstallRoot(runtime()->user_data_root()));
+  skate3::jumbotron::Install(skate3::ContentInstallRoot(runtime()->user_data_root()));
 
   // Register retail multi-entry-function alternate entries.
 #if !SKATE3_HAS_TITLE_UPDATE

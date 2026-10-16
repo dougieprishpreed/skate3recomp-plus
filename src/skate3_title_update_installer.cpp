@@ -1,4 +1,5 @@
 #include "skate3_title_update_installer.h"
+#include "skate3_setup_process.h"
 
 #include <algorithm>
 #include <array>
@@ -542,34 +543,10 @@ bool DownloadToFile(const std::string& url, const std::filesystem::path& destina
 bool DownloadToFile(const std::string& url, const std::filesystem::path& destination,
                     std::atomic<uint64_t>& copied_bytes, std::atomic<uint64_t>& total_bytes,
                     std::string& error) {
-  if (url.find('\'') != std::string::npos || url.find('\\') != std::string::npos) {
-    error = "The configured title update URL is invalid.";
-    return false;
-  }
-  const std::string destination_str = destination.string();
-  if (destination_str.find('\'') != std::string::npos) {
-    error = "The temporary download path is not usable.";
-    return false;
-  }
-  const std::string command = "curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o '" +
-                              destination_str + "' '" + url + "'";
-  REXLOG_INFO("Downloading Skate 3 title update via curl");
-  const int status = std::system(command.c_str());
-  if (status != 0) {
-    // std::system returns the raw wait status; decode it into the actual curl
-    // exit code (e.g. 22 = HTTP error response) for a readable message.
-    std::string detail;
-    if (status == -1) {
-      detail = "curl could not be launched";
-    } else if (WIFEXITED(status)) {
-      detail = "curl exit code " + std::to_string(WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-      detail = "curl terminated by signal " + std::to_string(WTERMSIG(status));
-    } else {
-      detail = "curl status " + std::to_string(status);
-    }
-    error = "The download failed (" + detail +
-            "). Check your internet connection, or select the title update file manually.";
+  const std::vector<std::string> args = {"-fsSL", "--connect-timeout", "30",
+      "--max-time", "600", "--retry", "3", "-o", destination.string(), url};
+  if (!RunSetupProcess("/usr/bin/curl", args, destination.parent_path() / "download.log", error)) {
+    error = "The update download failed. Check your connection or select the update file manually. " + error;
     return false;
   }
   std::error_code ec;

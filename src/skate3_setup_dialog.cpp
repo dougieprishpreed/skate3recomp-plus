@@ -1,4 +1,5 @@
 #include "skate3_nsv_installer.h"
+#include "skate3_install_paths.h"
 #include "skate3_setup_sources.h"
 #include "skate3_title_update_installer.h"
 #include <algorithm>
@@ -6,6 +7,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string_view>
@@ -25,6 +28,10 @@
 #include <shobjidl.h>
 #include <gdiplus.h>
 #include <rex/ui/window_win.h>
+#elif defined(__APPLE__)
+#include <SDL3/SDL.h>
+#else
+#include <gtk/gtk.h>
 #endif
 
 // New San Vanelona sky (skate3_world_loading.cpp): true = Skate 2's.
@@ -33,7 +40,9 @@ REXCVAR_DECLARE(bool, skate3_skate2_sky);
 REXCVAR_DECLARE(bool, skate3_skate2_night);
 
 namespace skate3 {
-#if defined(_WIN32)
+#if defined(__APPLE__)
+std::filesystem::path PickSetupSourceMacOS(const wchar_t* title, bool folder, bool iso);
+#endif
 namespace {
 namespace fs = std::filesystem;
 fs::path Pick(const wchar_t* title, bool folder, bool iso = false) {
@@ -43,6 +52,7 @@ fs::path Pick(const wchar_t* title, bool folder, bool iso = false) {
       io.AddKeyEvent(ImGuiKey_Enter,false); io.AddKeyEvent(ImGuiKey_Space,false);
     }
   } balance;
+  #if defined(_WIN32)
   if (folder) {
     IFileOpenDialog* dialog = nullptr;
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -73,14 +83,40 @@ fs::path Pick(const wchar_t* title, bool folder, bool iso = false) {
   ofn.lpstrFilter = iso ? L"Xbox 360 ISO\0*.iso\0\0" : L"Title update package\0*.*\0\0";
   ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
   return GetOpenFileNameW(&ofn) ? fs::path(name.data()) : fs::path{};
+#elif defined(__APPLE__)
+  return PickSetupSourceMacOS(title, folder, iso);
+#else
+  const auto title_utf8 = rex::path_to_utf8(fs::path(title));
+  auto* dialog = gtk_file_chooser_dialog_new(title_utf8.c_str(), nullptr,
+      folder ? GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER : GTK_FILE_CHOOSER_ACTION_OPEN,
+      "_Cancel", GTK_RESPONSE_CANCEL, "_Select", GTK_RESPONSE_ACCEPT, nullptr);
+  if (!dialog) return {};
+  if (iso) {
+    auto* filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "Xbox 360 ISO");
+    gtk_file_filter_add_pattern(filter, "*.iso");
+    gtk_file_filter_add_pattern(filter, "*.ISO");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+  }
+  fs::path result;
+  if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+    if (char* name = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog))) {
+      result = name; g_free(name);
+    }
+  }
+  gtk_widget_destroy(dialog);
+  while (gtk_events_pending()) gtk_main_iteration_do(FALSE);
+  return result;
+#endif
 }
 
 rex::ui::ImmediateTexture* Background(rex::ui::ImGuiDrawer* drawer) {
+#if defined(_WIN32)
   Gdiplus::GdiplusStartupInput input; ULONG_PTR token = 0;
   if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) return {};
   std::vector<uint8_t> pixels; UINT width = 0, height = 0;
   {
-    const auto path = rex::filesystem::GetAppRootFolder() / "installer/title.png";
+    const auto path = SetupResourceRoot() / "installer/title.png";
     Gdiplus::Bitmap bitmap(path.c_str());
     if (bitmap.GetLastStatus() == Gdiplus::Ok) {
       width = bitmap.GetWidth(); height = bitmap.GetHeight();
@@ -100,6 +136,40 @@ rex::ui::ImmediateTexture* Background(rex::ui::ImGuiDrawer* drawer) {
   }
   Gdiplus::GdiplusShutdown(token);
   return pixels.empty() ? nullptr : drawer->CreateImage(width, height, pixels.data());
+#elif defined(__APPLE__)
+  const auto path = SetupResourceRoot() / "installer/title.png";
+  std::ifstream in(path, std::ios::binary);
+  std::vector<char> encoded((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (encoded.empty()) return nullptr;
+  auto* source = SDL_LoadPNG_IO(SDL_IOFromConstMem(encoded.data(), encoded.size()), true);
+  if (!source) return nullptr;
+  auto* rgba = SDL_ConvertSurface(source, SDL_PIXELFORMAT_RGBA32);
+  SDL_DestroySurface(source);
+  if (!rgba) return nullptr;
+  std::vector<uint8_t> pixels(size_t(rgba->w) * rgba->h * 4);
+  for (int y = 0; y < rgba->h; ++y)
+    std::copy_n(static_cast<const uint8_t*>(rgba->pixels) + y * rgba->pitch,
+                rgba->w * 4, pixels.data() + size_t(y) * rgba->w * 4);
+  auto* image = drawer->CreateImage(rgba->w, rgba->h, pixels.data());
+  SDL_DestroySurface(rgba);
+  return image;
+#else
+  const auto path = SetupResourceRoot() / "installer/title.png";
+  auto* pixbuf = gdk_pixbuf_new_from_file(path.c_str(), nullptr);
+  if (!pixbuf) return nullptr;
+  const int w = gdk_pixbuf_get_width(pixbuf), h = gdk_pixbuf_get_height(pixbuf);
+  const int channels = gdk_pixbuf_get_n_channels(pixbuf), stride = gdk_pixbuf_get_rowstride(pixbuf);
+  const auto* data = gdk_pixbuf_read_pixels(pixbuf);
+  std::vector<uint8_t> pixels(size_t(w) * h * 4);
+  for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+    const auto* src = data + y * stride + x * channels;
+    auto* dst = pixels.data() + (size_t(y) * w + x) * 4;
+    std::copy_n(src, 3, dst); dst[3] = channels == 4 ? src[3] : 255;
+  }
+  auto* image = drawer->CreateImage(w, h, pixels.data());
+  g_object_unref(pixbuf);
+  return image;
+#endif
 }
 
 struct Row { bool ready = false; std::string detail, error; };
@@ -107,9 +177,9 @@ struct Row { bool ready = false; std::string detail, error; };
 class SetupDialog final : public rex::ui::ImGuiDialog {
  public:
   SetupDialog(rex::ui::ImGuiDrawer* drawer, rex::PathConfig paths, fs::path settings_path,
-              std::shared_ptr<bool> finished)
+              std::shared_ptr<bool> finished, std::function<void(bool)> closed = {})
       : ImGuiDialog(drawer), paths_(std::move(paths)), settings_path_(std::move(settings_path)),
-        finished_(std::move(finished)) {
+        finished_(std::move(finished)), closed_(std::move(closed)) {
     sky_choice_ = REXCVAR_GET(skate3_skate2_night) ? 2 : REXCVAR_GET(skate3_skate2_sky) ? 0 : 1;
     inputs_.s3 = {paths_.game_data_root, true};
     rows_[0].ready = ValidateSetupGame(inputs_.s3, 0x454108E6, rows_[0].error);
@@ -129,6 +199,7 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
   void OnClose() override {
     Shutdown();
     background_ = nullptr;
+    if (closed_) closed_(*finished_);
   }
   void OnDraw(ImGuiIO& io) override {
     const float saved_dpi=ImGui::GetStyle().FontScaleDpi;
@@ -378,7 +449,7 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
     if (!download && file.empty()) return;
     rows_[2]={};
     Job(download?"Downloading and verifying Title Update 3...":"Verifying Title Update 3...",[this,file,download] {
-      auto stage=rex::filesystem::GetAppRootFolder()/"install-state"/("tu-"+std::to_string(std::random_device{}()));
+      auto stage=ContentInstallRoot(paths_.user_data_root)/"install-state"/("tu-"+std::to_string(std::random_device{}()));
       fs::create_directories(stage.parent_path());
       if (!fs::create_directory(stage)) throw std::runtime_error("Unable to create update staging");
       std::string error;
@@ -393,6 +464,7 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
   rex::PathConfig paths_;
   fs::path settings_path_;
   std::shared_ptr<bool> finished_;
+  std::function<void(bool)> closed_;
   SetupInputs inputs_;
   std::array<Row,5> rows_{};
   bool busy_=false,installed_=false,background_attempted_=false;
@@ -407,7 +479,19 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
   rex::ui::ImmediateTexture* background_ = nullptr;
 };
 }
-#endif
+
+void ShowNewSanVanSetup(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer,
+                        rex::PathConfig paths, const fs::path& settings_path,
+                        std::function<void(rex::PathConfig)> resume) {
+  auto finished = std::make_shared<bool>(false);
+  auto closed = [&context, paths, resume = std::move(resume)](bool ok) mutable {
+    context.CallInUIThreadDeferred([&context, ok, paths, resume = std::move(resume)]() mutable {
+      if (ok) resume(std::move(paths));
+      else context.QuitFromUIThread();
+    });
+  };
+  new SetupDialog(drawer, std::move(paths), settings_path, finished, std::move(closed));
+}
 
 bool RunNewSanVanSetup(rex::ui::WindowedAppContext& context,rex::ui::Window* window,
                        rex::ui::ImGuiDrawer* drawer,const rex::PathConfig& paths,

@@ -8,6 +8,30 @@
 
 namespace skate3 {
 
+std::filesystem::path PickSetupSourceMacOS(const wchar_t* title, bool folder, bool iso) {
+  @autoreleasepool {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    std::string label;
+    for (const wchar_t* p = title; *p; ++p) label += static_cast<char>(*p);
+    [panel setTitle:[NSString stringWithUTF8String:label.c_str()]];
+    [panel setPrompt:@"Select"];
+    [panel setCanChooseFiles:!folder];
+    [panel setCanChooseDirectories:folder];
+    [panel setAllowsMultipleSelection:NO];
+    [panel setResolvesAliases:YES];
+    if (iso) {
+      if (UTType* type = [UTType typeWithFilenameExtension:@"iso"])
+        [panel setAllowedContentTypes:@[type]];
+    }
+    if ([panel runModal] == NSModalResponseOK) {
+      NSURL* url = [[panel URLs] firstObject];
+      if (url && [url isFileURL]) return std::string([[url path] UTF8String]);
+    }
+    return {};
+  }
+}
+
 std::filesystem::path PickTitleUpdateFileMacOS() {
   @autoreleasepool {
     SDL_Window* sdl_window = SDL_GetKeyboardFocus();

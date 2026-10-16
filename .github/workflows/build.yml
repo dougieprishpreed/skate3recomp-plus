@@ -1,0 +1,119 @@
+name: Native desktop builds
+
+on:
+  workflow_dispatch:
+  # Bootstrap and repair builds from the explicitly trusted development branch.
+  push:
+    branches: [v0.2-dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      github.repository == 'dougieprishpreed/skate3recomp-plus' &&
+      (github.ref == 'refs/heads/v0.2-dev' || github.ref == 'refs/heads/main')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-24.04
+          - platform: macos-arm64
+            os: macos-15
+          - platform: win-amd64
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    steps:
+      - name: Check out reviewed source without recursive submodules
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: false
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13.16'
+      - name: Bootstrap the pinned SDK and corrected ImGui revision
+        shell: bash
+        run: |
+          git submodule update --init third_party/rexglue-sdk
+          python tools/apply_sdk_patches.py
+          git -C third_party/rexglue-sdk submodule update --init --recursive
+          python tools/apply_sdk_patches.py --check
+          python -m pip install numpy==2.2.6
+      - name: Check out private code-generation inputs (read-only key)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: dougieprishpreed/skate3recomp-plus-build-inputs
+          ref: 7cbfa03c3e3516dbd42a4a4dfd1abf6bb5840f33
+          path: out/private-inputs
+          ssh-key: ${{ secrets.BUILD_INPUTS_SSH_KEY }}
+          persist-credentials: false
+      - name: Verify all three private inputs before code generation
+        run: python tools/ci/build_inputs.py extract --archive out/private-inputs/codegen-inputs.zip --output out/ci-inputs
+      - name: Install Linux compiler and desktop dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-20.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/llvm-20.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-20 main' | sudo tee /etc/apt/sources.list.d/llvm-20.list
+          sudo apt-get update
+          sudo apt-get install -y clang-20 lld-20 cmake ninja-build build-essential pkg-config \
+            libgtk-3-dev libx11-xcb-dev libvulkan-dev libasound2-dev libpulse-dev libpipewire-0.3-dev
+          echo 'CC=clang-20' >> "$GITHUB_ENV"
+          echo 'CXX=clang++-20' >> "$GITHUB_ENV"
+      - name: Install macOS LLVM and Vulkan/MoltenVK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install llvm@20 ninja vulkan-loader vulkan-headers molten-vk
+          echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
+          echo "CC=$(brew --prefix llvm@20)/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=$(brew --prefix llvm@20)/bin/clang++" >> "$GITHUB_ENV"
+      - name: Install Windows LLVM and media tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --version=20.1.8 --yes --no-progress --allow-downgrade
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          choco install ffmpeg --version=7.1.1 --yes --no-progress --allow-downgrade
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+      - name: Prepare relocatable Python and source-built media tools
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          python tools/ci/prepare_runtime.py --platform '${{ matrix.platform }}' --output out/installer-runtime
+          bash tools/ci/build_media.sh third_party/rexglue-sdk/thirdparty/FFmpeg out/media
+      - name: Record runner resources
+        shell: bash
+        run: |
+          df -h .
+          python -c "import os,platform; print(platform.platform()); print('CPUs',os.cpu_count())"
+      - name: Compile, check installer tools and package (never launch the game)
+        run: python tools/ci/run_build.py --platform ${{ matrix.platform }}
+      - name: Upload verified packages only
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: Skate3Recomp-Plus-${{ matrix.platform }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            out/packages/*.tar.gz
+            out/packages/*.tar.gz.sha256
+            out/packages/*.zip
+            out/packages/*.zip.sha256
+            out/packages/*-build.json
+      - name: Preserve matching symbols separately
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: Skate3Recomp-Plus-symbols-${{ matrix.platform }}-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: out/symbols/*-matching-symbols.zip

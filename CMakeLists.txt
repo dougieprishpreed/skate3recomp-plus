@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 0.1.2 LANGUAGES CXX)
+project(skate3 VERSION 0.2.0 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "0.1b")
+set(SKATE3_FULL_VERSION "0.2-dev")
 set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
@@ -246,6 +246,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_iso_installer.cpp
     src/skate3_nsv_installer.cpp
     src/skate3_setup_sources.cpp
+    src/skate3_setup_process.cpp
     src/skate3_setup_dialog.cpp
     src/skate3_jumbotron.cpp
     src/skate3_menu_probe.cpp
@@ -371,7 +372,13 @@ rexglue_configure_target(skate3)
 
 if(APPLE)
     target_link_options(skate3 PRIVATE -Wl,-stack_size,0x4000000)
-    target_link_libraries(skate3 PRIVATE "-framework Cocoa")
+    target_link_libraries(skate3 PRIVATE "-framework Cocoa" "-framework UniformTypeIdentifiers" SDL3::SDL3)
+endif()
+
+if(UNIX AND NOT APPLE)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SKATE3_GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0 x11-xcb)
+    target_link_libraries(skate3 PRIVATE PkgConfig::SKATE3_GTK3)
 endif()
 
 if(WIN32)
@@ -418,19 +425,33 @@ else()
     target_compile_options(skate3 PRIVATE -finput-charset=UTF-8 -fexec-charset=UTF-8)
 endif()
 
-# Ship the private preparation runtime with the Windows release.
-if(WIN32)
+# Ship the same preparation modules and baker with every desktop release.
+option(SKATE3_STAGE_INSTALLER "Stage a private Python/NumPy/media preparation runtime" ON)
+set(SKATE3_INSTALLER_PYTHON_ROOT "" CACHE PATH "Redistributable POSIX Python root, including NumPy")
+if(SKATE3_STAGE_INSTALLER)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     find_program(SKATE3_INSTALLER_FFMPEG NAMES ffmpeg HINTS "C:/ffmpeg" REQUIRED)
+    set(_skate3_installer_python_args)
+    if(NOT WIN32)
+        if(NOT IS_DIRECTORY "${SKATE3_INSTALLER_PYTHON_ROOT}")
+            message(FATAL_ERROR "Set SKATE3_INSTALLER_PYTHON_ROOT to the redistributable Python/NumPy runtime")
+        endif()
+        list(APPEND _skate3_installer_python_args --python-runtime "${SKATE3_INSTALLER_PYTHON_ROOT}")
+    endif()
     add_custom_target(skate3_stage_nsv_installer
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/package_nsv_installer.py"
             --output "$<TARGET_FILE_DIR:skate3>/installer"
             --ffmpeg "${SKATE3_INSTALLER_FFMPEG}"
             --nav-baker "$<TARGET_FILE:nsv_nav_bake>"
+            ${_skate3_installer_python_args}
         VERBATIM)
     add_dependencies(skate3 skate3_stage_nsv_installer)
+endif()
+
+if(WIN32)
     add_executable(skate3_content_tool EXCLUDE_FROM_ALL
         tools/skate3_content_tool.cpp src/skate3_iso_installer.cpp src/skate3_nsv_installer.cpp
+        src/skate3_setup_process.cpp
         src/skate3_setup_sources.cpp src/skate3_title_update_installer.cpp
         third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp)
     target_include_directories(skate3_content_tool PRIVATE src "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -443,6 +464,6 @@ file(GLOB NSV_RECAST_SOURCES CONFIGURE_DEPENDS
 add_executable(nsv_nav_bake EXCLUDE_FROM_ALL tools/nsv_nav_bake.cpp ${NSV_RECAST_SOURCES})
 target_include_directories(nsv_nav_bake PRIVATE third_party/recast/Recast/Include)
 
-if(WIN32)
+if(SKATE3_STAGE_INSTALLER)
     add_dependencies(skate3_stage_nsv_installer nsv_nav_bake)
 endif()

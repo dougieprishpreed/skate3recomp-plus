@@ -1,4 +1,6 @@
 #include "skate3_nsv_installer.h"
+#include "skate3_install_paths.h"
+#include "skate3_setup_process.h"
 #include "skate3_iso_installer.h"
 #include "skate3_setup_sources.h"
 #include "skate3_title_update_installer.h"
@@ -148,29 +150,26 @@ bool IsNewSanVanInstalled(const fs::path& app_root, const fs::path& content_root
   return fs::is_regular_file(content_root / kContent / kMenu);
 }
 
-#if defined(_WIN32)
 namespace {
-// Windows command-line quoting, not shell escaping; CreateProcess runs Python directly.
-std::wstring Quote(const fs::path& value) {
-  std::wstring out = L"\"";
-  size_t slashes = 0;
-  for (wchar_t c : value.wstring()) {
-    if (c == L'\\') { ++slashes; continue; }
-    out.append(c == L'"' ? slashes * 2 + 1 : slashes, L'\\');
-    slashes = 0; out += c;
-  }
-  out.append(slashes * 2, L'\\'); out += L'"'; return out;
-}
-
 bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
              std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total, std::string& error) {
   fs::path scratch;
-  const auto app = rex::filesystem::GetAppRootFolder();
+  const auto app = ContentInstallRoot(paths.user_data_root);
+  const auto resources = SetupResourceRoot();
   try {
-    const auto python = app / "installer/python/python.exe";
-    const auto script = app / "installer/tools/prepare_new_san_van.py";
-    if (!fs::is_regular_file(python) || !fs::is_regular_file(script)) {
-      error = "The installer folder is missing. Extract the complete release beside skate3.exe.";
+    #if defined(_WIN32)
+    const auto python = resources / "installer/python/python.exe";
+    const auto media = resources / "installer/media/ffmpeg.exe";
+    const auto baker = resources / "installer/tools/nsv_nav_bake.exe";
+#else
+    const auto python = resources / "installer/python/bin/python3";
+    const auto media = resources / "installer/media/ffmpeg";
+    const auto baker = resources / "installer/tools/nsv_nav_bake";
+#endif
+    const auto script = resources / "installer/tools/prepare_new_san_van.py";
+    if (!fs::is_regular_file(python) || !fs::is_regular_file(script) ||
+        !fs::is_regular_file(media) || !fs::is_regular_file(baker)) {
+      error = "The installer folder is missing. Extract the complete release package.";
       return false;
     }
     fs::create_directories(app / "install-state");
@@ -189,31 +188,14 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
     for (const auto& p : input.dlc3)
       if (ok) ok = StageSetupDlc(p, scratch / "prepared", 0x454108E6, copied, error);
     if (ok) {
-      std::wstring command = Quote(python) + L" -E -s " + Quote(script);
-      const std::pair<const wchar_t*, fs::path> args[] = {
-          {L"--source", source / "data"}, {L"--native-data", paths.game_data_root / "data"},
-          {L"--dlc-source", scratch / "dlc"}, {L"--stage", scratch / "prepared"},
-          {L"--root", app}, {L"--content-root", paths.user_data_root},
-          {L"--ffmpeg", app / "installer/media/ffmpeg.exe"}};
-      for (const auto& [key, value] : args) command += L" " + std::wstring(key) + L" " + Quote(value);
-      SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-      HANDLE log = CreateFileW((app / "install-state/new-san-van.log").c_str(), GENERIC_WRITE,
-          FILE_SHARE_READ, &security, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (log == INVALID_HANDLE_VALUE) throw std::runtime_error("Unable to create setup log");
-      STARTUPINFOW startup{}; startup.cb = sizeof(startup);
-      startup.dwFlags = STARTF_USESTDHANDLES; startup.hStdOutput = log; startup.hStdError = log;
-      startup.hStdInput = nullptr;
-      PROCESS_INFORMATION process{};
-      ok = CreateProcessW(python.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
-                           nullptr, app.c_str(), &startup, &process) != 0;
-      if (ok) {
-        WaitForSingleObject(process.hProcess, INFINITE);
-        DWORD exit = 1; GetExitCodeProcess(process.hProcess, &exit);
-        CloseHandle(process.hThread); CloseHandle(process.hProcess);
-        ok = exit == 0;
-      }
-      CloseHandle(log);
-      if (!ok) error = "Setup did not complete. Details are in install-state/new-san-van.log.";
+      const std::vector<std::string> args = {"-E", "-s", rex::path_to_utf8(script),
+          "--source", rex::path_to_utf8(fs::absolute(source / "data")),
+          "--native-data", rex::path_to_utf8(fs::absolute(paths.game_data_root / "data")),
+          "--dlc-source", rex::path_to_utf8(scratch / "dlc"),
+          "--stage", rex::path_to_utf8(scratch / "prepared"),
+          "--root", rex::path_to_utf8(app), "--content-root", rex::path_to_utf8(paths.user_data_root),
+          "--ffmpeg", rex::path_to_utf8(media), "--nav-baker", rex::path_to_utf8(baker)};
+      ok = RunSetupProcess(python, args, app / "install-state/new-san-van.log", error);
     }
     std::error_code ec; fs::remove_all(scratch, ec);
     return ok;
@@ -224,12 +206,10 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
   }
 }
 }
-#endif
 
 bool InstallSetupInputs(const SetupInputs& input, const rex::PathConfig& paths,
                          std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total,
                          std::string& error) {
-#if defined(_WIN32)
   fs::path staged;
   try {
     const auto game = fs::absolute(paths.game_data_root);
@@ -300,9 +280,5 @@ bool InstallSetupInputs(const SetupInputs& input, const rex::PathConfig& paths,
     if (!staged.empty()) { std::error_code ec; fs::remove_all(staged, ec); }
     return false;
   }
-#else
-  error = "This setup flow requires Windows.";
-  return false;
-#endif
 }
 }
