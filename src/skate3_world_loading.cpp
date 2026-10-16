@@ -11,6 +11,7 @@
 #include "skate3_sim_extent.h"
 #include "skate3_stream_heap.h"
 #include "skate3_texture_identity.h"
+#include "skate3_texture_lookup.h"
 
 #include <algorithm>
 #include <array>
@@ -1251,7 +1252,10 @@ extern "C" REX_FUNC(sub_8280AAF0) {
       REXCVAR_GET(skate3_skate2_texture_identity);
   const bool changed = skate3::world_loading::TranslateBamTextureUnbind(
       enabled, uint32_t(ctx.lr), ctx.r5.u64, bam_lighting_ids.contains(source));
-  __imp__sub_8280AAF0(ctx, base);
+  {
+    skate3::world_loading::TextureLookupResetScope invalidate_index(ctx.r3.u32 + 272);
+    __imp__sub_8280AAF0(ctx, base);
+  }
   if (changed && REXCVAR_GET(skate3_world_load_probe)) {
     static std::atomic<uint32_t> count{0};
     const auto n = ++count;
@@ -1605,7 +1609,14 @@ extern "C" REX_FUNC(sub_82B93960) {
       sp = parent;
     }
   }
+  // The Stacks slow-frame samples include this synchronous event chain.
+  // Measure only the outer dispatch on NSV; nested events are included in
+  // its time once. Home exports the guest render thread's own frame totals.
+  const uint64_t event_began = saved_object == 0 && skate3::world_loading::IsSkate2Gameplay()
+      ? skate3::perf_recorder::BeginGuestEvent() : 0;
   __imp__sub_82B93960(ctx, base);
+  skate3::perf_recorder::EndGuestEvent(event_began, event_type, event_token,
+                                     pause_event_caller);
   pause_event_caller = saved_caller;
   pause_event_object = saved_object;
 }
@@ -2093,6 +2104,7 @@ extern "C" REX_FUNC(sub_82A86A40) {
 }
 
 extern "C" REX_FUNC(sub_82A867C8) {
+  skate3::perf_recorder::WorkTimelineScope work(skate3::perf_recorder::WorkPhase::kGuestDecompress);
   skate3::perf_recorder::Count(skate3::perf_recorder::Activity::kDecompress);
   if (skate2_loading.load() && REXCVAR_GET(skate3_world_load_probe)) {
     uint32_t header0 = 0, header1 = 0;

@@ -29,8 +29,10 @@
 #include <functional>
 #include <fstream>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <thread>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -46,6 +48,9 @@
 #include "native/skate3_native_diag.h"
 #include "native/character_fade.h"
 #include "native/mesh_normals.h"
+#include "native/skate3_native_sheet_twins.h"
+#include "native/skate3_native_mesh_decode_output.h"
+#include "native/skate3_native_prewarm_requests.h"
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
@@ -68,9 +73,39 @@
 #include "skate3_native_scene_gpu_internal.h"
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
+// Generic Vulkan controls; legacy Skate2 switches remain NSV overrides.
+REXCVAR_DEFINE_BOOL(skate3_native_vulkan_cached_mesh_decode, true, "Skate 3",
+                    "Decode Vulkan meshes in cached CPU memory before write-only upload copies")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_vulkan_output_view_reuse, true, "Skate 3",
+                    "Reuse the current presenter-owned output view in native Vulkan frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_vulkan_table_lookup_cache, true, "Skate 3",
+                    "Index exact texture descriptor tuples in native Vulkan frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DECLARE(bool, skate3_skate2_texture_probe);
+REXCVAR_DEFINE_BOOL(skate3_skate2_vulkan_static_mesh_upload, true, "Skate 3",
+                    "Stage static New San Van mesh uploads into device-local Vulkan buffers")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_vulkan_cached_mesh_decode, true, "Skate 3",
+                    "Decode NSV Vulkan meshes in cached CPU memory before write-only upload copies")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_coalesce_mesh_requests, true, "Skate 3",
+                    "Coalesce queued NSV mesh preparation with visible misses; preserve request ownership")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_vulkan_output_view_reuse, true, "Skate 3",
+                    "Reuse the current presenter-owned output view in New San Van Vulkan frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_vulkan_table_lookup_cache, true, "Skate 3",
+                    "Index exact Vulkan texture descriptor tuples during New San Van native frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_skate2_material_depth_bias, true, "Skate 3",
-                    "Apply authored depth separation to New San Van overlay materials")
+                    "Apply authored overlay separation and the coplanar transparency "
+                    "guard in New San Van")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_skate2_night_brightness, 1.0, "Skate 3",
                       "New San Vanelona at night (skate3_skate2_night): multiplier on the "
@@ -326,6 +361,19 @@ void RebasedViewProj(const float vp[16], const float origin[3], float out[16],
   for (int i = 0; i < 16; ++i) out[i] = float(m[i]);
 }
 // kReversedZ: skate3_native_scene_gpu_internal.h.
+
+// Authored Skate 2 transparent surfaces can share an exact plane with an
+// opaque mesh using different triangles. Strict float-depth comparison makes
+// those overlays alternately pass/fail as interpolation rounds on each mesh.
+// A relative reversed-depth pull covers that rounding without the distance-
+// squared displacement of the authored decalzbias constant. 2^-16 is 128-256
+// float depth ulps; with a 0.1 m near plane it is ~0.8 mm at 50 m. Keep x/y/w
+// and all material shading unchanged. This applies to the material family,
+// never a texture ID, location, mesh name or navigation/bake output.
+void PullCoplanarSkate2TransparentDepth(float mvp[16]) {
+  constexpr float kScale = 1.0f + 1.0f / 65536.0f;
+  for (int r = 0; r < 4; ++r) mvp[r * 4 + 2] *= kScale;
+}
 
 // Original S2 water families, identified by material class and source GUID
 // namespace, not individual pond/fountain names. S3 water keeps its own path.
@@ -855,8 +903,9 @@ void EvictCubeStore(uint64_t frame_number, uint64_t submission) {
 
 // ---- Staged texture decode (worker-thread half) ---------------------------
 // The texture decoders normally finish by recording GPU copies into the
-// frame's command stream, pushing a barrier and creating the SRV, all
-// render-thread-only. When `g_tex_stage_out` is set (decode worker), they
+// frame's command stream and pushing a barrier, both render-thread-only.
+// NSV Vulkan workers also prepare the view before publishing the result.
+// When `g_tex_stage_out` is set (decode worker), the decoders
 // stop after filling the upload resource and export what the render-thread
 // commit needs instead. RHI resource creation and upload mapping are
 // thread-safe, so everything up to that point is safe off-thread.
@@ -885,8 +934,18 @@ struct StagedTexCommit {
 };
 thread_local StagedTexCommit* g_tex_stage_out = nullptr;
 
-// Render-thread half: record the staged upload's copies + barrier, create
-// the SRV, mark the texture live. On view-creation failure the texture stays
+nrhi::TextureViewDesc StagedTextureViewDesc(const StagedTexCommit& sc) {
+  nrhi::TextureViewDesc vd;
+  vd.format = sc.srv_format;
+  for (uint32_t c = 0; c < 4; ++c) vd.swizzle[c] = sc.swizzle[c];
+  vd.dimension = sc.cube ? nrhi::ViewDimension::kCube : nrhi::ViewDimension::k2D;
+  vd.mip_levels = sc.cube ? sc.cube_mip_levels : sc.mip_count;
+  return vd;
+}
+
+// Render-thread half: record the staged upload's copies + barrier, adopt
+// the prepared SRV (or create one through the existing fallback), mark live.
+// On view-creation failure the texture stays
 // invalid (renders white; the backend-managed views make this near-impossible).
 void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
                               GuestTexture& gt, const StagedTexCommit& sc) {
@@ -907,21 +966,19 @@ void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
   // deferred until the recorded submission completes.
   g_r.device->DestroyDeferred(gt.upload);
   gt.upload = nullptr;
-  nrhi::TextureViewDesc vd;
-  vd.format = sc.srv_format;
-  for (uint32_t c = 0; c < 4; ++c) {
-    vd.swizzle[c] = sc.swizzle[c];
-  }
-  if (sc.cube) {
-    vd.dimension = nrhi::ViewDimension::kCube;
-    vd.mip_levels = sc.cube_mip_levels;
-  } else {
-    vd.dimension = nrhi::ViewDimension::k2D;
-    vd.mip_levels = sc.mip_count;
+  if (!sc.cube) {
     gt.srv_format = sc.srv_format;
     gt.srv_mips = sc.mip_count;
   }
-  gt.srv = g_r.device->CreateTextureView(gt.texture, vd);
+  if (gt.srv == nullptr) {
+    gt.srv = g_r.device->CreateTextureView(gt.texture, StagedTextureViewDesc(sc));
+  } else {
+    static bool logged = false;  // render thread only
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("native-scene: New San Van Vulkan texture views prepared on decode workers");
+    }
+  }
   if (gt.srv == nullptr) {
     gt.valid = false;
     return;
@@ -945,10 +1002,35 @@ struct StagedTexResult {
   // 2D/HUD overlay origin: skip the stability verify (see PrewarmEntry::ui).
   bool ui = false;
 };
+// Called only after decode, before the result is visible to the render
+// thread. D3D12, Skate 3 maps and animated UI retain their existing path.
+// Copies/barriers and the stability verify still happen at commit; an early
+// view never makes the texture valid or exposes an unfinished upload.
+void PrepareStagedTextureView(nrhi::Device* device, StagedTexResult& tr) {
+  if (tr.valid && !tr.ui && skate3::world_loading::IsSkate2Gameplay() &&
+      device->backend() == nrhi::Backend::kVulkan) {
+    tr.gt.srv = device->CreateTextureViewAsync(tr.gt.texture,
+                                              StagedTextureViewDesc(tr.commit));
+  }
+}
+
+// A staged texture may already own a prepared view. Retire that view even
+// when verification fails or another result wins the race into the cache.
+// All discard sites run on the render thread (descriptor-cache retirement).
+void DiscardStagedTexture(GuestTexture& gt) {
+  g_r.device->DestroyDeferred(gt.srv);
+  g_r.device->DestroyDeferred(gt.texture);
+  g_r.device->DestroyDeferred(gt.upload);
+  gt.srv = nullptr;
+  gt.texture = nullptr;
+  gt.upload = nullptr;
+}
+
 struct PrewarmResult {
   DrawItem item;
   MeshBuffers buffers;
   bool mesh_valid = false;
+  PrewarmMissRequest request;
   std::vector<StagedTexResult> textures;
   // Draw-path miss result (visible right now): the commit takes it this
   // frame regardless of the gameplay per-frame cap.
@@ -960,6 +1042,7 @@ std::vector<PrewarmResult> g_prewarm_out;
 // thread re-injects them each frame so retries are frame-paced instead of
 // hot-spinning the workers.
 std::vector<PrewarmEntry> g_prewarm_retry;  // under g_prewarm_out_mutex
+PrewarmRequestScratch g_prewarm_request_scratch;  // render thread, queue mutex
 
 // Shader sources live in src/native/shaders/*.hlsl; the build embeds them
 // into this generated header (cmake/EmbedShaders.cmake) so the exe stays
@@ -990,11 +1073,13 @@ float HalfToFloat(uint16_t h) {
 
 nrhi::Buffer* CreateUploadBuffer(
     nrhi::Device* device, size_t size,
-    nrhi::BufferBindClass bind_class = nrhi::BufferBindClass::kFull) {
+    nrhi::BufferBindClass bind_class = nrhi::BufferBindClass::kFull,
+    bool static_upload = false) {
   nrhi::BufferDesc desc;
   desc.size = size;
   desc.heap = nrhi::HeapKind::kUpload;
   desc.bind_class = bind_class;
+  desc.static_upload = static_upload;
   return device->CreateBuffer(desc);  // nullptr on failure, like the old helper
 }
 
@@ -1016,6 +1101,10 @@ constexpr size_t kMeshPoolCap = 96;
 
 void PoolMeshBuffer(nrhi::Device* device, nrhi::Buffer* buffer) {
   if (buffer == nullptr) return;
+  if (buffer->is_static_upload()) {
+    device->DestroyDeferred(buffer);
+    return;  // static staging is consumed once; never remap this buffer
+  }
   nrhi::Buffer* overflow = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mesh_pool_mutex);
@@ -1028,12 +1117,14 @@ void PoolMeshBuffer(nrhi::Device* device, nrhi::Buffer* buffer) {
   device->DestroyDeferred(overflow);
 }
 
-nrhi::Buffer* AcquireMeshUploadBuffer(nrhi::Device* device, size_t size) {
+nrhi::Buffer* AcquireMeshUploadBuffer(nrhi::Device* device, size_t size,
+                                      bool static_upload = false) {
   {
     const uint64_t completed = device->CompletedSubmission();
     std::lock_guard<std::mutex> lock(g_mesh_pool_mutex);
     for (auto it = g_mesh_pool.begin(); it != g_mesh_pool.end(); ++it) {
-      if (it->buffer->size() == size && it->retire_submission < completed) {
+      if (!static_upload && it->buffer->size() == size &&
+          it->retire_submission < completed) {
         nrhi::Buffer* buffer = it->buffer;
         *it = g_mesh_pool.back();
         g_mesh_pool.pop_back();
@@ -1041,7 +1132,7 @@ nrhi::Buffer* AcquireMeshUploadBuffer(nrhi::Device* device, size_t size) {
       }
     }
   }
-  return CreateUploadBuffer(device, size, nrhi::BufferBindClass::kVertexIndex);
+  return CreateUploadBuffer(device, size, nrhi::BufferBindClass::kVertexIndex, static_upload);
 }
 
 uint16_t SwapU16(uint16_t v) { return uint16_t((v >> 8) | (v << 8)); }
@@ -1092,8 +1183,18 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     }
     ib_payload = ib_scratch.data();
   }
-  nrhi::Buffer* vb = AcquireMeshUploadBuffer(device, size_t(num_verts) * 56);
-  nrhi::Buffer* ib = AcquireMeshUploadBuffer(device, size_t(item.ib_count) * 2);
+  const bool static_upload = skate3::world_loading::IsSkate2Gameplay() &&
+      device->backend() == nrhi::Backend::kVulkan &&
+      REXCVAR_GET(skate3_skate2_vulkan_static_mesh_upload) &&
+      !item.skinned && !item.ropa && !item.cloth_quads &&
+      item.char_family == 0 && item.dynobj == 0;
+  if (static_upload) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+      REXLOG_INFO("native-scene: NSV Vulkan static mesh uploads enabled (host staging, device-local draw buffers)");
+  }
+  nrhi::Buffer* vb = AcquireMeshUploadBuffer(device, size_t(num_verts) * 56, static_upload);
+  nrhi::Buffer* ib = AcquireMeshUploadBuffer(device, size_t(item.ib_count) * 2, static_upload);
   if (!vb || !ib) {
     PoolMeshBuffer(device, vb);
     PoolMeshBuffer(device, ib);
@@ -1120,7 +1221,27 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   uint32_t garbage = 0;
   int min_bi = 255;
   int max_bi = -1;
-  dst = static_cast<float*>(device->Map(vb));
+  float* upload_vb = static_cast<float*>(device->Map(vb));
+  static thread_local MeshDecodeOutputScratch output_scratch;
+  std::vector<float> overflow_vertices;
+  std::vector<uint16_t> overflow_indices;
+  float* cpu_vertices = nullptr;
+  uint16_t* cpu_indices = nullptr;
+  const bool cached_output = device->backend() == nrhi::Backend::kVulkan &&
+      REXCVAR_GET(skate3_native_vulkan_cached_mesh_decode) &&
+      (!skate3::world_loading::IsSkate2Gameplay() ||
+       REXCVAR_GET(skate3_skate2_vulkan_cached_mesh_decode)) &&
+      (!item.cloth_quads || item.ib_count % 6 == 0) &&
+      output_scratch.Prepare(size_t(num_verts) * 14, item.ib_count,
+          overflow_vertices, overflow_indices, cpu_vertices, cpu_indices);
+  if (cached_output) {
+    static const bool announced = [] {
+      REXLOG_INFO("native-scene: NSV Vulkan cached CPU mesh decode enabled (write-only upload copies)");
+      return true;
+    }();
+    (void)announced;
+  }
+  dst = cached_output ? cpu_vertices : upload_vb;
   for (uint32_t v = 0; v < num_verts; ++v) {
     const uint8_t* p = src_vb + size_t(v) * item.stride + item.pos_offset;
     float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -1503,6 +1624,7 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   std::vector<float> bam_capture_vertices;
   if (capture_bam_geometry)
     bam_capture_vertices.assign(dst, dst + size_t(num_verts) * 14);
+  if (cached_output) std::memcpy(upload_vb, dst, size_t(num_verts) * 56);
   device->Unmap(vb);
   // Blend indices outside the captured palette read garbage rows and mangle
   // the vertex. Indices are plain bone numbers, bone k = palette rows 3k.
@@ -1531,7 +1653,8 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   }
 
   uint16_t* dst_ib = nullptr;
-  dst_ib = static_cast<uint16_t*>(device->Map(ib));
+  uint16_t* upload_ib = static_cast<uint16_t*>(device->Map(ib));
+  dst_ib = cached_output ? cpu_indices : upload_ib;
   if (item.cloth_quads) {
     // Quad-list topology with no guest index buffer (live vertex range
     // already exact from the draw args): two triangles per quad.
@@ -1605,36 +1728,50 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
       }
     }
     if (tris.size() >= 2) {
-      std::vector<char> used(tris.size(), 0);
       size_t twins = 0;
-      for (size_t i = 0; i < tris.size(); ++i) {
-        if (used[i]) {
-          continue;
-        }
-        for (size_t j = i + 1; j < tris.size(); ++j) {
-          if (used[j]) {
+      if (skate3::world_loading::IsSkate2Gameplay()) {
+        static const bool announced = [] {
+          REXLOG_INFO("native-scene: NSV sheet search enabled (bounded scratch, original pair order and thresholds)");
+          return true;
+        }();
+        (void)announced;
+        static thread_local SheetTwinScratch scratch;
+        skate3::perf_recorder::WorkTimelineScope sheet_work(
+            skate3::perf_recorder::WorkPhase::kNativeSheet);
+        sheet_work.SetAsset(item.mesh, item.fingerprint, item.diffuse_guid,
+                            item.vb_bytes, item.ib_count, item.bbox_min, item.bbox_max);
+        twins = CountSheetTwins(tris, scratch);
+      } else {
+        std::vector<char> used(tris.size(), 0);
+        for (size_t i = 0; i < tris.size(); ++i) {
+          if (used[i]) {
             continue;
           }
-          const float dx = tris[i].c[0] - tris[j].c[0];
-          const float dy = tris[i].c[1] - tris[j].c[1];
-          const float dz = tris[i].c[2] - tris[j].c[2];
-          const float d2 = dx * dx + dy * dy + dz * dz;
-          // Plane separation along i's normal must be small (back-to-back
-          // sheets); in-plane offset up to the triangle scale (opposite
-          // diagonal splits put twin centroids half a quad apart).
-          const float along = std::fabs(dx * tris[i].n[0] + dy * tris[i].n[1] +
-                                        dz * tris[i].n[2]);
-          const float lat_limit = 0.5f * (tris[i].edge + tris[j].edge);
-          if (along > 0.05f || d2 - along * along > lat_limit * lat_limit) {
-            continue;
-          }
-          const float dot = tris[i].n[0] * tris[j].n[0] + tris[i].n[1] * tris[j].n[1] +
-                            tris[i].n[2] * tris[j].n[2];
-          if (dot < -0.9f) {
-            used[i] = 1;
-            used[j] = 1;
-            twins += 2;
-            break;
+          for (size_t j = i + 1; j < tris.size(); ++j) {
+            if (used[j]) {
+              continue;
+            }
+            const float dx = tris[i].c[0] - tris[j].c[0];
+            const float dy = tris[i].c[1] - tris[j].c[1];
+            const float dz = tris[i].c[2] - tris[j].c[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            // Plane separation along i's normal must be small (back-to-back
+            // sheets); in-plane offset up to the triangle scale (opposite
+            // diagonal splits put twin centroids half a quad apart).
+            const float along = std::fabs(dx * tris[i].n[0] + dy * tris[i].n[1] +
+                                          dz * tris[i].n[2]);
+            const float lat_limit = 0.5f * (tris[i].edge + tris[j].edge);
+            if (along > 0.05f || d2 - along * along > lat_limit * lat_limit) {
+              continue;
+            }
+            const float dot = tris[i].n[0] * tris[j].n[0] + tris[i].n[1] * tris[j].n[1] +
+                              tris[i].n[2] * tris[j].n[2];
+            if (dot < -0.9f) {
+              used[i] = 1;
+              used[j] = 1;
+              twins += 2;
+              break;
+            }
           }
         }
       }
@@ -1709,6 +1846,12 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
           item.mesh, item.diffuse_guid, item.material_name,
           !ec && bool(vertices) && bool(indices) && bool(metadata), stem.string(), bytes);
     }
+  }
+  if (cached_output) {
+    std::memcpy(upload_ib, dst_ib, size_t(item.ib_count) * 2);
+    // Drain write-combined/non-temporal stores before the result can be
+    // published to the command thread. Keep normal Unmap/retirement as well.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
   }
   device->Unmap(ib);
 
@@ -3454,7 +3597,9 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
   }
   // Skate 2 transparentenvironment.xml (environment.transparent in New San
   // Van): SRCALPHA / INVSRCALPHA, COLORWRITE RGB, z-write ON, CULLMODE
-  // FRONT (our kFront), ALPHAREF 16 on a^2 in the shader; no depth bias.
+  // FRONT (our kFront), ALPHAREF 16 on a^2 in the shader. Accept equal depth
+  // for authored coplanar overlays; their float interpolation guard rides in
+  // the projection below, separate from decalzbias's authored constant bias.
   // [1] = mirrored instances. The Skate 3 transparent state (cull none,
   // z-write off) drew every layer of the nearly opaque Waterfront sail
   // canopies (diffuse alpha 239-255) in index order, far faces and inner
@@ -3470,6 +3615,8 @@ bool EnsureScenePsoFamily(const NativeGuestOutputRenderContext& context) {
     tr.blend.op_alpha = nrhi::BlendOp::kAdd;
     tr.blend.write_mask = 0x7;
     tr.depth.write_enable = true;
+    tr.depth.func = kReversedZ ? nrhi::CompareFunc::kGreaterEqual
+                              : nrhi::CompareFunc::kLessEqual;
     tr.depth_bias = 0;
     tr.depth_bias_slope = 0.0f;
     tr.cull = nrhi::CullMode::kFront;
@@ -4798,6 +4945,50 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+bool EnsureOutputSampleView(const NativeGuestOutputRenderContext& context) {
+  if (context.backend == NativeGuestOutputBackend::kVulkan &&
+      REXCVAR_GET(skate3_native_vulkan_output_view_reuse) &&
+      (!skate3::world_loading::IsSkate2Gameplay() ||
+       REXCVAR_GET(skate3_skate2_vulkan_output_view_reuse))) {
+    bool reused = false;
+    // Always query the CURRENT live wrapper, even if its address equals the
+    // last one. SDK eviction/resize can reuse wrapper addresses between calls.
+    nrhi::TextureView* view =
+        context.device->BorrowGuestOutputView(context.guest_output, &reused);
+    if (view != nullptr) {
+      ++g_r.output_view_borrows;
+      g_r.output_view_reuses += reused ? 1u : 0u;
+      if (g_r.output_srv_owned && g_r.output_srv_slot != nullptr) {
+        context.device->DestroyDeferred(g_r.output_srv_slot);
+      }
+      g_r.output_srv_slot = view;
+      g_r.output_srv_owned = false;
+      g_r.output_srv_allocated = true;
+      g_r.rtv_resource = context.guest_output;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("native-scene: Vulkan output-view reuse enabled (current wrapper, presenter-owned image view)");
+      }
+      return true;
+    }
+  }
+  // Legacy backend/off/failure path owns its view. A borrowed pointer
+  // is never destroyed here, including after its wrapper has been evicted.
+  if (g_r.rtv_resource != context.guest_output || !g_r.output_srv_owned) {
+    if (g_r.output_srv_owned && g_r.output_srv_slot != nullptr) {
+      context.device->DestroyDeferred(g_r.output_srv_slot);
+    }
+    nrhi::TextureViewDesc vd;
+    vd.mip_levels = 1;
+    g_r.output_srv_slot = context.device->CreateTextureView(context.guest_output, vd);
+    g_r.output_srv_owned = true;
+    g_r.output_srv_allocated = g_r.output_srv_slot != nullptr;
+    g_r.rtv_resource = context.guest_output;
+  }
+  return g_r.output_srv_slot != nullptr;
+}
+
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
   if (g_r.failed) return false;
   nrhi::Device* device = context.device;
@@ -4883,21 +5074,8 @@ bool EnsurePipeline(const NativeGuestOutputRenderContext& context) {
     return false;
   }
 
-  if (g_r.rtv_resource != context.guest_output) {
-    // The presenter recreated the output image (resize). Render-target
-    // binding is by texture now (the old heap-slot-0 RTV is gone); re-point
-    // the cached identity and the sampled view of the output (blur source /
-    // photo passes).
-    if (g_r.output_srv_slot) {
-      device->DestroyDeferred(g_r.output_srv_slot);
-      g_r.output_srv_slot = nullptr;
-    }
-    nrhi::TextureViewDesc vd;
-    vd.mip_levels = 1;
-    g_r.output_srv_slot = device->CreateTextureView(context.guest_output, vd);
-    g_r.output_srv_allocated = g_r.output_srv_slot != nullptr;
-    g_r.rtv_resource = context.guest_output;
-  }
+  EnsureOutputSampleView(context);
+
   return true;
 }
 
@@ -5157,7 +5335,8 @@ void EnqueueCubeMiss(uint32_t tex) {
 // decode the mesh into upload-heap buffers, and stage every material
 // texture up to a filled upload resource. Results go to g_prewarm_out for
 // the render thread's commit.
-void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
+void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e,
+                         skate3::perf_recorder::WorkTimelineScope& work) {
   if (e.mesh == 0 && e.tex == 0 && e.wkey != 0) {
     // Words-keyed texture miss (posters/ads, see EnqueueWordsMiss): stage
     // the decode from the captured fetch words.
@@ -5169,7 +5348,9 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestTextureFromWords(stage_ctx, base, e.words, tr.gt);
     g_tex_stage_out = nullptr;
+    PrepareStagedTextureView(stage_ctx.device, tr);
     PrewarmResult res;
+    res.request = PrewarmMissRequest::From(e);
     res.item.mesh = 0;
     res.mesh_valid = false;
     res.miss = e.miss;
@@ -5190,7 +5371,9 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestCubeTexture(stage_ctx, base, e.tex, tr.gt);
     g_tex_stage_out = nullptr;
+    PrepareStagedTextureView(stage_ctx.device, tr);
     PrewarmResult res;
+    res.request = PrewarmMissRequest::From(e);
     res.item.mesh = 0;  // texture-only result (DrawItem::mesh has no default)
     res.mesh_valid = false;
     res.miss = e.miss;
@@ -5201,28 +5384,40 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   }
   uint8_t record[0x60];
   DrawItem item{};
+  ItemBindingWatch watch;
+  ItemCoreProof proof;
   if (!GuestTryCopy(record, base + e.mesh, sizeof(record)) ||
-      !BuildItemFromMesh(base, e.mesh, item)) {
+      !BuildItemFromMesh(base, e.mesh, item, e.core_generation ? &watch : nullptr,
+                         e.core_generation ? &proof : nullptr)) {
     // Buffer objects can finish initializing shortly after registration;
     // retries are re-injected frame-paced by the render thread.
     bool dropped = false;
     {
       std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
       if (e.retries > 0) {
-        g_prewarm_retry.push_back({e.mesh, uint16_t(e.retries - 1)});
+        auto retry = e; --retry.retries;
+        g_prewarm_retry.push_back(retry);
       } else {
         g_prewarm_dropped.fetch_add(1, std::memory_order_relaxed);
         dropped = true;
       }
     }
     if (dropped) {
+      FinishItemWarmAttempt(e.mesh, e.core_generation);
       // A dropped draw-path miss must leave the in-flight set so a later
       // frame can retry it (the payload may finish streaming in).
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-      g_miss_inflight_mesh.erase(e.mesh);
+      if (e.miss || !skate3::world_loading::IsSkate2Gameplay() ||
+          !REXCVAR_GET(skate3_skate2_coalesce_mesh_requests))
+        g_miss_inflight_mesh.erase(e.mesh);
     }
     return;
   }
+  if (e.core_generation)
+    PublishWarmedItemCore(base, e.core_generation, item, watch, std::move(proof));
+  if (e.core_only) return;  // preserve the original GPU registration dedup
+  work.SetAsset(item.mesh, item.fingerprint, item.diffuse_guid,
+                item.vb_bytes, item.ib_count, item.bbox_min, item.bbox_max);
   // One representative draw entry so DecodeMesh's two-sided-sheet detection
   // keys off the real primitive type (empty draw lists would pass it
   // unconditionally). Guarded: island params live outside the validated
@@ -5236,6 +5431,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
   }
 
   PrewarmResult res;
+  res.request = PrewarmMissRequest::From(e);
   res.miss = e.miss;
   res.mesh_valid = DecodeMesh(g_r.device, base, item, res.buffers);
   if (res.mesh_valid) {
@@ -5279,6 +5475,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e) {
     g_tex_stage_out = &tr.commit;
     tr.valid = EnsureGuestTextureFromWords(stage_ctx, base, words, tr.gt);
     g_tex_stage_out = nullptr;
+    PrepareStagedTextureView(stage_ctx.device, tr);
     if (!tr.valid) {
       std::memcpy(tr.gt.fetch_words, words, sizeof(tr.gt.fetch_words));
     }
@@ -5345,8 +5542,8 @@ void PrewarmWorkerLoop() {
     {
       std::unique_lock<std::mutex> lock(g_prewarm_mutex);
       g_prewarm_cv.wait_for(lock, std::chrono::milliseconds(500), [] {
-        return !g_prewarm_queue.empty() || !g_miss_queue.empty() ||
-               !g_dyn_jobs.empty();
+        return !g_prewarm_queue.empty() || !g_prewarm_core_queue.empty() ||
+               !g_miss_queue.empty() || !g_dyn_jobs.empty();
       });
       if (!g_dyn_jobs.empty()) {
         // Dynamic cloth first: these are per-frame payloads whose result
@@ -5364,6 +5561,9 @@ void PrewarmWorkerLoop() {
       } else if (!g_prewarm_queue.empty()) {
         e = g_prewarm_queue.back();
         g_prewarm_queue.pop_back();
+      } else if (!g_prewarm_core_queue.empty()) {
+        e = g_prewarm_core_queue.back();
+        g_prewarm_core_queue.pop_back();
       } else {
         continue;
       }
@@ -5381,6 +5581,13 @@ void PrewarmWorkerLoop() {
     // keep them permanently armed for raw-load read-fault recovery (POSIX;
     // no-op on Windows).
     ArmGuestReadRecoveryForThread(base);
+    skate3::perf_recorder::WorkTimelineScope work(
+        have_dyn ? skate3::perf_recorder::WorkPhase::kNativeDynamic :
+                   skate3::perf_recorder::WorkPhase::kNativeDecode, have_dyn || !e.core_only);
+    work.SetMesh(have_dyn ? dyn.item.mesh : e.mesh, !have_dyn && e.miss);
+    if (have_dyn)
+      work.SetAsset(dyn.item.mesh, dyn.item.fingerprint, dyn.item.diffuse_guid,
+                    dyn.item.vb_bytes, dyn.item.ib_count, dyn.item.bbox_min, dyn.item.bbox_max);
     if (have_dyn) {
       PrewarmResult res;
       res.mesh_valid =
@@ -5396,9 +5603,115 @@ void PrewarmWorkerLoop() {
       }
       continue;
     }
-    ProcessPrewarmEntry(base, e);
+    ProcessPrewarmEntry(base, e, work);
   }
 }
+
+// Complete only the capacity reservation belonging to this queue lifetime.
+// Clear may have invalidated a worker while it parsed; never debit a new epoch.
+void CompleteItemCoreRequest(const ItemCoreEntry& entry) {
+  std::lock_guard lock(g_prewarm_mutex);
+  if (entry.epoch == g_item_core_epoch)
+    g_item_core_pending.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// A distinct entry type and processor: no GPU/device/result-queue access.
+// Failed geometry retries stay frame-paced, including the original60 limit.
+void ProcessItemCoreEntry(uint8_t* base, const ItemCoreEntry& entry) {
+  if (base == nullptr || !ItemWarmAttemptCurrent(entry.mesh, entry.generation)) {
+    FinishItemWarmAttempt(entry.mesh, entry.generation);
+    CompleteItemCoreRequest(entry);
+    return;
+  }
+  uint8_t record[0x60];
+  DrawItem item{};
+  ItemBindingWatch watch;
+  ItemCoreProof proof;
+  if (!GuestTryCopy(record, base + entry.mesh, sizeof(record)) ||
+      !BuildItemFromMesh(base, entry.mesh, item, &watch, &proof)) {
+    {
+      std::lock_guard lock(g_prewarm_mutex);
+      if (entry.epoch == g_item_core_epoch && entry.retries != 0) {
+        auto retry = entry;
+        --retry.retries;
+        g_item_core_retry.push_back(retry);
+        return;  // pending capacity includes queued, retrying and active work
+      }
+    }
+    FinishItemWarmAttempt(entry.mesh, entry.generation);
+    CompleteItemCoreRequest(entry);
+    return;
+  }
+  PublishWarmedItemCore(base, entry.generation, item, watch, std::move(proof));
+  CompleteItemCoreRequest(entry);
+}
+
+void RequeueItemCoreRetries() {
+  std::lock_guard lock(g_prewarm_mutex);
+  for (const auto& entry : g_item_core_retry) {
+    if (entry.epoch == g_item_core_epoch) g_item_core_queue.push_back(entry);
+  }
+  g_item_core_retry.clear();
+  g_item_core_queued.store(uint32_t(g_item_core_queue.size()), std::memory_order_relaxed);
+  if (!g_item_core_queue.empty()) g_item_core_cv.notify_one();
+}
+
+// Optional host metadata has independent low-priority service capacity.
+// It never dequeues GPU work or allocates/records/commits GPU resources.
+void ItemCoreWorkerLoop() {
+  skate3::perf_recorder::NameCurrentThread("NSV item metadata");
+#if defined(_WIN32)
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#endif
+  for (;;) {
+    ItemCoreEntry entry{};
+    {
+      std::unique_lock lock(g_prewarm_mutex);
+      g_item_core_cv.wait_for(lock, std::chrono::milliseconds(500), [] {
+        return !g_item_core_queue.empty() && SceneEnabled() &&
+               skate3::world_loading::IsSkate2Gameplay();
+      });
+      if (g_item_core_queue.empty() || !SceneEnabled() ||
+          !skate3::world_loading::IsSkate2Gameplay()) continue;
+      entry = g_item_core_queue.back();
+      g_item_core_queue.pop_back();
+      g_item_core_queued.store(uint32_t(g_item_core_queue.size()), std::memory_order_relaxed);
+    }
+    uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
+    if (base != nullptr) ArmGuestReadRecoveryForThread(base);
+    g_item_core_started.fetch_add(1, std::memory_order_relaxed);
+    ProcessItemCoreEntry(base, entry);
+  }
+}
+
+}  // namespace
+
+bool EnsureItemCoreWorker() {
+  static std::atomic<bool> started{false};
+  static std::once_flag once;
+  if (started.load(std::memory_order_acquire)) return true;
+  try {
+    std::call_once(once, [] {
+      {
+        std::lock_guard lock(g_prewarm_mutex);
+        // Bound TOTAL outstanding work, and reserve both destinations once.
+        // Registration and retry handoff then allocate no queue storage.
+        g_item_core_queue.reserve(kItemCoreQueueCap);
+        g_item_core_retry.reserve(kItemCoreQueueCap);
+      }
+      std::thread(ItemCoreWorkerLoop).detach();
+      started.store(true, std::memory_order_release);
+      REXLOG_INFO("native-scene: NSV metadata worker started (host-only, GPU queues unchanged)");
+    });
+  } catch (const std::system_error&) {
+    return false;  // optional optimization: preserve the original worker path
+  } catch (const std::bad_alloc&) {
+    return false;
+  }
+  return started.load(std::memory_order_acquire);
+}
+
+namespace {
 
 // Lazily start the decode workers (process-lifetime, parked on the queue's
 // condition variable when idle). Only started once the pipeline exists;
@@ -5427,15 +5740,33 @@ void EnsurePrewarmWorkers() {
 // gameplay alike).
 void PrewarmCommit(const NativeGuestOutputRenderContext& context,
                    uint64_t frame_number, bool loading = false) {
+  const bool coalesce = skate3::world_loading::IsSkate2Gameplay() &&
+                        REXCVAR_GET(skate3_skate2_coalesce_mesh_requests);
   {
     std::scoped_lock lock(g_prewarm_out_mutex, g_prewarm_mutex);
     if (!g_prewarm_retry.empty()) {
-      g_prewarm_queue.insert(g_prewarm_queue.end(), g_prewarm_retry.begin(),
-                             g_prewarm_retry.end());
+      for (const auto& retry : g_prewarm_retry) {
+        auto& queue = coalesce && retry.miss ? g_miss_queue :
+                      (retry.core_only ? g_prewarm_core_queue : g_prewarm_queue);
+        queue.push_back(retry);
+      }
       g_prewarm_retry.clear();
       g_prewarm_cv.notify_all();
     }
+    if (coalesce) {
+      const auto removed = CoalesceQueuedMeshRequests(
+          g_prewarm_queue, g_miss_queue, g_prewarm_request_scratch);
+      if (removed) {
+        skate3::perf_recorder::Count(skate3::perf_recorder::Activity::kPrewarmCoalesced, removed);
+        static bool logged = false;  // render thread only
+        if (!logged) {
+          logged = true;
+          REXLOG_INFO("native-scene: NSV queued mesh requests coalesced (visible FIFO, fresh decode, full retry budget)");
+        }
+      }
+    }
   }
+  RequeueItemCoreRetries();
   std::vector<PrewarmResult> done;
   {
     std::lock_guard<std::mutex> lock(g_prewarm_out_mutex);
@@ -5524,6 +5855,8 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         PoolMeshBuffer(g_r.device, r.buffers.ib);
         mit->second.last_used_frame = frame_number;
       } else {
+        context.cmd->PrepareBufferUpload(r.buffers.vb);
+        context.cmd->PrepareBufferUpload(r.buffers.ib);
         r.buffers.identity = MeshIdentity(r.item);
         if (mit != g_r.meshes.end()) {
           // Stale decode (miss-driven revalidation heal): swap it out. The
@@ -5558,14 +5891,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       if (t.valid && !t.cube && !t.ui && verify_base != nullptr &&
           t.gt.payload_addr != 0 &&
           SampleProbeFingerprint(verify_base, t.gt) != t.gt.payload_fp) {
-        if (t.gt.texture) {
-          g_r.device->DestroyDeferred(t.gt.texture);
-          t.gt.texture = nullptr;
-        }
-        if (t.gt.upload) {
-          g_r.device->DestroyDeferred(t.gt.upload);
-          t.gt.upload = nullptr;
-        }
+        DiscardStagedTexture(t.gt);
         t.valid = false;
         t.verify_failed = true;
         g_heal_verify_fail.fetch_add(1, std::memory_order_relaxed);
@@ -5576,8 +5902,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
         // negative-caches like the old inline path did.
         auto cit = g_r.cube_textures.find(t.key);
         if (cit != g_r.cube_textures.end() && cit->second.valid) {
-          if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
-          if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
+          DiscardStagedTexture(t.gt);
           continue;
         }
         if (cit != g_r.cube_textures.end()) {
@@ -5634,8 +5959,7 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
               // confirmation toward "genuinely uniform content".
               ++wit->second.nb_redecodes;
             }
-            if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
-            if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
+            DiscardStagedTexture(t.gt);
             continue;
           }
           if (t.valid && wit->second.valid) {
@@ -5702,16 +6026,20 @@ void PrewarmCommit(const NativeGuestOutputRenderContext& context,
       }
       // No words key and not a cube: an empty/failed stage slot; release
       // whatever it carries (nothing routes to it).
-      if (t.gt.texture) g_r.device->DestroyDeferred(t.gt.texture);
-      if (t.gt.upload) g_r.device->DestroyDeferred(t.gt.upload);
+      DiscardStagedTexture(t.gt);
     }
     g_prewarm_done.fetch_add(1, std::memory_order_relaxed);
   }
-  // Release the miss-in-flight keys so later revalidation cycles can enqueue
-  // these again (erasing keys that were never in the sets is harmless).
+  // NSV results release only the request they own. A speculative texture/mesh
+  // or a priority dynamic result must not clear another pending miss's key.
+  // Keep the original release behavior on the other maps/off fallback.
   {
     std::lock_guard<std::mutex> lock(g_prewarm_mutex);
     for (const PrewarmResult& r : done) {
+      if (coalesce) {
+        r.request.Release(g_miss_inflight_mesh, g_miss_inflight_tex, g_miss_inflight_words);
+        continue;
+      }
       if (r.item.mesh != 0) {
         g_miss_inflight_mesh.erase(r.item.mesh);
       }
@@ -5969,7 +6297,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
       size_t queued = 0;
       {
         std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-        queued = g_prewarm_queue.size();
+        queued = g_prewarm_queue.size() + g_prewarm_core_queue.size();
       }
       REXLOG_INFO(
           "native-scene: gameplay (prewarm: {} meshes decoded, {} dropped, {} still "
@@ -7222,13 +7550,26 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   // served map (and to a rebuild in progress) as it arrives; a record
   // changed in place also marks the map dirty, since its old shape stays
   // in the map until a rebuild.
+  const bool nsv_static = skate3::world_loading::IsSkate2Gameplay();
   for (const DrawItem& item : scene.items) {
     // Skate 2 additive effects (glare sprites, godray cones, neon overlays)
     // are light, not occluders.
     if (item.transparent || item.unlit || item.cloth_quads || item.water ||
         item.water_ocean != 0 || item.skinned || item.ropa ||
         item.char_family != 0 || item.dynobj != 0 || item.s2_blend != 0 ||
-        item.indicator) {
+        item.indicator ||
+        (nsv_static && item.env_family == 11)) {
+      // NSV proxyworld is view-dependent distant scenery. Persisting its
+      // simplified solid silhouette beside the detailed world leaves ghost
+      // shadows after a round trip/marker return. Keep the proxy's visible
+      // color rendering, but use detailed geometry for this persistent map.
+      if (nsv_static && item.env_family == 11) {
+        static bool logged = false;  // render thread only
+        if (!logged) {
+          logged = true;
+          REXLOG_INFO("native-scene: NSV distant proxies excluded from persistent static shadows");
+        }
+      }
       continue;
     }
     // Key: mesh + quantized world translation (placed instances of one
@@ -8943,6 +9284,8 @@ std::atomic<int64_t> g_occl_pub_ms{0};
 }  // namespace
 
 bool CopyOcclusionCulledCtxs(std::vector<uint32_t>& out) {
+  // NSV visibility is not proven by a ctx-only set from an earlier frame.
+  if (skate3::world_loading::IsSkate2Gameplay()) { out.clear(); return false; }
   const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now().time_since_epoch())
                              .count();
@@ -9150,8 +9493,7 @@ void UpdateJumbotron(const NativeGuestOutputRenderContext& context, uint64_t fra
 // press go to the log as runs of frames that share one lighting state (a
 // one- or two-frame flash stands out as a short run between long ones); the
 // whole ring goes to logs/light_history_<marker>_<unix time>.csv.
-void MaybeDumpLightHistory() {
-  const uint32_t marker = g_light_history_marker.exchange(0, std::memory_order_acq_rel);
+void MaybeDumpLightHistory(uint32_t marker) {
   if (marker == 0) {
     return;
   }
@@ -9328,9 +9670,70 @@ void MaybeDumpLightHistory() {
               double(t_end - at(0).t_us) / 1e6, path);
 }
 
+// Manual NSV inventory: distinguish receiver/map changes from cached caster
+// history after a marker return. No GPU readback, guest reads or idle scans.
+static void DumpNsvShadowState(const FrameScene& scene, uint32_t marker,
+                               uint64_t frame_number) {
+  if (!skate3::world_loading::IsSkate2Gameplay()) return;
+  char path[160];
+  std::snprintf(path, sizeof(path), "logs/shadow_state_%u_%lld_%llu.csv", marker,
+                static_cast<long long>(std::time(nullptr)),
+                static_cast<unsigned long long>(frame_number));
+  std::ofstream out(path);
+  if (!out) { REXLOG_WARN("native-shadow-state: could not open {}", path); return; }
+  out.precision(9);
+  out << "marker,frame,cam,nsm_valid,nsm_active,nsm_radius,nsm_center,nsm_sun,nsm_rows,"
+         "receiver_valid,receiver_fresh,receiver_rows,build_active,pending,"
+         "key,mesh,fingerprint,gpu_fingerprint,resident,last_seen,queued,family,"
+         "diffuse_guid,world,bbox_min,bbox_max,in_far_tile,cached_ranges,current_ranges\n";
+  std::unordered_multimap<uint32_t, const DrawItem*> current;
+  current.reserve(scene.items.size());
+  for (const auto& item : scene.items) current.emplace(item.mesh, &item);
+  const auto floats = [&](const float* p, size_t count) {
+    for (size_t i = 0; i < count; ++i) out << (i ? ";" : "") << p[i];
+  };
+  constexpr size_t kLimit = 8192;
+  size_t written = 0, eligible = 0;
+  for (size_t i = 0; i < g_r.static_casters.size(); ++i) {
+    const auto& rec = g_r.static_casters[i];
+    const bool in_far = NsmCasterInTile(g_r.static_caster_bounds[i], g_r.nsm_rows, 2);
+    const auto [first, last] = current.equal_range(rec.mesh);
+    std::string ranges;
+    for (auto it = first; it != last; ++it) {
+      if (std::memcmp(it->second->world, rec.world, sizeof(rec.world)) != 0) continue;
+      if (!ranges.empty()) ranges += " | ";
+      ranges += DescribeDrawRanges(it->second->draws);
+    }
+    if (!in_far && ranges.empty()) continue;
+    ++eligible;
+    if (written >= kLimit) continue;
+    out << marker << ',' << frame_number << ','; floats(scene.cam_pos, 3);
+    out << ',' << g_r.static_sun_valid << ',' << g_r.nsm_active << ',' << g_r.nsm_built_radius << ',';
+    floats(g_r.nsm_center, 3); out << ','; floats(g_r.nsm_sun, 3);
+    out << ','; floats(g_r.nsm_rows, 12);
+    out << ',' << scene.shadow_valid << ',' << scene.shadow_fresh << ',';
+    floats(scene.shadow_rows, 48);
+    out << ',' << g_r.nsm_build.active << ',' << g_r.nsm_pending.size() << ',';
+    const auto gpu = g_r.meshes.find(rec.mesh);
+    out << std::hex << rec.key << ',' << rec.mesh << ',' << rec.fingerprint << ','
+        << (gpu == g_r.meshes.end() ? 0 : gpu->second.fingerprint) << std::dec << ','
+        << (gpu != g_r.meshes.end() && gpu->second.fingerprint == rec.fingerprint) << ','
+        << rec.last_seen_frame << ',' << rec.queued << ',' << unsigned(rec.env_family) << ','
+        << std::hex << rec.diffuse_guid << std::dec << ',';
+    floats(rec.world, 16); out << ','; floats(rec.bbox_min, 3);
+    out << ','; floats(rec.bbox_max, 3);
+    out << ',' << in_far << ",\"" << DescribeDrawRanges(rec.draws) << "\",\"" << ranges << "\"\n";
+    ++written;
+  }
+  out.flush();
+  if (out) REXLOG_WARN("native-shadow-state: marker={} rows={} eligible={} cached={} cap={} -> {}",
+      marker, written, eligible, g_r.static_casters.size(), kLimit, path);
+  else REXLOG_WARN("native-shadow-state: could not write {}", path);
+}
+
 // One-shot shadow probe on the frame a lighting-history marker (Insert/F10)
 // is pending: the dynamic-shadow receiver rows and every movable prop within
-// 15 m of the camera, with where its lowest point falls in each shadow map
+// 100 m of the camera, with where its lowest point falls in each shadow map
 // (CSM height window + cascade, the props' world-shadow map). For prop feet
 // that change shade as the camera moves.
 static void LogShadowProbe(const FrameScene& scene) {
@@ -9381,14 +9784,14 @@ static void LogShadowProbe(const FrameScene& scene) {
     const float dx = 0.5f * (n.lo[0] + n.hi[0]) - cam[0];
     const float dz = 0.5f * (n.lo[2] + n.hi[2]) - cam[2];
     n.dist = std::sqrt(dx * dx + dz * dz);
-    if (n.dist <= 15.0f) {
+    if (n.dist <= 100.0f) {
       props.push_back(n);
     }
   }
   std::sort(props.begin(), props.end(),
             [](const Near& a, const Near& b) { return a.dist < b.dist; });
-  if (props.size() > 24) {
-    props.resize(24);
+  if (props.size() > 64) {
+    props.resize(64);
   }
   for (const Near& n : props) {
     // The prop's lowest point under its bbox center.
@@ -9410,12 +9813,22 @@ static void LogShadowProbe(const FrameScene& scene) {
     REXLOG_WARN(
         "shadow-probe: prop mesh={:08X} {} dist={:.1f} xz=({:.2f},{:.2f}) y=[{:.3f},{:.3f}] "
         "csm_depth_bottom={:.4f} cascade={} ls=({:.3f},{:.3f}) ws_depth_bottom={:.5f} "
-        "ws_texel=({:.2f},{:.2f}) world_rot_y=({:.3f},{:.3f},{:.3f})",
+        "ws_texel=({:.2f},{:.2f}) world_rot_y=({:.3f},{:.3f},{:.3f}) "
+        "dynobj={} family={} skinned={} guest_caster={} resident={} "
+        "normal_fmt={} tb_fmt={} ws_inside={} dyn_valid={} "
+        "ctx={:08X} diffuse={:08X} guid={:016X} center=({:.2f},{:.2f},{:.2f}) "
+        "prop_world_shade={}",
         n.item->mesh, n.item->material_name, n.dist, p[0], p[2], n.lo[1], n.hi[1], csm_d,
         casc, lx, ly, ws_d, ws_u, ws_v, n.item->world[4], n.item->world[5],
-        n.item->world[6]);
+        n.item->world[6], n.item->dynobj, n.item->char_family, n.item->skinned,
+        n.item->shadow_caster, g_r.meshes.contains(n.item->mesh),
+        n.item->normal_fmt, n.item->tb_fmt,
+        ws_u >= 0.0f && ws_u < 512.0f && ws_v >= 0.0f && ws_v < 512.0f,
+        scene.dynobj_valid, n.item->ctx, n.item->diffuse_tex, n.item->diffuse_guid,
+        p[0], 0.5f * (n.lo[1] + n.hi[1]), p[2],
+        REXCVAR_GET(skate3_native_render_scene_prop_world_shade));
   }
-  REXLOG_WARN("shadow-probe: {} movable props within 15 m", props.size());
+  REXLOG_WARN("shadow-probe: {} movable props within 100 m (nearest 64 maximum)", props.size());
 }
 
 bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_data*/) {
@@ -9428,6 +9841,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // every return; each yield below names itself.
   struct LightRecord {
     LightFrame f;
+    // Latch the request for this frame. A press after the shadow probe now
+    // stays queued for the next frame instead of dumping without its probe.
+    uint32_t marker = g_light_history_marker.exchange(0, std::memory_order_acq_rel);
     LightRecord() {
       f.t_us = std::chrono::duration_cast<std::chrono::microseconds>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -9441,7 +9857,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     ~LightRecord() {
       g_light_cur = nullptr;
       g_light_ring[g_light_ring_count++ % kLightRingFrames] = f;
-      MaybeDumpLightHistory();
+      MaybeDumpLightHistory(marker);
     }
     LightRecord(const LightRecord&) = delete;
     LightRecord& operator=(const LightRecord&) = delete;
@@ -9599,9 +10015,12 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
   const FrameScene& scene = *scene_ptr;
 
+  g_r.output_view_borrows = g_r.output_view_reuses = 0;
   if (!EnsurePipeline(context)) {
     return light_yield(kLightYieldPipeline);
   }
+  perf_rec.r.output_view_borrows = g_r.output_view_borrows;
+  perf_rec.r.output_view_reuses = g_r.output_view_reuses;
   // Flush any barriers pushed by lazy resource creation (white texture).
   context.cmd->FlushBarriers();
 
@@ -9651,6 +10070,33 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
 
   nrhi::Cmd* cmd = context.cmd;
+  struct TableLookupScope {
+    nrhi::Cmd* cmd;
+    skate3::perf_recorder::RenderRecord* record;
+    bool enabled;
+    TableLookupScope(nrhi::Cmd* cmd, skate3::perf_recorder::RenderRecord* record,
+                     bool enabled) : cmd(cmd), record(record), enabled(enabled) {
+      if (enabled) cmd->SetTextureTableLookupCache(true);
+    }
+    ~TableLookupScope() {
+      if (!enabled) return;
+      const auto stats = cmd->GetTextureTableLookupStats();
+      record->table_lookup_calls = stats.lookups;
+      record->table_lookup_hits = stats.hits;
+      cmd->SetTextureTableLookupCache(false);
+    }
+  } table_lookup_scope(cmd, &perf_rec.r,
+      context.backend == NativeGuestOutputBackend::kVulkan &&
+      REXCVAR_GET(skate3_native_vulkan_table_lookup_cache) &&
+      (!skate3::world_loading::IsSkate2Gameplay() ||
+       REXCVAR_GET(skate3_skate2_vulkan_table_lookup_cache)));
+  if (table_lookup_scope.enabled) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("native-scene: Vulkan descriptor-table lookup cache enabled (exact keys, retirement invalidation)");
+    }
+  }
 
   ReleaseRetiredAndFlushCaches(context);
 
@@ -9731,7 +10177,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         size_t queued = 0;
         {
           std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-          queued = g_prewarm_queue.size();
+          queued = g_prewarm_queue.size() + g_prewarm_core_queue.size();
         }
         REXLOG_INFO(
             "native-scene: taking over natively ({} items; prewarm {} done / {} dropped "
@@ -9837,8 +10283,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     light.f.csm_s1 = sh[4];
     light.f.csm_s2 = sh[8];
   }
-  if (g_light_history_marker.load(std::memory_order_relaxed) != 0) {
+  if (light.marker != 0) {
     LogShadowProbe(scene);
+    DumpNsvShadowState(scene, light.marker, frame_number);
   }
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
   cmd->ProfileRegion(nrhi::ProfileStage::kMain);
@@ -10227,11 +10674,32 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // at a wrong surface names it. draw_item logs each on entry and at
   // submission; the summary after the passes names any that never drew.
   struct PickState {
-    int rank = 0;
+    int rank = -1;  // negative = complete NSV snapshot, not a ray pick
     bool entered = false;
-    uint32_t submitted = 0;
+    uint32_t submitted = 0, issued_draws = 0;
+    uint32_t fetch[4][6] = {};
+    uint64_t payload[4] = {};
+    uint8_t texture_state[4] = {};  // 0 none, 1 white, 2 valid, 3 invalid
+    float shader_family = 0;
+    bool blend = false, zbias = false;
+    int cull = -1;  // opaque PSO only; blended PSO is tracked separately
+    float raster_vp[16] = {};
   };
   std::unordered_map<const DrawItem*, PickState> pick_map;
+  // Insert's old nearest16 AABBs were filled by overlapping ground batches,
+  // excluding the distant facade a user was investigating. Capture the whole
+  // published static scene once, independently of centre-ray aim. No ongoing
+  // history, guest geometry reads or per-frame allocation when not requested.
+  const bool visibility_snapshot = light.marker != 0 && debug_mode == 0 &&
+      skate3::world_loading::IsSkate2Gameplay();
+  constexpr size_t kVisibilitySnapshotLimit = 4096;
+  if (visibility_snapshot) {
+    pick_map.reserve(std::min(scene.items.size(), kVisibilitySnapshotLimit));
+    for (const DrawItem& item : scene.items) {
+      if (!item.skinned && !item.ropa && !item.cloth_quads && item.bones.empty() &&
+          pick_map.size() < kVisibilitySnapshotLimit) pick_map.try_emplace(&item);
+    }
+  }
   if (g_pick_request.exchange(false, std::memory_order_acq_rel)) {
     // The centre ray is clip x = y = 0: perpendicular to view_proj's x and y
     // columns, oriented along +w.
@@ -10412,23 +10880,28 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // cost. Sampled once per RenderScene call; the per-item clock reads only
   // happen while the cvar is on.
   const bool prof_items = REXCVAR_GET(skate3_native_render_scene_perf_items);
+  const bool scene_detail = skate3::perf_recorder::SceneDetailEnabled(
+      skate3::world_loading::IsSkate2Gameplay());
+  uint32_t detail_item_number = 0;
+
   // Blended sub-pass state for the zbias matrix offset (draw_item): in that
   // pass scene_pso_bound still holds the last OPAQUE pipeline, so the
   // offset follows the pass's own zbias flag instead.
   bool in_blend_pass = false;
   bool blend_zbias = false;
+  bool blend_coplanar_depth = false;
   // Hall of Meat bone depth mask drawn this frame (see after the blended
   // sub-pass); ps_depthpack turns it into the chain's stencil byte.
   bool hom_mask_ready = false;
   bool opaque_scene_pass = false;
   CharacterFadeUniformCache fade_uniforms;
-  const auto draw_item = [&](const DrawItem& item) {
+  const auto draw_item = [&](const DrawItem& item, bool sampled = false) {
     // Stage split points (profiling only): t0..t1 mesh serve, t1..t2 texture
     // serve, t2..t3 constants assembly, t3..end binds + draw recording.
     // Early returns skip the stage windows; the caller's in/out totals still
     // capture them.
     PerfClock::time_point di_t0{}, di_t1{}, di_t2{}, di_t3{};
-    if (prof_items) {
+    if (prof_items || sampled) {
       di_t0 = PerfClock::now();
     }
     const auto body_fade = ResolveCharacterBodyFade(
@@ -10538,7 +11011,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     it->second.last_used_frame = frame_number;
     MeshBuffers& mesh_record = it->second;  // sticky sites update in place
     const MeshBuffers& buffers = mesh_record;
-    if (prof_items) {
+    if (prof_items || sampled) {
       di_t1 = PerfClock::now();
     }
 
@@ -11119,7 +11592,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // + material tint + overlay params + misc. tint.a > 0 selects debug
     // solid colors; tint.r > 0 marks a bound lightmap. For transparent
     // items misc.yzw carries the fog ramp and mat_tint the fog color.
-    if (prof_items) {
+    if (prof_items || sampled) {
       di_t2 = PerfClock::now();
     }
     float constants[52] = {};
@@ -11148,6 +11621,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
                                         g_r.pso_bam_zbias != nullptr));
     RebasedViewProj(scene.view_proj, scene.cam_pos, constants + 16, kReversedZ,
                     zbias_item ? 1678.0 / 16777216.0 : 0.0);
+    if (kReversedZ && blend_coplanar_depth) {
+      PullCoplanarSkate2TransparentDepth(constants + 16);
+      static bool s_coplanar_logged = false;
+      if (!s_coplanar_logged) {
+        s_coplanar_logged = true;
+        REXLOG_INFO("native-scene: Skate 2 transparent coplanar guard enabled "
+                    "(relative depth pull=2^-16, compare=greater_equal)");
+      }
+    }
     // Coplanar-overlap yield (IsSkate2StadiumCrowd): scale the stored depth
     // by 1 - 2^-15, ~250 float ulps at any distance (the interpolation
     // rounding it must beat is a few), i.e. 1.5 mm farther at 50 m.
@@ -11574,6 +12056,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           scene.dynobj_ws_valid &&
           REXCVAR_GET(skate3_native_render_scene_prop_world_shade)) {
         v2_flags |= 8;
+        if (skate3::world_loading::IsSkate2Gameplay()) {
+          v2_flags |= 16; // Finite world-shade footprint, including shared props.
+        }
       }
     }
     // Skate 2 sky clouds: S2 sky_defaultPS adds the material's `detail`
@@ -12062,7 +12547,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       si.item = &item;
       ssr_items.push_back(si);
     }
-    if (prof_items) {
+    if (prof_items || sampled) {
       di_t3 = PerfClock::now();
     }
     // A packed atlas always lights in packed mode: its R/G/B channels are
@@ -12218,6 +12703,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     if (pick != nullptr) {
       ++pick->submitted;
+      if (visibility_snapshot) {
+        const GuestTexture* textures[] = {diffuse, lightmap, chromaticity, decal_tex};
+        for (size_t t = 0; t < 4; ++t) {
+          const auto* tex = textures[t];
+          if (!tex) continue;
+          pick->texture_state[t] = tex == &g_r.white || tex == &g_r.white_cube
+              ? 1 : tex->valid ? 2 : 3;
+          std::memcpy(pick->fetch[t], tex->fetch_words, sizeof(pick->fetch[t]));
+          pick->payload[t] = tex->payload_fp;
+        }
+        pick->shader_family = constants[39];
+        pick->blend = in_blend_pass;
+        if (!in_blend_pass) pick->cull = scene_pso_bound == g_r.pso_cullback ||
+            scene_pso_bound == g_r.pso_bam_zbias;
+        pick->zbias = zbias_item;
+        std::memcpy(pick->raster_vp, constants + 16, sizeof(pick->raster_vp));
+      }
+    }
+    if (pick != nullptr && pick->rank >= 0) {
       std::string cs;
       for (int k = 32; k < 52; ++k) {
         char buf[24];
@@ -12298,6 +12802,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       }
       cmd->DrawIndexed(draw.index_count, draw.start_index, draw.base_vertex);
       ++drawn;
+      if (pick != nullptr) ++pick->issued_draws;
       if (ring_frame != nullptr) {
         const auto rit = ring_map.find(&item);
         if (rit != ring_map.end()) {
@@ -12308,16 +12813,25 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // Stage attribution for draws that reached submission (early returns
     // above skip this; their time still lands in the caller's in/out
     // windows).
-    if (prof_items && di_t3 != PerfClock::time_point{}) {
+    if ((prof_items || sampled) && di_t3 != PerfClock::time_point{}) {
       const auto di_t4 = PerfClock::now();
       const auto ns = [](PerfClock::time_point a, PerfClock::time_point b) {
         return uint64_t(
             std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
       };
-      g_pw_di_mesh.Add(ns(di_t0, di_t1));
-      g_pw_di_tex.Add(ns(di_t1, di_t2));
-      g_pw_di_const.Add(ns(di_t2, di_t3));
-      g_pw_di_submit.Add(ns(di_t3, di_t4));
+      if (prof_items) {
+        g_pw_di_mesh.Add(ns(di_t0, di_t1));
+        g_pw_di_tex.Add(ns(di_t1, di_t2));
+        g_pw_di_const.Add(ns(di_t2, di_t3));
+        g_pw_di_submit.Add(ns(di_t3, di_t4));
+      }
+      if (sampled) {
+        ++perf_rec.r.sample_completed;
+        perf_rec.r.sample_mesh_ns += ns(di_t0, di_t1);
+        perf_rec.r.sample_texture_ns += ns(di_t1, di_t2);
+        perf_rec.r.sample_constants_ns += ns(di_t2, di_t3);
+        perf_rec.r.sample_submit_ns += ns(di_t3, di_t4);
+      }
     }
   };
   // Profiling-mode consumption of the occlusion-grid readback ring (filled
@@ -12381,8 +12895,24 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   // pixels; a large share in either class is a visibility-culling gap, not
   // a scene-density cost.
   const auto timed_draw = [&](const DrawItem& item) {
+    // Rotate the phase each frame so a fixed draw order cannot always sample
+    // the same materials. Sampling is CPU-only; it never alters visibility,
+    // binds, draw calls, GPU passes, occlusion readback or content readiness.
+    const bool sampled = scene_detail &&
+        ((detail_item_number++ + uint32_t(frame_number * 17)) & 63u) == 0u;
+    const auto detail_t0 = sampled ? PerfClock::now() : PerfClock::time_point{};
+    const auto record_sample = [&] {
+      if (!sampled) return;
+      const uint64_t elapsed = perf_ns_since(detail_t0);
+      ++perf_rec.r.sample_items; perf_rec.r.sample_total_ns += elapsed;
+      const bool classifiable = !item.skinned && !item.ropa && !item.cloth_quads && item.bones.empty();
+      if (classifiable && ItemOutsideFrustum(item, scene.view_proj, 1.0f)) {
+        ++perf_rec.r.sample_outside_items; perf_rec.r.sample_outside_ns += elapsed;
+      }
+    };
     if (!prof_items) {
-      draw_item(item);
+      draw_item(item, sampled);
+      record_sample();
       return;
     }
     // Statics only (same gate as the retention pass): a skinned/ropa item's
@@ -12399,7 +12929,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       indices += e.index_count;
     }
     const auto t0 = PerfClock::now();
-    draw_item(item);
+    draw_item(item, sampled);
+    record_sample();
     const uint64_t total_ns = perf_ns_since(t0);
     if (off) {
       g_pw_di_out.Add(total_ns);
@@ -12967,7 +13498,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
           cmd->SetPipeline(want);
           blend_bound = want;
         }
+        blend_coplanar_depth = REXCVAR_GET(skate3_skate2_material_depth_bias);
         timed_draw(*item);
+        blend_coplanar_depth = false;
         continue;
       }
       // reflective_trans glass culls like the game (its material family's
@@ -13000,13 +13533,81 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     in_blend_pass = false;
   }
   for (const auto& [pick_item, st] : pick_map) {
-    if (st.submitted == 0) {
+    if (st.rank >= 0 && st.submitted == 0) {
       REXLOG_INFO("pick-skip: #{} mesh={:08X} {}", st.rank, pick_item->mesh,
                   st.entered ? "returned before drawing (mesh or texture not ready, retained "
                                "mismatch, or hidden)"
                              : "never reached draw (occlusion-culled, faded out, or filtered "
                                "out of the passes)");
     }
+  }
+  if (visibility_snapshot) {
+    char path[128];
+    std::snprintf(path, sizeof(path), "logs/visibility_%u_%lld_%llu.csv", light.marker,
+                  static_cast<long long>(std::time(nullptr)),
+                  static_cast<unsigned long long>(frame_number));
+    std::ofstream out(path);
+    out.precision(9);
+    const auto quoted = [&](const std::string& value) {
+      out << '"';
+      for (char c : value) { if (c == '"') out << '"'; out << c; }
+      out << '"';
+    };
+    const auto words = [&](const uint32_t* w) {
+      for (int i = 0; i < 6; ++i) out << (i ? ";" : "") << std::hex << w[i];
+      out << std::dec;
+    };
+    out << "marker,frame,generation,cam_x,cam_y,cam_z,mesh,ctx,guid,material,family,retained,"
+           "pending,tex_missing,entered,ready,issued_draws,mesh_resident,mesh_fp_match,"
+           "fingerprint,gpu_fingerprint,range_hash,draw_ranges,"
+           "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z,"
+           "world,view_proj,outside_render,diffuse_obj,lightmap_obj,chroma_obj,art_obj,"
+           "diffuse_override,art_override,shader_family,blend,opaque_cull,zbias,raster_view_proj,"
+           "diffuse_state,diffuse_fetch,diffuse_payload,lightmap_state,lightmap_fetch,lightmap_payload,"
+           "chroma_state,chroma_fetch,chroma_payload,art_state,art_fetch,art_payload\n";
+    size_t rows = 0;
+    // Scene order is deterministic; unordered_map iteration would scramble a
+    // pair of snapshots and make comparison needlessly difficult.
+    for (const DrawItem& item : scene.items) {
+      const auto pi = pick_map.find(&item);
+      if (pi == pick_map.end()) continue;
+      const PickState& st = pi->second;
+      const auto mesh = g_r.meshes.find(item.mesh);
+      const bool resident = mesh != g_r.meshes.end();
+      out << light.marker << ',' << frame_number << ',' << scene.generation << ','
+          << scene.cam_pos[0] << ',' << scene.cam_pos[1] << ',' << scene.cam_pos[2] << ','
+          << std::hex << item.mesh << ',' << item.ctx << ',' << item.diffuse_guid << ',';
+      quoted(item.material_name);
+      out << std::dec << ',' << unsigned(item.env_family) << ',' << item.retained << ','
+          << item.pending << ',' << unsigned(item.tex_missing) << ',' << st.entered << ','
+          << st.submitted << ',' << st.issued_draws << ',' << resident << ','
+          << (resident && mesh->second.fingerprint == item.fingerprint) << ','
+          << std::hex << item.fingerprint << ',' << (resident ? mesh->second.fingerprint : 0) << ','
+          << DrawRangesHash(item.draws) << ',';
+      quoted(DescribeDrawRanges(item.draws));
+      out << std::dec;
+      for (float f : item.bbox_min) out << ',' << f;
+      for (float f : item.bbox_max) out << ',' << f;
+      out << ',';
+      for (int i = 0; i < 16; ++i) out << (i ? ";" : "") << item.world[i];
+      out << ',';
+      for (int i = 0; i < 16; ++i) out << (i ? ";" : "") << scene.view_proj[i];
+      out << ',' << ItemOutsideFrustum(item, scene.view_proj, 1.0f) << ',' << std::hex
+          << item.diffuse_tex << ',' << item.lightmap_tex << ',' << item.chromaticity_tex << ','
+          << item.decal_art << ',';
+      words(item.diffuse_fetch); out << ','; words(item.decal_fetch);
+      out << ',' << st.shader_family << ',' << st.blend << ',' << st.cull << ',' << st.zbias << ',';
+      for (int i = 0; i < 16; ++i) out << (i ? ";" : "") << st.raster_vp[i];
+      for (size_t t = 0; t < 4; ++t) {
+        out << ',' << unsigned(st.texture_state[t]) << ','; words(st.fetch[t]);
+        out << ',' << std::hex << st.payload[t] << std::dec;
+      }
+      out << '\n'; ++rows;
+    }
+    out.flush();
+    if (out) REXLOG_WARN("native-visibility: marker={} rows={} scene_items={} cap={} -> {}",
+        light.marker, rows, scene.items.size(), kVisibilitySnapshotLimit, path);
+    else REXLOG_WARN("native-visibility: could not write {}", path);
   }
   // Hall of Meat stencil mark: the game's bones write stencil, and its
   // postfx_visualfxPS / postfx_uberPS read that byte (packed-depth .z) to
@@ -14584,7 +15185,7 @@ bool SceneFailed() { return g_r.failed; }
 void GetDecodeQueueDepths(uint32_t out[4]) {
   {
     std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-    out[0] = uint32_t(g_prewarm_queue.size());
+    out[0] = uint32_t(g_prewarm_queue.size() + g_prewarm_core_queue.size());
     out[1] = uint32_t(g_miss_queue.size());
     out[2] = uint32_t(g_dyn_jobs.size());
   }

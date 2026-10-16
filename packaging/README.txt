@@ -43,4 +43,4 @@ Open the imgui interface with RB+Start or ESC and look in the World menu for:
 -no black screen out of bounds
 -disable screen shake on high speed
 
-Emulated renderer is broken, D3D12 is not working, linux and macOS builds not yet tested. Future builds may remove the option to enable emulated renderer or d3d12 except via settings.toml
+Emulated renderer is broken in New San Van, linux and macOS builds not yet tested.

@@ -1,6 +1,7 @@
 #include "skate3_native_render.h"
 
 #include "skate3_perf_recorder.h"
+#include "skate3_world_loading.h"
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
@@ -177,7 +178,8 @@ OcclDispatchFilter g_occl_filter;
 uint32_t FilterSceneDrawList(uint8_t* base, uint32_t sort_vec, uint32_t first,
                              uint32_t count) {
   OcclDispatchFilter& f = g_occl_filter;
-  if (f.active || count == 0 || count > 100000 ||
+  if (skate3::world_loading::IsSkate2Gameplay() ||
+      f.active || count == 0 || count > 100000 ||
       !REXCVAR_GET(skate3_native_render_scene_occlusion_cull_guest)) {
     return count;
   }
@@ -577,8 +579,11 @@ extern "C" REX_FUNC(sub_82795AD8) {
 // SceneRenderView::Render (82 7FB158) for each of the view's key lists.
 extern "C" REX_FUNC(sub_827FAF50) {
   if (skate3::native_render::Enabled()) {
-    skate3::native_render::OnSceneDrawList(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
-                                           ctx.r6.u32);
+    {
+      skate3::perf_recorder::WorkTimelineScope work(skate3::perf_recorder::WorkPhase::kSortCapture);
+      skate3::native_render::OnSceneDrawList(base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                                             ctx.r6.u32);
+    }
     // Guest-side occlusion dispatch filter: capture above saw every entry;
     // the dispatcher only gets the ones the occlusion cull did not prove
     // hidden. The segment is restored after the call (the list object
@@ -587,11 +592,15 @@ extern "C" REX_FUNC(sub_827FAF50) {
         base, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
     if (kept != ctx.r6.u32) {
       ctx.r6.u64 = kept;
-      __imp__sub_827FAF50(ctx, base);
+      {
+        skate3::perf_recorder::WorkTimelineScope work(skate3::perf_recorder::WorkPhase::kSortOriginal);
+        __imp__sub_827FAF50(ctx, base);
+      }
       skate3::native_render::RestoreSceneDrawList(base);
       return;
     }
   }
+  skate3::perf_recorder::WorkTimelineScope work(skate3::perf_recorder::WorkPhase::kSortOriginal);
   __imp__sub_827FAF50(ctx, base);
 }
 
@@ -603,7 +612,10 @@ extern "C" REX_FUNC(sub_82B82E08) {
   if (native) {
     skate3::native_render::OnFrameEnd(base);
   }
-  __imp__sub_82B82E08(ctx, base);
+  {
+    skate3::perf_recorder::GuestSwapScope swap_detail(native);
+    __imp__sub_82B82E08(ctx, base);
+  }
   if (native) {
     skate3::native_render::OnSwapIssued();
   }
@@ -980,8 +992,22 @@ extern "C" REX_FUNC(sub_8263C498) {
 // loading-screen decode.
 extern "C" REX_FUNC(sub_82791290) {
   const uint32_t instance = ctx.r4.u32;
-  __imp__sub_82791290(ctx, base);
+  {
+    skate3::perf_recorder::GuestEventWorkScope timing(
+        skate3::perf_recorder::GuestEventWork::kRenderInstance);
+    if (skate3::perf_recorder::RegistrationDetailEnabled() && instance != 0) {
+      uint32_t model = 0;
+      uint16_t meshes = 0;
+      if (skate3::native_scene::GuestTryLoadU32(base, instance + 128, &model) && model != 0 &&
+          skate3::native_scene::GuestTryCopy(&meshes, REX_RAW_ADDR(model + 50), sizeof(meshes))) {
+        skate3::perf_recorder::NoteRegistrationMeshes(__builtin_bswap16(meshes));
+      }
+    }
+    __imp__sub_82791290(ctx, base);
+  }
   if (skate3::native_render::Enabled()) {
+    skate3::perf_recorder::GuestEventWorkScope timing(
+        skate3::perf_recorder::GuestEventWork::kNativePrewarm);
     skate3::native_scene::OnAddRenderInstance(base, instance);
   }
 }

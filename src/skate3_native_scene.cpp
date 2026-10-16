@@ -1,3 +1,4 @@
+#include "native/skate3_native_draw_shader_paths.h"
 // Native scene renderer, game-thread half: captures the hooked MeshContext
 // stream and guest render state, and builds/publishes the per-frame
 // FrameScene. The render-thread RHI half lives in
@@ -5,6 +6,9 @@
 // skate3_native_scene_state.h.
 
 #include "skate3_native_scene.h"
+#include "native/skate3_native_scene_capacity.h"
+#include "native/skate3_native_world_item_storage.h"
+#include "native/skate3_native_cull_probe.h"
 #include "skate3_perf_recorder.h"
 #include "skate3_world_loading.h"
 
@@ -40,6 +44,15 @@
 
 REXCVAR_DEFINE_BOOL(skate3_skate2_hide_inherited_backdrop, true, "Skate 3",
                     "Hide native district proxies and Danny Way backdrop assets inherited by New San Van")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_scene_item_reserve_growth, true, "Skate 3",
+                    "Grow pooled native scene-item capacity geometrically without changing items")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_scene_item_reserve_growth, true, "Skate 3",
+                    "Reuse growing scene-item buffers in New San Van; off for allocation comparison")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_world_item_storage, true, "Skate 3",
+                    "Reuse empty world draw buffers and construct scene items in place in New San Van")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_skate2_native_occlusion, false, "Skate 3",
                     "Experimental native occlusion optimization in New San Van; disabled for visibility validation")
@@ -1349,6 +1362,12 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_dyn_gap_fill, true, "Skate 3",
                     "Re-publish character/cloth/skinned items for up to two "
                     "missed publish frames (high-frame-rate body flicker)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_worker_item_cores, true, "Skate 3",
+                    "Reuse validated static item cores from New San Van decode workers");
+
+REXCVAR_DEFINE_BOOL(skate3_skate2_independent_item_cores, true, "Skate 3",
+                    "Prepare New San Van host item metadata independently of GPU decode queues");
+
 namespace skate3::native_scene {
 namespace {
 
@@ -2090,6 +2109,9 @@ bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t size) {
 // be committed yet; the failure defers the mesh instead of faulting the
 // thread. Returns false when the payload is unreadable.
 bool ComputeItemFingerprint(uint8_t* base, DrawItem& item) {
+  skate3::perf_recorder::NoteSceneCacheWork(skate3::perf_recorder::SceneCacheWork::kFingerprint);
+  skate3::perf_recorder::GuestSceneCacheScope fingerprint_detail(
+      skate3::perf_recorder::SceneCacheWork::kFingerprint);
   uint64_t h = 1469598103934665603ull;
   const auto mix = [&h](uint64_t v) {
     h = (h ^ v) * 1099511628211ull;
@@ -2098,7 +2120,23 @@ bool ComputeItemFingerprint(uint8_t* base, DrawItem& item) {
   mix(item.ib_addr);
   mix(item.vb_bytes);
   mix(item.ib_count);
-  if (item.vb_bytes >= 8 && item.ib_count >= 4) {
+  if (item.vb_bytes >= 8 && item.ib_count >= 4 &&
+      skate3::world_loading::IsSkate2Gameplay()) {
+    // Same 16 interleaved VB/IB samples and FNV order; amortize only the
+    // guarded call overhead. No fewer samples, wider validity interval or
+    // retained payload pointers. An unreadable sample still rejects the item.
+    const void* sources[32];
+    uint64_t words[32];
+    for (uint32_t k = 0; k < 16; ++k) {
+      const uint32_t vb_off = uint32_t(uint64_t(item.vb_bytes - 8) * k / 15u) & ~7u;
+      const uint32_t ib_off = uint32_t(uint64_t(item.ib_count * 2 - 8) * k / 15u) & ~7u;
+      const uint32_t va = item.vb_addr + vb_off, ia = item.ib_addr + ib_off;
+      sources[k * 2] = va < 0x10000 ? nullptr : REX_RAW_ADDR(va);
+      sources[k * 2 + 1] = ia < 0x10000 ? nullptr : REX_RAW_ADDR(ia);
+    }
+    if (!GuestTryGatherU64(words, sources, 32)) return false;
+    for (uint64_t word : words) mix(__builtin_bswap64(word));
+  } else if (item.vb_bytes >= 8 && item.ib_count >= 4) {
     for (uint32_t k = 0; k < 16; ++k) {
       uint64_t vq = 0, iq = 0;
       const uint32_t vb_off = uint32_t(uint64_t(item.vb_bytes - 8) * k / 15u) & ~7u;
@@ -2258,7 +2296,13 @@ void TraceSkate2TextureBinding(uint8_t* base, uint32_t mesh, uint32_t material,
 }
 
 bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
-                       ItemBindingWatch* watch) {
+                       ItemBindingWatch* watch, ItemCoreProof* proof) {
+  if (proof) {
+    uint8_t record[0x60];
+    if (GuestTryCopy(record, base + mesh, sizeof(record)))
+      proof->Add(mesh, record, sizeof(record));
+    else proof->valid = false;
+  }
   if (watch != nullptr) {
     watch->count = 0;
   }
@@ -2283,6 +2327,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
+  if (proof) proof->Add(vdesc, desc_head, sizeof(desc_head));
   const uint32_t num_elements = BSwap32(desc_head[2]) >> 16;  // u16 at +8
   if (num_elements == 0 || num_elements > 32) return false;
   // Element table at +0x10 (16 bytes per element) followed by the stride
@@ -2293,6 +2338,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
+  if (proof) proof->Add(vdesc + 0x10, desc_tab, desc_tab_bytes);
   const auto elem_u16 = [&](uint32_t i, uint32_t off) -> uint32_t {
     return (uint32_t(desc_tab[i * 16 + off]) << 8) | desc_tab[i * 16 + off + 1];
   };
@@ -2397,6 +2443,10 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
+  if (proof) {
+    proof->Add(vb + kBufferPhysAddr, vb_words, sizeof(vb_words));
+    proof->Add(ib + kBufferPhysAddr, ib_words, sizeof(ib_words));
+  }
   item.vb_addr = BSwap32(vb_words[0]) & 0xFFFFFFFC;
   item.vb_bytes = BSwap32(vb_words[2]);
   item.ib_addr = BSwap32(ib_words[0]) & 0xFFFFFFFC;
@@ -2462,11 +2512,20 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
   uint32_t mat_head[3] = {};
   if (GuestReadableApprox(base, material) &&
       GuestTryCopy(mat_head, REX_RAW_ADDR(material), sizeof(mat_head))) {
+    if (proof) proof->Add(material, mat_head, sizeof(mat_head));
     const uint32_t num_channels = BSwap32(mat_head[0]);
     const uint32_t channels = BSwap32(mat_head[2]);
     uint8_t chan_buf[32 * 0x20];
     if (num_channels != 0 && num_channels <= 32 && GuestReadableApprox(base, channels) &&
         GuestTryCopy(chan_buf, REX_RAW_ADDR(channels), num_channels * 0x20)) {
+      if (proof) proof->Add(channels, chan_buf, num_channels * 0x20);
+      const auto prove_string = [&](uint32_t address, const char* text, uint32_t capacity) {
+        if (!proof) return;
+        const size_t n = strnlen(text, capacity);
+        // GuestTryReadString intentionally truncates long channel names.
+        // Record exactly the consumed prefix, not its synthetic trailing NUL.
+        proof->Add(address, text, uint32_t(std::min(n + 1, size_t(capacity - 1))));
+      };
       const auto chan_u32 = [&](uint32_t idx, uint32_t off) -> uint32_t {
         uint32_t v;
         std::memcpy(&v, chan_buf + idx * 0x20 + off, 4);
@@ -2478,6 +2537,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
         const uint32_t name = chan_u32(i, 0);
         char text[20];
         GuestTryReadString(base, name, text, sizeof(text));
+        prove_string(name, text, sizeof(text));
         if (text[0] == '\0') continue;
         uint32_t* slot = nullptr;
         if (std::memcmp(text, "diffuse", 8) == 0) {
@@ -2582,6 +2642,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
             // "livingworld" pedestrian prefix.
             char mat_name[40] = {};
             GuestTryReadString(base, s, mat_name, sizeof(mat_name));
+            prove_string(s, mat_name, sizeof(mat_name));
             std::memcpy(item.material_name, mat_name, sizeof(mat_name));
             item.material_name[sizeof(item.material_name) - 1] = 0;
             // character.*_ropa = the Ropa cloth-sim VS variant (flag-row
@@ -2758,6 +2819,15 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
               GuestTryLoadU32(base, tex + 7 * 4, &tex_w0) && (tex_w0 & 3u) == 2u) {
             *slot = tex;
           }
+          if (proof) {
+            const uint32_t tex_be = BSwap32(tex);
+            uint32_t fetch[6];
+            proof->Add(stream, &tex_be, sizeof(tex_be));
+            if (GuestTryCopy(fetch, base + tex + 28, sizeof(fetch)) &&
+                BSwap32(fetch[0]) == tex_w0)
+              proof->Add(tex + 28, fetch, sizeof(fetch));
+            else proof->valid = false;
+          }
           if (watch != nullptr && stream >= 0x10000 &&
               watch->count < ItemBindingWatch::kMax) {
             watch->stream[watch->count] = stream;
@@ -2787,6 +2857,8 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
             *slot = 0;
             placeholder = true;
           }
+          // Registry fallbacks and placeholders lack a live binding proof.
+          if (proof && (!tex || *slot != tex || placeholder)) proof->valid = false;
           if (placeholder) {
             g_placeholder_slots.fetch_add(1, std::memory_order_relaxed);
           }
@@ -2877,16 +2949,25 @@ namespace {
 // but only if that draw's slot 3 is this item's own lightmap
 // (mirror-masked base compare), which proves the recorded fetch state
 // belongs to the mesh's MAIN-pass draw (the z-prepass leaves another
-// material's bindings). Slot targets are family-specific (Skate 2
-// shader source): environmentsimple.* sample the diffuse at s4;
-// environment.decal samples its decal overlay art at s4 (diffuse rides
-// s6); environment.default has DETAIL at s4, so its diffuse adoption
-// stays stub-gated; never adopt a detail texture over real poster art.
+// material's bindings). Slot targets are family-specific in the guest's
+// Skate 3 effect banks (verified shader constant tables): environmentsimple.*
+// samples diffuse at s4, environment.decal samples decal art at s4 (diffuse
+// at s6), environment.default has DETAIL at s4, and baseincandescent has
+// diffuse at s3. A small mip cannot change these sampler assignments, so
+// NSV only adopts verified s4 artwork families.
 // Per-frame state (g_frame_draw_fetch), so this runs on every item build;
 // it is NOT part of the cacheable item core.
 void AdoptDrawFetchOverrides(uint8_t* base, DrawItem& item) {
   if (skate3::world_loading::IsSkate2Gameplay() &&
       !REXCVAR_GET(skate3_skate2_ad_overrides)) return;
+  // A reduced diffuse mip is not evidence of an ad rebind. The guest effect
+  // used by imported incandescent materials samples diffuse at s3; s4 may
+  // still be an unrelated material's missing-texture binding. Restrict NSV
+  // to verified s4 artwork families; Skate 3 keeps its existing path.
+  const bool s2 = skate3::world_loading::IsSkate2Gameplay();
+  const bool s4_art = item.env_family == 2 || item.env_family == 3 ||
+                      item.env_family == 7 || item.env_family == 8;
+  if (s2 && !s4_art) return;
   if (item.env_family != 0 && item.diffuse_tex != 0 && item.lightmap_tex != 0) {
     // Physical base of a fetch word-1, collapsing the 0xA0000000-style
     // cached/uncached mirrors (the channel object records the mirror
@@ -2971,6 +3052,11 @@ void AdoptDrawFetchOverrides(uint8_t* base, DrawItem& item) {
 //     buffers the CPU sim rewrites): fingerprint refresh
 //   - every 32nd frame: full rebuild (material channels re-resolve: late
 //     CAS composites, streamed textures binding into channel records)
+// NSV resolved static meshes use a stable per-mesh phase, so one scenery
+// activation doesn't make hundreds of routine refreshes due together.
+// The first refresh may be earlier; subsequent intervals remain 4 / 32.
+// Pending channels, CPU-rewritten payloads and immediate invalidation keep
+// their existing checks. Skate 3 keeps the original relative deadlines.
 // Invalidated when the mesh re-registers (tRModelData::Fixup /
 // AddRenderInstance -> OnMeshRegistered), on the menus/loading flip and by
 // the mesh-cache debug flush. Guarded by its own mutex: builders run on the
@@ -2985,6 +3071,123 @@ struct CachedItemCore {
 constexpr size_t kItemCacheCap = 16384;
 std::mutex g_item_cache_mutex;
 std::unordered_map<uint32_t, CachedItemCore> g_item_cache;
+struct WarmedItemCore {
+  DrawItem item;
+  ItemBindingWatch watch;
+  ItemCoreProof proof;
+};
+struct WarmItemSlot {
+  uint64_t generation = 0;
+  std::unique_ptr<WarmedItemCore> ready;
+  bool in_flight = false;
+  uint64_t ready_order = 0;
+};
+std::unordered_map<uint32_t, WarmItemSlot> g_item_warm;
+uint64_t g_item_warm_generation = 0;  // monotonic, never reset with the map
+size_t g_item_warm_ready = 0;
+struct WarmReadyKey { uint32_t mesh; uint64_t generation, order; };
+std::deque<WarmReadyKey> g_item_warm_fifo;  // bounded tombstones, worker eviction only
+uint64_t g_item_warm_order = 0;
+struct ItemWarmStats {
+  std::atomic<uint64_t> requested{0}, late{0}, attempted{0}, published{0};
+  std::atomic<uint64_t> unready{0}, invalid_proof{0}, changed{0}, unsupported{0};
+  std::atomic<uint64_t> discarded{0}, cancelled{0}, evicted{0};
+} g_item_warm_stats;
+
+uint64_t BeginItemWarm(uint32_t mesh, bool new_content, bool& fresh) {
+  fresh = false;
+  if (!skate3::world_loading::IsSkate2Gameplay() ||
+      !REXCVAR_GET(skate3_skate2_worker_item_cores)) return 0;
+  std::lock_guard lock(g_item_cache_mutex);
+  // At the cap, new addresses fall back to the original walk. Never free a
+  // whole warm set on the guest's activation path; existing lifetimes remain.
+  if (g_item_warm.size() >= kItemCacheCap && !g_item_warm.contains(mesh)) return 0;
+  auto& slot = g_item_warm[mesh];
+  if (new_content || !slot.generation) {
+    if (slot.ready) { slot.ready.reset(); --g_item_warm_ready; }
+    slot.generation = ++g_item_warm_generation;
+    slot.in_flight = false;
+  }
+  // GPU registration dedup is independent of metadata readiness. If the
+  // early walk could not prove its bindings, activation may now have them.
+  // Coalesce clone registrations while exactly one attempt is in flight.
+  fresh = !slot.ready && !slot.in_flight;
+  if (fresh) {
+    slot.in_flight = true;
+    g_item_warm_stats.requested.fetch_add(1, std::memory_order_relaxed);
+    if (!new_content) g_item_warm_stats.late.fetch_add(1, std::memory_order_relaxed);
+  }
+  static bool logged = false;  // protected by the item-cache mutex
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("native-scene: NSV worker item-core warming enabled (bounded input proofs)");
+  }
+  return slot.generation;
+}
+
+bool TryWarmedItemCore(uint8_t* base, uint32_t mesh, DrawItem& item,
+                       ItemBindingWatch& watch) {
+  if (!skate3::world_loading::IsSkate2Gameplay() ||
+      !REXCVAR_GET(skate3_skate2_worker_item_cores)) return false;
+  std::unique_ptr<WarmedItemCore> ready;
+  uint64_t generation = 0;
+  {
+    std::lock_guard lock(g_item_cache_mutex);
+    const auto it = g_item_warm.find(mesh);
+    if (it == g_item_warm.end() || !it->second.ready) return false;
+    generation = it->second.generation;
+    ready = std::move(it->second.ready);  // exclusive ownership, one shot
+    --g_item_warm_ready;
+  }
+  // Guarded guest reads and payload sampling only touch the owned candidate.
+  // Don't block workers or live-cache readers for the entire proof/fingerprint.
+  // Recheck the arena generation AFTER those reads, before accepting it.
+  if (!ready->proof.Matches([&](uint32_t address, void* dst, uint32_t size) {
+        return GuestTryCopy(dst, base + address, size);
+      }) || !ComputeItemFingerprint(base, ready->item)) return false;
+  {
+    std::lock_guard lock(g_item_cache_mutex);
+    const auto it = g_item_warm.find(mesh);
+    if (it == g_item_warm.end() || it->second.generation != generation) return false;
+  }
+  // Keep donated HOST capacity across the one-shot core move. Prepared cores
+  // contain no instance draws; the current list is still read fresh below.
+  if (item.draws.empty() && ready->item.draws.empty()) {
+    auto empty_draws = std::move(item.draws);
+    item = std::move(ready->item);
+    item.draws = std::move(empty_draws);
+  } else {
+    item = std::move(ready->item);
+  }
+  watch = ready->watch;
+  skate3::perf_recorder::NoteSceneCacheWork(skate3::perf_recorder::SceneCacheWork::kWarmReuse);
+  static bool logged = false;  // guest render thread only
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("native-scene: NSV worker item core reused (generation and bindings validated)");
+  }
+  return true;
+}
+
+
+uint64_t NextItemCacheRefresh(uint64_t frame, uint32_t mesh, uint32_t period,
+                             bool stagger) {
+  if (!stagger) return frame + period;
+  // Both periods are powers of two. Mix out the aligned address bits, and
+  // choose the next phase strictly AFTER this frame, never beyond period.
+  uint32_t phase = mesh;
+  phase ^= phase >> 16;
+  phase *= 0x7FEB352Du;
+  phase ^= phase >> 15;
+  phase *= 0x846CA68Bu;
+  phase ^= phase >> 16;
+  return frame + 1 + ((phase - uint32_t(frame + 1)) & (period - 1));
+}
+
+bool ItemChannelsPending(const DrawItem& item) {
+  return item.diffuse_tex == 0 ||
+         (item.packed_lightmap && (item.tex_missing & 6u) != 0);
+}
 
 void InvalidateCachedItem(uint32_t mesh) {
   std::lock_guard<std::mutex> lock(g_item_cache_mutex);
@@ -2995,6 +3198,90 @@ void InvalidateCachedItem(uint32_t mesh) {
 void ClearItemCache() {
   std::lock_guard<std::mutex> lock(g_item_cache_mutex);
   g_item_cache.clear();
+  g_item_warm.clear();
+  g_item_warm_fifo.clear();
+  g_item_warm_ready = 0;
+  // Lock order: item-cache -> queue. No queue owner calls back into the
+  // item cache while holding the queue lock. Old retry tokens reject later.
+  std::lock_guard queue_lock(g_prewarm_mutex);
+  g_item_core_queue.clear();
+  g_item_core_retry.clear();
+  ++g_item_core_epoch;
+  g_item_core_pending.store(0, std::memory_order_relaxed);
+  g_item_core_queued.store(0, std::memory_order_relaxed);
+}
+
+bool ItemWarmAttemptCurrent(uint32_t mesh, uint64_t generation) {
+  if (!generation) return false;
+  std::lock_guard lock(g_item_cache_mutex);
+  const auto it = g_item_warm.find(mesh);
+  return it != g_item_warm.end() && it->second.generation == generation &&
+         it->second.in_flight;
+}
+
+void FinishItemWarmAttempt(uint32_t mesh, uint64_t generation) {
+  if (!generation) return;
+  std::lock_guard lock(g_item_cache_mutex);
+  const auto it = g_item_warm.find(mesh);
+  if (it != g_item_warm.end() && it->second.generation == generation) {
+    it->second.in_flight = false;
+    g_item_warm_stats.cancelled.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void PublishWarmedItemCore(uint8_t* base, uint64_t generation, const DrawItem& item,
+                           const ItemBindingWatch& watch, ItemCoreProof&& proof) {
+  if (!generation) return;
+  g_item_warm_stats.attempted.fetch_add(1, std::memory_order_relaxed);
+  bool usable = true;
+  if (item.skinned || item.ropa || item.pos_fmt != 57 || item.char_family) {
+    g_item_warm_stats.unsupported.fetch_add(1, std::memory_order_relaxed);
+    usable = false;
+  } else if (ItemChannelsPending(item)) {
+    g_item_warm_stats.unready.fetch_add(1, std::memory_order_relaxed);
+    usable = false;
+  } else if (!proof.valid) {
+    g_item_warm_stats.invalid_proof.fetch_add(1, std::memory_order_relaxed);
+    usable = false;
+  } else if (!proof.Matches([&](uint32_t address, void* dst, uint32_t size) {
+               return GuestTryCopy(dst, base + address, size);
+             })) {
+    g_item_warm_stats.changed.fetch_add(1, std::memory_order_relaxed);
+    usable = false;
+  }
+  std::lock_guard lock(g_item_cache_mutex);
+  const auto it = g_item_warm.find(item.mesh);
+  // A reload, re-fixup, cache flush or map transition rejects old workers.
+  if (it == g_item_warm.end() || it->second.generation != generation) {
+    g_item_warm_stats.discarded.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  it->second.in_flight = false;  // a failed early proof can retry after activation
+  if (!usable || it->second.ready) return;
+  // An early unseen cohort must not permanently occupy all 2048 slots. Evict
+  // only optional prepared HOST metadata, on a worker, never the live cache or
+  // GPU content. A future use of an evicted candidate takes the original walk.
+  // Serial checks distinguish republished candidates within one arena lifetime.
+  while (!g_item_warm_fifo.empty() &&
+         (g_item_warm_ready >= 2048 || g_item_warm_fifo.size() >= 4096)) {
+    const auto oldest = g_item_warm_fifo.front();
+    g_item_warm_fifo.pop_front();
+    const auto victim = g_item_warm.find(oldest.mesh);
+    if (victim != g_item_warm.end() &&
+        victim->second.generation == oldest.generation &&
+        victim->second.ready_order == oldest.order && victim->second.ready) {
+      victim->second.ready.reset();
+      --g_item_warm_ready;
+      g_item_warm_stats.evicted.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  auto ready = std::make_unique<WarmedItemCore>();
+  ready->item = item; ready->watch = watch; ready->proof = std::move(proof);
+  it->second.ready = std::move(ready);
+  it->second.ready_order = ++g_item_warm_order;
+  g_item_warm_fifo.push_back({item.mesh, generation, it->second.ready_order});
+  ++g_item_warm_ready;
+  g_item_warm_stats.published.fetch_add(1, std::memory_order_relaxed);
 }
 
 namespace {
@@ -3013,6 +3300,7 @@ bool ItemRebound(uint8_t* base, const ItemBindingWatch& watch) {
     GuestTryLoadU32(base, watch.stream[i], &bound);
     if (bound != watch.bound[i]) {
       g_item_rebinds.fetch_add(1, std::memory_order_relaxed);
+      skate3::perf_recorder::NoteSceneCacheWork(skate3::perf_recorder::SceneCacheWork::kRebind);
       return true;
     }
   }
@@ -3022,10 +3310,16 @@ bool ItemRebound(uint8_t* base, const ItemBindingWatch& watch) {
 bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   const uint64_t frame = g_guest_frame;
   const bool prof = REXCVAR_GET(skate3_native_render_scene_perf_items);
+  auto miss = skate3::perf_recorder::SceneCacheWork::kMissAbsent;
   {
     std::lock_guard<std::mutex> lock(g_item_cache_mutex);
     auto it = g_item_cache.find(mesh);
+    if (it != g_item_cache.end())
+      miss = ItemChannelsPending(it->second.item) ?
+          skate3::perf_recorder::SceneCacheWork::kMissPending :
+          skate3::perf_recorder::SceneCacheWork::kMissRefresh;
     if (it != g_item_cache.end() && frame < it->second.rebuild_frame) {
+      miss = skate3::perf_recorder::SceneCacheWork::kMissInvalid;
       CachedItemCore& core = it->second;
       // Structural validation: the mesh's pointer fields must still match
       // the cached walk.
@@ -3061,11 +3355,15 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
             g_item_cache.erase(it);
             return false;
           }
-          core.fp_frame = frame + 4;
+          core.fp_frame = NextItemCacheRefresh(
+              frame, mesh, 4,
+              !dynamic_payload && !ItemChannelsPending(core.item) &&
+                  skate3::world_loading::IsSkate2Gameplay());
         }
         core.last_used = frame;
         item = core.item;
         g_item_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        skate3::perf_recorder::NoteSceneCacheWork(skate3::perf_recorder::SceneCacheWork::kHit);
         return true;
       }
       g_item_cache.erase(it);
@@ -3073,7 +3371,15 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   }
   const auto walk_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
   ItemBindingWatch watch;
-  const bool walked = BuildItemFromMesh(base, mesh, item, &watch);
+  skate3::perf_recorder::NoteSceneCacheWork(skate3::perf_recorder::SceneCacheWork::kWalk);
+  skate3::perf_recorder::NoteSceneCacheWork(miss);
+  bool walked = false;
+  {
+    skate3::perf_recorder::GuestSceneCacheScope walk_detail(
+        skate3::perf_recorder::SceneCacheWork::kWalk);
+    walked = TryWarmedItemCore(base, mesh, item, watch) ||
+             BuildItemFromMesh(base, mesh, item, &watch);
+  }
   if (prof) {
     g_pw_bi_walk.Add(PerfNsSince(walk_t0));
   }
@@ -3102,15 +3408,17 @@ bool BuildItemFromMeshCached(uint8_t* base, uint32_t mesh, DrawItem& item) {
   core.item = item;
   core.watch = watch;
   core.last_used = frame;
-  core.fp_frame = frame + 4;
+  const bool channels_pending = ItemChannelsPending(item);
+  const bool stagger = !item.skinned && !item.ropa && !channels_pending &&
+                       skate3::world_loading::IsSkate2Gameplay();
+  core.fp_frame = NextItemCacheRefresh(frame, mesh, 4, stagger);
   // Materials with an unresolved diffuse retry the full walk quickly: CAS
   // composites and streamed channel textures bind shortly after first sight
   // (ocean.default legitimately has no diffuse and just rebuilds often,
   // a handful of items).
   // Packed lightmap/chroma channels still unbound re-walk as quickly.
-  const bool channels_pending =
-      item.diffuse_tex == 0 || (item.packed_lightmap && (item.tex_missing & 6u) != 0);
-  core.rebuild_frame = frame + (channels_pending ? 2 : 32);
+  core.rebuild_frame = channels_pending ? frame + 2 :
+      NextItemCacheRefresh(frame, mesh, 32, stagger);
   g_item_cache[mesh] = std::move(core);
   return true;
 }
@@ -3223,6 +3531,7 @@ void ApplySkate2Material(DrawItem& item) {
 }
 
 bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
+  skate3::perf_recorder::GuestSceneGeometryScope geometry_detail;
   const uint32_t record = REX_LOAD_U32(ctx);
   if (!GuestReadableApprox(base, record)) {
     g_rej_chain.fetch_add(1, std::memory_order_relaxed);
@@ -3237,7 +3546,9 @@ bool BuildItemGeometry(uint8_t* base, uint32_t ctx, DrawItem& item) {
   }
   const bool prof = REXCVAR_GET(skate3_native_render_scene_perf_items);
   const auto core_t0 = prof ? PerfClock::now() : PerfClock::time_point{};
+  geometry_detail.BeginCache();
   const bool built = BuildItemFromMeshCached(base, mesh, item);
+  geometry_detail.EndCache();
   if (prof) {
     g_pw_bi_core.Add(PerfNsSince(core_t0));
   }
@@ -3358,9 +3669,16 @@ void RequestCharDump() {
   g_ped_bank_dump_budget.store(48, std::memory_order_release);
   g_char_dump_frames.store(4, std::memory_order_release);
 }
+namespace {
+// One manual request; no continuous submission history or guest-memory scans.
+std::atomic<uint32_t> g_visibility_submission_request{0};
+}
 void RequestLightHistory(uint32_t marker) {
+  skate3::native_cull_probe::Request(marker);
   g_light_history_marker.store(std::max(marker, 1u), std::memory_order_release);
   g_pick_request.store(true, std::memory_order_release);
+  if (skate3::world_loading::IsSkate2Gameplay())
+    g_visibility_submission_request.store(std::max(marker, 1u), std::memory_order_release);
   if (REXCVAR_GET(skate3_skate2_pedestrian_diagnostics) &&
       skate3::world_loading::IsSkate2Gameplay()) {
     RequestCharDump();
@@ -3437,33 +3755,55 @@ void OnUnregisterTexture(uint64_t guid, uint32_t texture) {
   }
 }
 
-void OnMeshRegistered(uint8_t* base, uint32_t mesh) {
-  if (mesh == 0) {
-    return;
-  }
-  // A (re-)registration is the "content changed at this address" signal;
-  // drop the cached item core so the next frame re-walks it.
+void OnMeshRegistered(uint8_t* base, uint32_t mesh, bool new_content) {
+  if (mesh == 0) return;
+  // Immediate invalidation and lifetime token semantics remain unchanged.
   InvalidateCachedItem(mesh);
-  // Publish the guest base here too: at boot the loading-screen prewarm
-  // workers run before the first gameplay frame would otherwise publish it.
+  bool warm_needed = false;
+  const uint64_t warm_generation = BeginItemWarm(mesh, new_content, warm_needed);
   g_guest_base.store(base, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lock(g_prewarm_mutex);
-  const uint64_t now = g_frames_rendered.load(std::memory_order_relaxed);
-  const auto [it, fresh] = g_prewarm_seen.try_emplace(mesh, now);
-  // 300-frame (~2 s) dedup window: activation bursts re-register the same
-  // model once per clone instance: queue it once; a re-registration past
-  // the window is a re-stream (content changed at this address) and must
-  // re-decode BEFORE its first draw or it pops in as a visible miss.
-  if (!fresh) {
-    if (now - it->second < 300) {
-      return;
+  // No thread starts outside the existing NSV worker-core gate. If optional
+  // thread creation fails, retain the old combined worker path for this request.
+  const bool independent = warm_generation &&
+      REXCVAR_GET(skate3_skate2_independent_item_cores) && EnsureItemCoreWorker();
+  bool metadata_queued = false;
+  {
+    std::lock_guard<std::mutex> lock(g_prewarm_mutex);
+    const uint64_t now = g_frames_rendered.load(std::memory_order_relaxed);
+    const auto [it, fresh] = g_prewarm_seen.try_emplace(mesh, now);
+    bool core_only = false;
+    if (!fresh) {
+      if (now - it->second < 300) {
+        if (!warm_needed) return;
+        core_only = true;
+      } else {
+        it->second = now;
+      }
     }
-    it->second = now;
+    if (independent) {
+      // The original GPU queue/cap/order/dedup is unchanged. Optional proof
+      // work has its own service capacity and cannot consume a GPU queue slot.
+      if (!core_only && g_prewarm_queue.size() + g_prewarm_core_queue.size() < 65536) {
+        g_prewarm_queue.push_back(PrewarmEntry{mesh, 60});
+        g_prewarm_cv.notify_one();
+      }
+      if (warm_needed && g_item_core_pending.load(std::memory_order_relaxed) < kItemCoreQueueCap) {
+        g_item_core_queue.push_back(ItemCoreEntry{mesh, 60, warm_generation, g_item_core_epoch});
+        g_item_core_pending.fetch_add(1, std::memory_order_relaxed);
+        g_item_core_queued.store(uint32_t(g_item_core_queue.size()), std::memory_order_relaxed);
+        g_item_core_cv.notify_one();
+        metadata_queued = true;
+      }
+    } else if (g_prewarm_queue.size() + g_prewarm_core_queue.size() < 65536) {
+      PrewarmEntry entry{mesh, 60};
+      entry.core_generation = warm_needed ? warm_generation : 0;
+      entry.core_only = core_only;
+      (core_only ? g_prewarm_core_queue : g_prewarm_queue).push_back(entry);
+      g_prewarm_cv.notify_one();
+      metadata_queued = true;
+    }
   }
-  if (g_prewarm_queue.size() < 65536) {
-    g_prewarm_queue.push_back({mesh, 60});
-    g_prewarm_cv.notify_one();
-  }
+  if (!metadata_queued && warm_needed) FinishItemWarmAttempt(mesh, warm_generation);
 }
 
 // Validate a candidate tRModelData against the layout the game's OWN
@@ -3495,7 +3835,7 @@ static bool PlausibleRModel(uint8_t* base, uint32_t model) {
 
 // Queue every optimesh-form mesh of a validated tRModelData for the prewarm
 // decode workers.
-static void QueueModelMeshes(uint8_t* base, uint32_t model) {
+static void QueueModelMeshes(uint8_t* base, uint32_t model, bool new_content) {
   uint32_t count_w = 0, table = 0;
   if (!GuestTryLoadU32(base, model + 0x30, &count_w) ||
       !GuestTryLoadU32(base, model + 0x24, &table)) {
@@ -3511,7 +3851,7 @@ static void QueueModelMeshes(uint8_t* base, uint32_t model) {
     if (entry_mat != 0) {
       continue;  // tRMeshData form (characters/props), wrong offsets
     }
-    OnMeshRegistered(base, mesh);
+    OnMeshRegistered(base, mesh, new_content);
   }
 }
 
@@ -3520,7 +3860,7 @@ void OnModelFixup(uint8_t* base, uint32_t model) {
   // the early prewarm source. The validation gate keeps non-render models
   // (and any layout drift) out of the queue.
   if (model != 0 && PlausibleRModel(base, model)) {
-    QueueModelMeshes(base, model);
+    QueueModelMeshes(base, model, true);
   }
 }
 
@@ -3554,7 +3894,7 @@ void OnAddRenderInstance(uint8_t* base, uint32_t instance) {
       !PlausibleRModel(base, model)) {
     return;  // instances without a renderable model are normal
   }
-  QueueModelMeshes(base, model);
+  QueueModelMeshes(base, model, false);
 }
 
 struct PfxCapture {
@@ -5816,6 +6156,34 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           }
         }
       }
+      // NSV: these four independent probes otherwise reread each identical
+      // shader path up to four times per draw, including draws in areas with
+      // no water/ocean/scroll material. Keep their positive family/range gates.
+      // The snapshots live only in this OnDrawDone call, so address reuse and
+      // subsequent draws always read fresh labels. Skate 3 keeps its old reads.
+      DrawShaderPaths shader_paths;
+      const bool nsv_shader_paths = skate3::world_loading::IsSkate2Gameplay();
+      const auto shader_name_has = [&](uint32_t obj, const char* needle) -> bool {
+        if (obj < 0x10000 || !GuestReadableApprox(base, obj)) return false;
+        const auto read = [&](char* text) {
+          // One guarded bounded copy replaces individual volatile byte reads.
+          // A name can end just before an unmapped page: the fallback reads
+          // only through its NUL, exactly like the original path probe.
+          if (nsv_shader_paths && GuestTryCopy(text, base + obj + 0x54, 119)) {
+            text[119] = '\0';
+            return;
+          }
+          for (int k = 0; k < 119; ++k) {
+            text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
+            if (text[k] == '\0') break;
+          }
+          text[119] = '\0';
+        };
+        if (nsv_shader_paths) return shader_paths.Contains(obj, needle, read);
+        char text[120] = {};
+        read(text);
+        return std::strstr(text, needle) != nullptr;
+      };
       // flowingwateralpha m_params + animation time (PS c11..c14, c15.x),
       // POSITIVE debug-path gate like the receiver rows: the water bank
       // keeps the whole baseenvironment receiver layout, so only the name
@@ -5824,19 +6192,8 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // the animation time is pass-global anyway.
       if (!g_water_frame_done && ps_bank != 0) {
         const auto water_ps = [&]() -> bool {
-          const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, "\\flowingwateralpha") != nullptr;
-          };
-          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
-                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+          return shader_name_has(g_cur_ps_obj.load(std::memory_order_relaxed), "\\flowingwateralpha") ||
+                 shader_name_has(g_cur_vs_obj.load(std::memory_order_relaxed), "\\flowingwateralpha");
         };
         if (water_ps()) {
           float rows[17];
@@ -5890,19 +6247,8 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // discriminate this family.
       if (!g_scroll_frame_done && ps_bank != 0) {
         const auto scroll_ps = [&]() -> bool {
-          const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, "\\scrollincandescent") != nullptr;
-          };
-          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
-                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+          return shader_name_has(g_cur_ps_obj.load(std::memory_order_relaxed), "\\scrollincandescent") ||
+                 shader_name_has(g_cur_vs_obj.load(std::memory_order_relaxed), "\\scrollincandescent");
         };
         if (scroll_ps()) {
           const float t = LoadGuestF32(base, bank + 36 * 4);        // VS c9.x
@@ -5928,19 +6274,8 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       // Same POSITIVE debug-path gating as the water rows.
       if ((!g_ocean_frame_done || !g_oceanrefl_frame_done) && ps_bank != 0) {
         const auto ps_name_has = [&](const char* needle) -> bool {
-          const auto check = [&](uint32_t obj) -> bool {
-            if (obj < 0x10000 || !GuestReadableApprox(base, obj)) {
-              return false;
-            }
-            char text[120] = {};
-            for (int k = 0; k < 119; ++k) {
-              text[k] = char(REX_LOAD_U8(obj + 0x54 + k));
-              if (text[k] == '\0') break;
-            }
-            return std::strstr(text, needle) != nullptr;
-          };
-          return check(g_cur_ps_obj.load(std::memory_order_relaxed)) ||
-                 check(g_cur_vs_obj.load(std::memory_order_relaxed));
+          return shader_name_has(g_cur_ps_obj.load(std::memory_order_relaxed), needle) ||
+                 shader_name_has(g_cur_vs_obj.load(std::memory_order_relaxed), needle);
         };
         if (!g_ocean_frame_done && ps_name_has("\\ocean_default")) {
           float c[64];
@@ -9730,31 +10065,177 @@ void WidenPublishedCamera(FrameScene& scene, float scale) {
 // pages every frame (run 158: 13,000-23,000 page faults per second
 // whenever a view held ~1,000+ records) and unmapped them at release.
 std::mutex g_scene_items_pool_mutex;
-std::vector<std::vector<DrawItem>> g_scene_items_pool;  // guarded by the mutex
+struct SceneItemStorage {
+  std::vector<DrawItem> items;
+  WorldDrawBuffers world_draws;
+};
+std::vector<SceneItemStorage> g_scene_items_pool;  // guarded by the mutex
 
-std::vector<DrawItem> TakeSceneItems() {
+std::vector<DrawItem> TakeSceneItems(WorldDrawBuffers* world_draws) {
   std::lock_guard<std::mutex> lock(g_scene_items_pool_mutex);
   if (g_scene_items_pool.empty()) {
     return {};
   }
-  std::vector<DrawItem> items = std::move(g_scene_items_pool.back());
+  std::vector<DrawItem> items = std::move(g_scene_items_pool.back().items);
+  if (world_draws) *world_draws = std::move(g_scene_items_pool.back().world_draws);
   g_scene_items_pool.pop_back();
   return items;
 }
 
 // shared_ptr deleter for published scenes (whichever thread drops the last
 // reference: the builder replacing g_scene, or the renderer).
-void RecycleScene(const FrameScene* scene) {
-  std::vector<DrawItem> items = std::move(const_cast<FrameScene*>(scene)->items);
+void RecycleScene(const FrameScene* scene, bool reuse_world_draws,
+                  WorldDrawBuffers& unused_draws) {
+  SceneItemStorage storage;
+  storage.world_draws = std::move(unused_draws);
+  storage.items = std::move(const_cast<FrameScene*>(scene)->items);
   delete scene;
-  items.clear();  // keeps the capacity
+  // Only the last reader reaches this deleter. No active scene or guest data
+  // is retained: the inner vectors are emptied before entering the pool.
+  if (reuse_world_draws) storage.world_draws.Recycle(storage.items);
+  storage.items.clear();  // keeps the capacity
   std::lock_guard<std::mutex> lock(g_scene_items_pool_mutex);
   if (g_scene_items_pool.size() < 4) {
-    g_scene_items_pool.push_back(std::move(items));
+    g_scene_items_pool.push_back(std::move(storage));
   }
 }
 
+
+namespace {
+// The render snapshot can only describe published items. This independent,
+// manual-only inventory distinguishes game submission from native rejection.
+// Registered addresses are candidates, NOT proof of residency/liveness. Every
+// diagnostic dereference is guarded; it never builds/caches/publishes an item.
+void DumpNsvSubmissions(uint8_t* base, const SubmitRecord* records, size_t count,
+                        uint32_t view, const FrameScene& scene) {
+  const uint32_t marker = g_visibility_submission_request.exchange(0, std::memory_order_acq_rel);
+  if (!marker || !skate3::world_loading::IsSkate2Gameplay()) return;
+  struct State {
+    uint32_t primary = 0, other_list = 0, other_view = 0, dynamic = 0;
+    uint32_t ctx = 0, published = 0;
+    uint64_t registered_frame = 0;
+  };
+  constexpr size_t cap = 65536;
+  std::unordered_map<uint32_t, State> meshes;
+  {
+    std::lock_guard lock(g_prewarm_mutex);
+    meshes.reserve(std::min(g_prewarm_seen.size() + count, cap));
+    for (const auto& [mesh, frame] : g_prewarm_seen) {
+      if (meshes.size() == cap) break;
+      meshes[mesh].registered_frame = frame;
+    }
+  }
+  for (size_t i = 0; i < count && i < cap; ++i) {
+    const auto& r = records[i];
+    if (r.kind > 2) continue;
+    uint32_t record = 0, mesh = 0;
+    if (!GuestTryLoadU32(base, r.a, &record) || record < 0x10000 ||
+        !GuestTryLoadU32(base, record, &mesh) || mesh < 0x10000) continue;
+    if (meshes.size() == cap && !meshes.contains(mesh)) continue;
+    auto& st = meshes[mesh];
+    if (!st.ctx) st.ctx = r.a;
+    if (r.kind == 1) {
+      if (r.c != view) ++st.other_view;
+      else if (r.b != 20160) ++st.other_list;
+      else { ++st.primary; st.ctx = r.a; }
+    } else ++st.dynamic;
+  }
+  for (const auto& item : scene.items) {
+    auto it = meshes.find(item.mesh);
+    if (it != meshes.end()) ++it->second.published;
+  }
+  char path[160];
+  std::snprintf(path, sizeof(path), "logs/submissions_%u_%lld_%llu.csv", marker,
+                static_cast<long long>(std::time(nullptr)),
+                static_cast<unsigned long long>(g_guest_frame));
+  std::ofstream out(path);
+  out.precision(9);
+  out << "marker,guest_frame,view,mesh,ctx,registered_frame,primary_records,other_list_records,"
+         "other_view_records,dynamic_records,published_items,outside_render,guid,material,"
+         "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z,"
+         "draw_count,selected_count,vdesc,vb,ib,diffuse_stream,diffuse_obj,diffuse_source_fetch\n";
+  {
+    std::lock_guard lock(g_item_cache_mutex);
+    REXLOG_INFO("native-item-warm: marker={} slots={} ready={} requested={} late={} attempted={} "
+                "published={} unready={} invalid_proof={} changed={} unsupported={} discarded={} "
+                "cancelled={} evicted={}", marker, g_item_warm.size(), g_item_warm_ready,
+                g_item_warm_stats.requested.load(), g_item_warm_stats.late.load(),
+                g_item_warm_stats.attempted.load(), g_item_warm_stats.published.load(),
+                g_item_warm_stats.unready.load(), g_item_warm_stats.invalid_proof.load(),
+                g_item_warm_stats.changed.load(), g_item_warm_stats.unsupported.load(),
+                g_item_warm_stats.discarded.load(), g_item_warm_stats.cancelled.load(),
+                g_item_warm_stats.evicted.load());
+  }
+  size_t rows = 0;
+  for (const auto& [mesh, st] : meshes) {
+    if (mesh > 0xffffffc0u) continue;
+    uint32_t head[14] = {};
+    if (!GuestTryCopy(head, base + mesh, sizeof(head))) continue;
+    DrawItem item{};
+    bool sane = true;
+    for (unsigned k = 0; k < 3; ++k) {
+      item.bbox_min[k] = std::bit_cast<float>(BSwap32(head[k]));
+      item.bbox_max[k] = std::bit_cast<float>(BSwap32(head[k + 4]));
+      sane &= std::isfinite(item.bbox_min[k]) && std::isfinite(item.bbox_max[k]) &&
+              item.bbox_max[k] >= item.bbox_min[k] &&
+              item.bbox_max[k] - item.bbox_min[k] < 50000.f;
+    }
+    if (!sane) continue;
+    item.world[0] = item.world[5] = item.world[10] = item.world[15] = 1.f;
+    const bool outside = ItemOutsideFrustum(item, scene.view_proj, 1.f);
+    if (outside && !st.primary && !st.other_list && !st.other_view && !st.dynamic) continue;
+    const uint32_t mat = BSwap32(head[kMeshMaterial / 4]);
+    uint32_t mh[3] = {};
+    if (mat < 0x10000 || mat > 0xfffffbffu ||
+        !GuestTryCopy(mh, base + mat, sizeof(mh))) continue;
+    const uint32_t n = BSwap32(mh[0]), channels = BSwap32(mh[2]);
+    uint32_t ch[32 * 8] = {};
+    if (!n || n > 32 || channels < 0x10000 || channels > 0xfffffbffu ||
+        !GuestTryCopy(ch, base + channels, n * 32)) continue;
+    uint32_t stream = 0, tex = 0;
+    uint64_t guid = 0;
+    char material[40] = {};
+    for (uint32_t i = 0; i < n; ++i) {
+      char name[32] = {};
+      GuestTryReadString(base, BSwap32(ch[i * 8]), name, sizeof(name));
+      if (std::strcmp(name, "diffuse") == 0) {
+        guid = (uint64_t(BSwap32(ch[i * 8 + 4])) << 32) | BSwap32(ch[i * 8 + 5]);
+        stream = BSwap32(ch[i * 8 + 7]);
+        if (stream >= 0x10000 && stream <= 0xfffffffbu)
+          GuestTryLoadU32(base, stream, &tex);
+      } else if (std::strcmp(name, "AttribulatorMaterialName") == 0) {
+        GuestTryReadString(base, BSwap32(ch[i * 8 + 6]), material, sizeof(material));
+      }
+    }
+    uint32_t counts = 0, fetch[6] = {};
+    if (st.ctx >= 0x10000 && st.ctx <= 0xffffffb0u)
+      GuestTryLoadU32(base, st.ctx + kCtxDrawCountU16, &counts);
+    if (tex >= 0x10000 && tex <= 0xffffffc0u)
+      GuestTryCopy(fetch, base + tex + 28, sizeof(fetch));
+    out << marker << ',' << g_guest_frame << ',' << std::hex << view << ',' << mesh << ','
+        << st.ctx << ',' << std::dec << st.registered_frame << ',' << st.primary << ','
+        << st.other_list << ',' << st.other_view << ',' << st.dynamic << ',' << st.published << ','
+        << outside << ',' << std::hex << guid << std::dec << ",\"";
+    for (const char c : material) { if (!c) break; if (c == '"') out << '"'; out << c; }
+    out << '\"';
+    for (float f : item.bbox_min) out << ',' << f;
+    for (float f : item.bbox_max) out << ',' << f;
+    out << ',' << (counts >> 16) << ',' << (counts & 0xffffu) << ',' << std::hex
+        << BSwap32(head[kMeshVertexDescriptor / 4]) << ',' << BSwap32(head[kMeshVertexBuffer / 4])
+        << ',' << BSwap32(head[kMeshIndexBuffer / 4]) << ',' << stream << ',' << tex << ',';
+    for (unsigned i = 0; i < 6; ++i) { if (i) out << ';'; out << BSwap32(fetch[i]); }
+    out << std::dec << '\n';
+    ++rows;
+  }
+  out.flush();
+  if (out) REXLOG_WARN("native-submissions: marker={} rows={} registered_candidates={} records={} -> {}",
+                       marker, rows, meshes.size(), count, path);
+  else REXLOG_WARN("native-submissions: could not write {}", path);
+}
+}  // namespace
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
+  skate3::native_cull_probe::OnGuestFrame(g_guest_frame + 1);
   if (!SceneEnabled()) {
     return;
   }
@@ -9767,6 +10248,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // guest base from the very first natively rendered boot frame.
   g_guest_base.store(base, std::memory_order_relaxed);
   ++g_guest_frame;  // paces the world-item cache revalidation
+  skate3::perf_recorder::GuestSceneScope scene_detail(
+      skate3::world_loading::IsSkate2Gameplay(), g_capture_frame_ns, uint32_t(count));
   // Perf telemetry: guest frame interval + this frame's capture-hook cost.
   static PerfClock::time_point s_last_frame_tp{};
   // Previous frame's phase costs, for the slow-frame attribution below (a
@@ -9958,8 +10441,41 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
 
   FrameScene scene;
-  scene.items = TakeSceneItems();
-  scene.items.reserve(count);
+  const bool nsv_items = skate3::world_loading::IsSkate2Gameplay();
+  const bool reuse_world_draws = nsv_items && REXCVAR_GET(skate3_skate2_world_item_storage);
+  WorldDrawBuffers world_draw_buffers;
+  scene.items = TakeSceneItems(reuse_world_draws ? &world_draw_buffers : nullptr);
+  if (reuse_world_draws) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("native-scene: NSV world-item storage reuse enabled (fresh draw lists, bounded host buffers)");
+    }
+  }
+  const bool geometric_items = REXCVAR_GET(skate3_native_scene_item_reserve_growth) &&
+      (!nsv_items || REXCVAR_GET(skate3_skate2_scene_item_reserve_growth));
+  if (nsv_items || geometric_items) {
+    const size_t before_capacity = scene.items.capacity();
+    const size_t reserve_target = SceneItemReserveTarget(
+        before_capacity, count, scene.items.max_size(), geometric_items);
+    const bool reserve_timed = reserve_target > before_capacity &&
+                               skate3::perf_recorder::SceneDetailEnabled(true);
+    const auto reserve_start = reserve_timed ? PerfClock::now() : PerfClock::time_point{};
+    scene.items.reserve(reserve_target);
+    const uint64_t reserve_ns = reserve_timed ? PerfNsSince(reserve_start) : 0;
+    skate3::perf_recorder::NoteSceneItemCapacity(
+        scene.items.capacity(), reserve_target > before_capacity ?
+            uint64_t(scene.items.capacity()) * sizeof(DrawItem) : 0, reserve_ns);
+    if (geometric_items) {
+      static bool logged = false;  // guest scene builder only
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("native-scene: scene-item capacity growth enabled (geometric reserve)");
+      }
+    }
+  } else {
+    scene.items.reserve(count);
+  }
   std::unordered_set<uint32_t> seen;
   // Pre-size the per-frame bookkeeping: these fill with thousands of
   // entries every frame, and growing from empty rehashes repeatedly.
@@ -10009,6 +10525,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       scene.occl_build_skipped.reserve(s_build_culled.size());
     }
   }
+  skate3::perf_recorder::GuestScenePhaseScope world_detail(
+      skate3::perf_recorder::SceneBuildPhase::kWorld);
   for (size_t i = 0; i < count; ++i) {
     const SubmitRecord& r = records[i];
     // Primary opaque list of the chosen view only; other lists (shadow
@@ -10129,7 +10647,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     if (!REXCVAR_GET(skate3_native_render_scene_world_items)) {
       continue;
     }
-    DrawItem item;
+    SceneWorldItemSlot world_slot(scene.items, reuse_world_draws, world_draw_buffers);
+    DrawItem& item = world_slot.item();
     if (BuildItemGeometry(base, r.a, item)) {
       if (item.skinned) {
         // Skinned meshes reached through the world sort lists (flags,
@@ -10157,7 +10676,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         sortlist_local_by_ctx.try_emplace(r.a, std::move(item));
         continue;
       }
-      scene.items.push_back(std::move(item));
+      world_slot.Keep();
     } else {
       // Silent world-item drop attribution (the F7 rings show world meshes
       // MISSING for 8-11 frame episodes, the mesh
@@ -10178,6 +10697,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  world_detail.End();
+  skate3::perf_recorder::GuestScenePhaseScope merge_detail(
+      skate3::perf_recorder::SceneBuildPhase::kMerge);
   if (wloop_prof) {
     g_pw_bi_wloop.Add(PerfNsSince(wloop_t0));
   }
@@ -11190,6 +11712,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     skate3::native_entity::EmitStats();
   }
 
+  merge_detail.End();
   // Camera re-timing (see SmoothCamera): replace the guest's sim-stepped
   // pose with a host-clock-interpolated one so panning is smooth at render
   // rate. All consumers (items, sky follow, sorting, outline) use the
@@ -11299,6 +11822,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       g_synpan_active.load(std::memory_order_relaxed) == 0 &&
       !REXCVAR_GET(skate3_native_render_scene_freecam)) {
     const auto retain_t0 = PerfClock::now();
+    skate3::perf_recorder::GuestScenePhaseScope retain_detail(
+        skate3::perf_recorder::SceneBuildPhase::kRetain);
     uint64_t retain_appended = 0;
     if (g_retained_clear.exchange(false, std::memory_order_relaxed)) {
       g_retained_items.clear();
@@ -11307,7 +11832,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     const uint64_t now = g_guest_frame;
     std::unordered_set<uint64_t> submitted;
     const size_t published = scene.items.size();
-    submitted.reserve(published);
+    if (!nsv_items) submitted.reserve(published);
     for (size_t i = 0; i < published; ++i) {
       const DrawItem& it = scene.items[i];
       if (it.skinned || it.cloth_quads || it.ropa || it.pending ||
@@ -11315,7 +11840,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       const uint64_t key = SynPanItemKey(it);
-      submitted.insert(key);
+      if (!nsv_items) submitted.insert(key);
       if (g_retained_items.size() >= 20000 &&
           g_retained_items.find(key) == g_retained_items.end()) {
         continue;  // growth backstop
@@ -11338,7 +11863,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     // far beyond the smoothing lag it needs to cover.
     constexpr uint64_t kRetainTtlFrames = 90;
     for (auto rit = g_retained_items.begin(); rit != g_retained_items.end();) {
-      if (submitted.find(rit->first) != submitted.end()) {
+      // NSV already stamped this exact retained key above. Avoid allocating,
+      // hashing and freeing a second node for every static item every frame.
+      // All existing TTL, frustum, fingerprint and registration gates remain.
+      if (nsv_items ? rit->second.last_seen == now :
+                      submitted.find(rit->first) != submitted.end()) {
         ++rit;
         continue;
       }
@@ -11372,6 +11901,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       return skate3::world_loading::IsInheritedBackdrop(item.diffuse_guid, item.env_family);
     });
   }
+  DumpNsvSubmissions(base, records, count, view, scene);
   TraceBamVisualScene(scene, guest_vp);
   TraceBamGroundScene(scene, guest_vp);
 
@@ -12011,6 +12541,18 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
     }
   }
 
+  if (skate3::perf_recorder::SceneCountersActive()) {
+    skate3::perf_recorder::NoteSceneWarmState(
+        g_item_core_started.load(std::memory_order_relaxed),
+        g_item_warm_stats.published.load(std::memory_order_relaxed),
+        g_item_warm_stats.unready.load(std::memory_order_relaxed),
+        g_item_warm_stats.invalid_proof.load(std::memory_order_relaxed) +
+            g_item_warm_stats.changed.load(std::memory_order_relaxed) +
+            g_item_warm_stats.unsupported.load(std::memory_order_relaxed),
+        g_item_core_queued.load(std::memory_order_relaxed),
+        g_item_core_pending.load(std::memory_order_relaxed));
+  }
+
   // The draw-time fetch map served this frame's item builds (streamed-artwork
   // diffuse override); next frame's draws repopulate it. Cleared HERE, not at
   // the top with the other per-frame structures; the world items that
@@ -12145,7 +12687,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                           std::memory_order_relaxed);
   std::lock_guard<std::mutex> lock(g_scene_mutex);
   scene.generation = ++g_generation;
-  g_scene = std::shared_ptr<const FrameScene>(new FrameScene(std::move(scene)), RecycleScene);
+  g_scene = std::shared_ptr<const FrameScene>(new FrameScene(std::move(scene)),
+      [reuse_world_draws, unused_draws = std::move(world_draw_buffers)]
+      (const FrameScene* old_scene) mutable {
+        RecycleScene(old_scene, reuse_world_draws, unused_draws);
+      });
 }
 
 // StartRecording / WriteRecording: native/skate3_native_diagnostics.cpp.

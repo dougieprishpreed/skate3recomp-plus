@@ -1,3 +1,13 @@
+// A covered world-shadow tap retains the original comparison. NSV's finite
+// map must not extend an edge occluder onto props outside its footprint.
+float DynObjectWorldTap(int2 p, float depth, bool bounded) {
+  if (bounded && (any(p < int2(0, 0)) || any(p > int2(511, 511)))) {
+    return 1.0;
+  }
+  return decal_art.Load(int3(clamp(p, int2(0, 0), int2(511, 511)), 0)).x >= depth
+             ? 1.0 : 0.0;
+}
+
 // dynamicobject.fx props (cam_pos.w = -(20 + variant): -21 default,
 // -22 alphatest). Rigid movable objects (dispensers, dumpsters, benches,
 // cans). Lit with the game's own dynamicobject model (verified exact
@@ -76,26 +86,15 @@ float4 ShadeDynObject(VSOut i, float4 albedo) {
     float2 st = wuv * 512.0 - 0.5;
     float2 fw = frac(st);
     int2 b0 = int2(floor(st));
+    // Bit16 is supplied only on NSV dynobj draws. Per-tap neutral borders
+    // retain the existing bilinear transition over one texel (~11 cm),
+    // rather than a hard cutoff of the whole pixel at the map boundary.
+    bool bounded = (v2f & 16u) != 0u;
     float4 t;
-    t.x = decal_art.Load(int3(clamp(b0, int2(0, 0), int2(511, 511)), 0)).x >=
-                  rdw
-              ? 1.0
-              : 0.0;
-    t.y = decal_art.Load(int3(clamp(b0 + int2(1, 0), int2(0, 0),
-                                    int2(511, 511)),
-                              0)).x >= rdw
-              ? 1.0
-              : 0.0;
-    t.z = decal_art.Load(int3(clamp(b0 + int2(0, 1), int2(0, 0),
-                                    int2(511, 511)),
-                              0)).x >= rdw
-              ? 1.0
-              : 0.0;
-    t.w = decal_art.Load(int3(clamp(b0 + int2(1, 1), int2(0, 0),
-                                    int2(511, 511)),
-                              0)).x >= rdw
-              ? 1.0
-              : 0.0;
+    t.x = DynObjectWorldTap(b0, rdw, bounded);
+    t.y = DynObjectWorldTap(b0 + int2(1, 0), rdw, bounded);
+    t.z = DynObjectWorldTap(b0 + int2(0, 1), rdw, bounded);
+    t.w = DynObjectWorldTap(b0 + int2(1, 1), rdw, bounded);
     world = lerp(lerp(t.x, t.y, fw.x), lerp(t.z, t.w, fw.x), fw.y);
   }
   float shadow = min(s * (ndl >= 0.0 ? 1.0 : 0.0), max(world, dyn_misc.y));

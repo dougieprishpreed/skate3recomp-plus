@@ -1,5 +1,5 @@
 diff --git a/include/rex/graphics/native_rhi.h b/include/rex/graphics/native_rhi.h
-index d2bdcd4..cbfc0de 100644
+index d2bdcd4..4d1b9ae 100644
 --- a/include/rex/graphics/native_rhi.h
 +++ b/include/rex/graphics/native_rhi.h
 @@ -140,6 +140,10 @@ enum class CompareFunc : uint32_t {
@@ -13,7 +13,29 @@ index d2bdcd4..cbfc0de 100644
  };
  
  enum class CullMode : uint32_t {
-@@ -378,6 +382,9 @@ struct GraphicsPipelineDesc {
+@@ -197,6 +201,9 @@ enum class Visibility : uint32_t {
+ class Buffer {
+  public:
+   virtual uint64_t size() const = 0;
++  // A static upload may only be mapped before its first PrepareBufferUpload.
++  // It must not enter a mutable upload-buffer reuse pool.
++  virtual bool is_static_upload() const { return false; }
+ 
+  protected:
+   virtual ~Buffer() = default;
+@@ -250,6 +257,11 @@ struct BufferDesc {
+   uint64_t size = 0;
+   HeapKind heap = HeapKind::kDefault;
+   BufferBindClass bind_class = BufferBindClass::kFull;
++  // Optional Vulkan upload vertex/index specialization: host staging plus
++  // a device-local target. Map/Unmap fill it once; PrepareBufferUpload records
++  // the copy before drawing and retires staging on the submission timeline.
++  // Other backends ignore this hint and keep normal upload semantics.
++  bool static_upload = false;
+ };
+ 
+ struct TextureDesc {
+@@ -378,6 +390,9 @@ struct GraphicsPipelineDesc {
    DepthStateDesc depth;
    CullMode cull = CullMode::kNone;
    bool depth_clip = true;
@@ -23,6 +45,51 @@ index d2bdcd4..cbfc0de 100644
    Format rtv_format = Format::kUnknown;  // kUnknown = no color target
    Format dsv_format = Format::kUnknown;  // kUnknown = no depth target
    uint32_t sample_count = 1;
+@@ -426,8 +441,18 @@ enum class ProfileStage : uint8_t {
+ // root-constant and binding state.
+ // ---------------------------------------------------------------------------
+ 
++struct TextureTableLookupStats {
++  uint32_t lookups = 0, hits = 0;
++};
++
+ class Cmd {
+  public:
++  // Optional acceleration of existing texture-table descriptor lookups.
++  // Does not change bindings or command recording. Caller scopes opt-in to
++  // its callback; backends without the index retain the normal lookup path.
++  virtual void PrepareBufferUpload(Buffer* buffer) { (void)buffer; }
++  virtual void SetTextureTableLookupCache(bool enabled) { (void)enabled; }
++  virtual TextureTableLookupStats GetTextureTableLookupStats() const { return {}; }
+   virtual void SetBindingLayout(BindingLayout* layout) = 0;
+   virtual void SetPipeline(Pipeline* pipeline) = 0;
+ 
+@@ -546,6 +571,25 @@ class Device {
+   virtual uint64_t CurrentSubmission() const = 0;
+   virtual uint64_t CompletedSubmission() const = 0;
+ 
++  // Optional borrowed sampled view of the CURRENT guest output. Render thread
++  // only. Ask again every callback: a wrapper may be evicted/recreated between
++  // callbacks. The backend owns the result; never DestroyDeferred it. nullptr
++  // means unsupported/unavailable and permits the caller's ordinary owned view.
++  // reused reports an existing wrapper view, without another driver create.
++  virtual TextureView* BorrowGuestOutputView(Texture*, bool* reused) {
++    if (reused) *reused = false;
++    return nullptr;
++  }
++
++  // Optional worker-thread view creation for an exclusively owned texture.
++  // No command recording or descriptor-table allocation. The caller keeps
++  // the texture alive until this returns and retires any discarded view on
++  // the render thread. nullptr means unsupported/failed: use the existing
++  // render-thread CreateTextureView at commit.
++  virtual TextureView* CreateTextureViewAsync(Texture*, const TextureViewDesc&) {
++    return nullptr;
++  }
++
+  protected:
+   virtual ~Device() = default;
+ };
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index 5d607c6..292dd0f 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -431,10 +498,29 @@ index cc9175e..9ced9ea 100644
    // The objects stay allocated until the flush so stale binding-cache keys
    // can never collide with a newly created view at the same address.
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 69863ce..ed44128 100644
+index 69863ce..098ec09 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
-@@ -6200,6 +6200,14 @@ void VulkanCommandProcessor::ResolveGpuTimestampFrame(VkCommandBuffer command_bu
+@@ -2849,7 +2849,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           native_context.device = native_rhi_device_;
+           native_context.cmd = NativeRhiBeginFrame(
+               native_rhi_device_, vulkan_context.image(), vulkan_context.image_view(),
+-              vulkan_context.image_ever_written_previously(), guest_output_width,
++              vulkan_context.image_ever_written_previously(), guest_output_image_version,
++              guest_output_width,
+               guest_output_height, &native_context.guest_output);
+           // Attribute the native pass's GPU time to its own profile bucket
+           // (it otherwise smears into the last emulated draw's bucket).
+@@ -3374,7 +3375,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           // is in the presenter's internal layout once barriers flush.
+           native_context.cmd = NativeRhiBeginFrame(
+               native_rhi_device_, vulkan_context.image(), vulkan_context.image_view(), true,
+-              guest_output_width, guest_output_height, &native_context.guest_output);
++              guest_output_image_version, guest_output_width, guest_output_height, &native_context.guest_output);
+           InvokeNativeGuestOutputPostProcessor(native_context);
+           NativeRhiEndFrame(native_rhi_device_);
+         }
+@@ -6200,6 +6201,14 @@ void VulkanCommandProcessor::ResolveGpuTimestampFrame(VkCommandBuffer command_bu
    }
  
    const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
@@ -450,15 +536,16 @@ index 69863ce..ed44128 100644
    // waiting hangs the device forever if any query in the range never gets its
    // timestamp written (this happened with bucket timestamps at 3x resolution
 diff --git a/src/graphics/vulkan/native_rhi_vulkan.cpp b/src/graphics/vulkan/native_rhi_vulkan.cpp
-index 28fd5b0..77808e6 100644
+index 28fd5b0..cea6e92 100644
 --- a/src/graphics/vulkan/native_rhi_vulkan.cpp
 +++ b/src/graphics/vulkan/native_rhi_vulkan.cpp
-@@ -30,10 +30,13 @@
+@@ -30,20 +30,33 @@
  
  #include <algorithm>
  #include <chrono>
 +#include <condition_variable>
  #include <cstring>
++#include <functional>
  #include <map>
  #include <mutex>
  #include <string>
@@ -467,7 +554,26 @@ index 28fd5b0..77808e6 100644
  #include <unordered_set>
  #include <utility>
  #include <vector>
-@@ -229,6 +232,12 @@ VkCompareOp ToVkCompare(nrhi::CompareFunc func) {
+ 
++#include <rex/cvar.h>
+ #include <rex/graphics/vulkan/command_processor.h>
+ #include <rex/logging.h>
+ #include <rex/ui/vulkan/mem_alloc.h>
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(native_rhi_vulkan_profiling, false, "GPU/Vulkan",
++                    "Collect native Vulkan CPU timing buckets and slow-frame diagnostics")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_BOOL(native_rhi_vulkan_memory_log, false, "GPU/Vulkan",
++                    "Query and log native Vulkan heap budgets every 600 frames")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ namespace {
+ 
+@@ -229,6 +242,12 @@ VkCompareOp ToVkCompare(nrhi::CompareFunc func) {
        return VK_COMPARE_OP_LESS;
      case nrhi::CompareFunc::kLessEqual:
        return VK_COMPARE_OP_LESS_OR_EQUAL;
@@ -480,9 +586,47 @@ index 28fd5b0..77808e6 100644
      case nrhi::CompareFunc::kAlways:
      default:
        return VK_COMPARE_OP_ALWAYS;
-@@ -298,6 +307,13 @@ class NrTextureViewVulkan : public nrhi::TextureView {
+@@ -244,6 +263,7 @@ class NrDeviceVulkan;
+ class NrBufferVulkan : public nrhi::Buffer {
+  public:
+   uint64_t size() const override { return size_; }
++  bool is_static_upload() const override { return static_upload; }
+ 
+   VkBuffer buffer = VK_NULL_HANDLE;
+   VmaAllocation allocation = VK_NULL_HANDLE;
+@@ -252,6 +272,8 @@ class NrBufferVulkan : public nrhi::Buffer {
+   HeapKind heap = HeapKind::kDefault;
+   nrhi::BufferBindClass bind_class = nrhi::BufferBindClass::kFull;
+   bool device_local = false;  // memory-type DEVICE_LOCAL (diagnostics)
++  bool static_upload = false;
++  NrBufferVulkan* staging = nullptr;  // separately live/retired, like texture uploads
+ };
+ 
+ // Live-buffer placement totals (bimodal-FPS diagnosis): bytes of nrhi
+@@ -262,6 +284,8 @@ std::atomic<uint64_t> g_buf_bytes_upload_host{0};
+ std::atomic<uint64_t> g_buf_bytes_default_dl{0};
+ std::atomic<uint64_t> g_buf_bytes_default_host{0};
+ 
++class NrTextureViewVulkan;
++
+ class NrTextureVulkan : public nrhi::Texture {
+  public:
+   uint32_t width() const override { return desc.width; }
+@@ -283,6 +307,9 @@ class NrTextureVulkan : public nrhi::Texture {
+   VkImageView attachment_view = VK_NULL_HANDLE;
+   bool attachment_view_owned = false;
+   bool is_guest_output = false;
++  NrTextureViewVulkan* sampled_output_view = nullptr;  // wrapper-owned, render thread
++  uint64_t guest_output_version = 0;
++
+   // Latched pending clear, consumed as loadOp CLEAR at the next render pass
+   // begin targeting this texture (or flushed as an empty CLEAR pass).
+   bool pending_clear = false;
+@@ -297,7 +324,15 @@ class NrTextureVulkan : public nrhi::Texture {
+ class NrTextureViewVulkan : public nrhi::TextureView {
   public:
    VkImageView view = VK_NULL_HANDLE;
++  bool owns_view = true;  // false only for the presenter-owned guest output view
    NrTextureVulkan* texture = nullptr;
 +  // Ids of the cached texture-table descriptor sets whose key holds this
 +  // view (render thread only), so destroying the view retires exactly those
@@ -494,7 +638,7 @@ index 28fd5b0..77808e6 100644
  };
  
  class NrBindingLayoutVulkan : public nrhi::BindingLayout {
-@@ -358,6 +374,8 @@ class NrPipelineVulkan : public nrhi::Pipeline {
+@@ -358,6 +393,8 @@ class NrPipelineVulkan : public nrhi::Pipeline {
    nrhi::DepthStateDesc depth;
    nrhi::CullMode cull = nrhi::CullMode::kNone;
    bool depth_clip = true;
@@ -503,7 +647,85 @@ index 28fd5b0..77808e6 100644
    Format rtv_format = Format::kUnknown;
    Format dsv_format = Format::kUnknown;
    uint32_t sample_count = 1;
-@@ -519,6 +537,7 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -370,11 +407,13 @@ class NrPipelineVulkan : public nrhi::Pipeline {
+ // Per-frame render-thread CPU accounting for the backend's own work (the
+ // app's timers cover RenderScene minus this layer; sustained multi-ms frames
+ // here showed up as the "render=13ms, items=0.6ms" gap). Reported from
+-// EndFrame when a frame exceeds the threshold, throttled.
++// EndFrame when a frame exceeds the threshold, throttled. Opt-in: disabled
++// scopes do not read the clock, including per-draw pass/constant operations.
+ struct NrFrameProf {
+   struct Bucket {
+     uint64_t us = 0;
+     uint32_t count = 0;
++    bool enabled = false;
+   };
+   Bucket pass_open;
+   Bucket flush_barriers;
+@@ -386,7 +425,14 @@ struct NrFrameProf {
+   Bucket const_slice;
+   Bucket pipeline_build;
+   Bucket drain;
+-  void Reset() { *this = NrFrameProf{}; }
++  void Reset(bool enabled) {
++    *this = NrFrameProf{};
++    if (enabled) {
++      Bucket* buckets[] = {&pass_open, &flush_barriers, &copies, &table_miss, &set0_miss,
++                           &view_destroy, &view_create, &const_slice, &pipeline_build, &drain};
++      for (Bucket* bucket : buckets) bucket->enabled = true;
++    }
++  }
+   uint64_t Total() const {
+     return pass_open.us + flush_barriers.us + copies.us + table_miss.us + set0_miss.us +
+            view_destroy.us + view_create.us + const_slice.us + pipeline_build.us + drain.us;
+@@ -395,22 +441,29 @@ struct NrFrameProf {
+ 
+ class NrProfScope {
+  public:
+-  NrProfScope(NrFrameProf::Bucket& bucket)
+-      : bucket_(bucket), start_(std::chrono::steady_clock::now()) {}
++  NrProfScope(NrFrameProf::Bucket& bucket) : bucket_(bucket.enabled ? &bucket : nullptr) {
++    if (bucket_) start_ = std::chrono::steady_clock::now();
++  }
+   ~NrProfScope() {
+-    bucket_.us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+-                               std::chrono::steady_clock::now() - start_)
+-                               .count());
+-    ++bucket_.count;
++    if (!bucket_) return;
++    bucket_->us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                std::chrono::steady_clock::now() - start_)
++                                .count());
++    ++bucket_->count;
+   }
+ 
+  private:
+-  NrFrameProf::Bucket& bucket_;
+-  std::chrono::steady_clock::time_point start_;
++  NrFrameProf::Bucket* bucket_;
++  std::chrono::steady_clock::time_point start_{};
+ };
+ 
+ class NrCmdVulkan : public nrhi::Cmd {
+  public:
++  void PrepareBufferUpload(nrhi::Buffer* buffer) override;
++  void SetTextureTableLookupCache(bool enabled) override { table_lookup_enabled_ = enabled; }
++  nrhi::TextureTableLookupStats GetTextureTableLookupStats() const override {
++    return table_lookup_stats_;
++  }
+   void SetBindingLayout(nrhi::BindingLayout* layout) override;
+   void SetPipeline(nrhi::Pipeline* pipeline) override;
+   void SetRootConstants(uint32_t param, uint32_t count, const void* values,
+@@ -476,6 +529,8 @@ class NrCmdVulkan : public nrhi::Cmd {
+   // Texture tables, by table index within the layout.
+   NrTextureViewVulkan* table_views_[nrhi::kMaxBindingParams][nrhi::kMaxTextureTableSize] = {};
+   bool table_dirty_[nrhi::kMaxBindingParams] = {};
++  bool table_lookup_enabled_ = false;
++  nrhi::TextureTableLookupStats table_lookup_stats_;
+ 
+   // Render target state.
+   NrTextureVulkan* rt_color_ = nullptr;
+@@ -519,6 +574,7 @@ class NrDeviceVulkan : public nrhi::Device {
      // Thread-safe allocator: nrhi creation APIs are called from decode
      // worker threads concurrently with the render thread.
      allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device_, /*externally_synchronized=*/false);
@@ -511,7 +733,7 @@ index 28fd5b0..77808e6 100644
  
      // The internal root-constant ring UBO: kRingRegions regions cycled by
      // frame index (deeper than the CP's 3 frames in flight), persistently
-@@ -553,6 +572,16 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -553,6 +609,16 @@ class NrDeviceVulkan : public nrhi::Device {
      const VkDevice device = vulkan_device_->device();
      FlushDissolvedViews();
      DrainRetired(~0ull);
@@ -528,7 +750,39 @@ index 28fd5b0..77808e6 100644
      for (auto& entry : set0_sets_) {
        dfn.vkFreeDescriptorSets(device, entry.second.pool, 1, &entry.second.set);
      }
-@@ -907,10 +936,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -582,7 +648,7 @@ class NrDeviceVulkan : public nrhi::Device {
+           live_pipelines_.size(), live_shaders_.size());
+     }
+     for (NrTextureViewVulkan* v : live_views_) {
+-      if (v->view != VK_NULL_HANDLE) {
++      if (v->owns_view && v->view != VK_NULL_HANDLE) {
+         dfn.vkDestroyImageView(device, v->view, nullptr);
+       }
+       delete v;
+@@ -662,6 +728,11 @@ class NrDeviceVulkan : public nrhi::Device {
+   // --- thread-safe creation / mapping ---
+ 
+   nrhi::Buffer* CreateBuffer(const nrhi::BufferDesc& desc) override {
++    if (desc.static_upload && desc.heap == HeapKind::kUpload &&
++        desc.bind_class == nrhi::BufferBindClass::kVertexIndex && desc.size) {
++      if (auto* buffer = CreateStaticMeshUpload(desc)) return buffer;
++      // Keep the original coherent upload allocation as the failure fallback.
++    }
+     VkBufferCreateInfo info = {};
+     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+@@ -841,6 +912,10 @@ class NrDeviceVulkan : public nrhi::Device {
+   void DestroyDeferred(nrhi::Buffer* buffer) override {
+     if (buffer == nullptr) return;
+     auto* b = static_cast<NrBufferVulkan*>(buffer);
++    if (b->staging) {
++      DestroyDeferred(b->staging);
++      b->staging = nullptr;
++    }
+     // Retire cached set-0 descriptor sets whose buffer tuple references this
+     // buffer. set0_sets_ is render-thread-only, like the D3D12 backend's
+     // bindings_: buffer destruction of bound buffers happens on the render
+@@ -907,10 +982,9 @@ class NrDeviceVulkan : public nrhi::Device {
      if (view == nullptr) return;
      // Destruction is batched: the view object stays allocated (so its
      // address cannot be reused by a new view while stale cache keys still
@@ -542,7 +796,7 @@ index 28fd5b0..77808e6 100644
      auto* v = static_cast<NrTextureViewVulkan*>(view);
      {
        std::lock_guard<std::mutex> lock(mutex_);
-@@ -921,31 +949,23 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -921,34 +995,29 @@ class NrDeviceVulkan : public nrhi::Device {
  
    // Render thread, once per frame (and at device destruction): retire every
    // cached texture descriptor set referencing a view destroyed since the
@@ -553,6 +807,9 @@ index 28fd5b0..77808e6 100644
 +  // sweep per flush grew into milliseconds per frame while streaming).
    void FlushDissolvedViews() {
      if (dissolved_views_.empty()) return;
++    // Clear logical validity BEFORE any descriptor retirement or view-address
++    // reuse. The authoritative map and its per-view id indexes stay unchanged.
++    InvalidateTableLookupCache();
      NrProfScope prof_scope(prof_.view_destroy);
      const uint64_t submission = cp_->GetCurrentSubmission();
 -    std::unordered_set<const NrTextureViewVulkan*> dissolved(dissolved_views_.begin(),
@@ -584,8 +841,57 @@ index 28fd5b0..77808e6 100644
 +      }
        RetiredObject r;
        r.submission = submission;
-       r.view = v->view;
-@@ -1223,6 +1243,8 @@ class NrDeviceVulkan : public nrhi::Device {
+-      r.view = v->view;
++      r.view = v->owns_view ? v->view : VK_NULL_HANDLE;
+       retired_.push_back(r);
+       delete v;
+     }
+@@ -985,6 +1054,44 @@ class NrDeviceVulkan : public nrhi::Device {
+   nrhi::TextureView* CreateTextureView(nrhi::Texture* texture,
+                                        const nrhi::TextureViewDesc& desc) override {
+     NrProfScope prof_scope(prof_.view_create);
++    return CreateTextureViewUnprofiled(texture, desc);
++  }
++
++  nrhi::TextureView* BorrowGuestOutputView(nrhi::Texture* texture, bool* reused) override {
++    if (reused) *reused = false;
++    auto* t = static_cast<NrTextureVulkan*>(texture);
++    if (t == nullptr || !t->is_guest_output || t->attachment_view == VK_NULL_HANDLE) {
++      return nullptr;
++    }
++    if (t->sampled_output_view != nullptr) {
++      if (reused) *reused = true;
++      return t->sampled_output_view;
++    }
++    // The presenter's sampled/color-attachment view is already exactly the
++    // requested 2D identity-swizzled color view: mip0/layer0, one mip/layer,
++    // same output format. Reuse it, without vkCreateImageView or GPU work.
++    auto* v = new NrTextureViewVulkan();
++    v->view = t->attachment_view;
++    v->owns_view = false;
++    v->texture = t;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      live_views_.insert(v);
++    }
++    t->sampled_output_view = v;
++    return v;
++  }
++
++  nrhi::TextureView* CreateTextureViewAsync(nrhi::Texture* texture,
++                                            const nrhi::TextureViewDesc& desc) override {
++    // The worker owns this image until publishing its decode result. Vulkan
++    // view creation records no commands; live_views_ is mutex protected.
++    // Do not touch the render thread's non-atomic per-frame profiler here.
++    return CreateTextureViewUnprofiled(texture, desc);
++  }
++
++  nrhi::TextureView* CreateTextureViewUnprofiled(nrhi::Texture* texture,
++                                                const nrhi::TextureViewDesc& desc) {
+     auto* t = static_cast<NrTextureVulkan*>(texture);
+     VkImageViewCreateInfo info = {};
+     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+@@ -1223,6 +1330,8 @@ class NrDeviceVulkan : public nrhi::Device {
      pipeline->depth = desc.depth;
      pipeline->cull = desc.cull;
      pipeline->depth_clip = desc.depth_clip;
@@ -594,7 +900,16 @@ index 28fd5b0..77808e6 100644
      pipeline->rtv_format = desc.rtv_format;
      pipeline->dsv_format = desc.dsv_format;
      pipeline->sample_count = desc.sample_count;
-@@ -1274,10 +1296,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1268,20 +1377,20 @@ class NrDeviceVulkan : public nrhi::Device {
+   // --- frame handling (called from the command processor) ---
+ 
+   nrhi::Cmd* BeginFrame(VkImage guest_output_image, VkImageView guest_output_image_view,
+-                        bool guest_output_ever_written, uint32_t width, uint32_t height,
++                        bool guest_output_ever_written, uint64_t guest_output_image_version,
++                        uint32_t width, uint32_t height,
+                         nrhi::Texture** guest_output_out) {
+-    prof_.Reset();
++    prof_.Reset(REXCVAR_GET(native_rhi_vulkan_profiling));
      FlushDissolvedViews();
      {
        std::lock_guard<std::mutex> lock(mutex_);
@@ -608,7 +923,12 @@ index 28fd5b0..77808e6 100644
        DrainRetired(cp_->GetCompletedSubmission(), 256);
      }
      ++frame_index_;
-@@ -1298,18 +1319,21 @@ class NrDeviceVulkan : public nrhi::Device {
+-    if ((frame_index_ % 600) == 0) {
++    if (REXCVAR_GET(native_rhi_vulkan_memory_log) && (frame_index_ % 600) == 0) {
+       // Periodic VRAM budget attribution (bimodal-FPS diagnosis): log every
+       // heap's VMA usage vs the driver-reported budget, flagging device-local.
+       VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+@@ -1298,18 +1407,21 @@ class NrDeviceVulkan : public nrhi::Device {
                               (unsigned long long)(budgets[i].budget >> 20));
        }
        size_t retired_backlog = 0;
@@ -632,7 +952,60 @@ index 28fd5b0..77808e6 100644
      }
      ring_region_base_ = uint32_t(frame_index_ % kRingRegions) * kRingRegionSize;
      ring_region_offset_ = 0;
-@@ -1705,7 +1729,24 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1325,10 +1437,11 @@ class NrDeviceVulkan : public nrhi::Device {
+ 
+     NrTextureVulkan*& wrapper = guest_outputs_[guest_output_image];
+     if (wrapper != nullptr &&
+-        (wrapper->desc.width != width || wrapper->desc.height != height ||
++        (wrapper->guest_output_version != guest_output_image_version ||
++         wrapper->desc.width != width || wrapper->desc.height != height ||
+          wrapper->attachment_view != guest_output_image_view)) {
+-      // Same VkImage handle value, different geometry/view: a recreated
+-      // image reusing the handle. Drop the stale wrapper (image + view are
++      // A presenter lifetime changed, even if image AND view handle values
++      // and geometry were reused. Drop the stale wrapper (image + view are
+       // presenter-owned) and its framebuffers.
+       DestroyGuestOutputWrapper(wrapper);
+       wrapper = nullptr;
+@@ -1345,6 +1458,7 @@ class NrDeviceVulkan : public nrhi::Device {
+       wrapper->attachment_view = guest_output_image_view;
+       wrapper->attachment_view_owned = false;
+       wrapper->is_guest_output = true;
++      wrapper->guest_output_version = guest_output_image_version;
+       // The presenter keeps a small guest-output mailbox; evict wrappers of
+       // images it has replaced.
+       if (guest_outputs_.size() > 6) {
+@@ -1676,15 +1790,27 @@ class NrDeviceVulkan : public nrhi::Device {
+   // Cached texture-table set for (per-param set layout, ordered view tuple)
+   // with white-fallback substitution already applied by the caller.
+   VkDescriptorSet GetTableSet(VkDescriptorSetLayout set_layout,
+-                              NrTextureViewVulkan* const* views, uint32_t count) {
++                              NrTextureViewVulkan* const* views, uint32_t count,
++                              nrhi::TextureTableLookupStats* lookup_stats) {
+     TableKey key{};
+     key.layout = set_layout;
+     key.count = count;
+     for (uint32_t i = 0; i < count; ++i) {
+       key.views[i] = views[i];
+     }
++    if (lookup_stats != nullptr) {
++      ++lookup_stats->lookups;
++      const VkDescriptorSet cached = FindTableLookup(key);
++      if (cached != VK_NULL_HANDLE) {
++        ++lookup_stats->hits;
++        return cached;
++      }
++    }
+     auto it = table_sets_.find(key);
+-    if (it != table_sets_.end()) return it->second.set;
++    if (it != table_sets_.end()) {
++      if (lookup_stats != nullptr) RememberTableLookup(key, it->second.set);
++      return it->second.set;
++    }
+ 
+     NrProfScope prof_scope(prof_.table_miss);
+     SetEntry entry;
+@@ -1705,7 +1831,25 @@ class NrDeviceVulkan : public nrhi::Device {
      }
      vulkan_device_->functions().vkUpdateDescriptorSets(vulkan_device_->device(), count, writes, 0,
                                                         nullptr);
@@ -655,10 +1028,120 @@ index 28fd5b0..77808e6 100644
 +        v->table_set_ids_compact_at = std::max<size_t>(16, v->table_set_ids.size() * 2);
 +      }
 +    }
++    if (lookup_stats != nullptr) RememberTableLookup(key, entry.set);
      return entry.set;
    }
  
-@@ -1846,29 +1887,78 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -1720,6 +1864,38 @@ class NrDeviceVulkan : public nrhi::Device {
+   std::vector<NrTextureVulkan*>& pending_clear_textures() { return pending_clear_textures_; }
+ 
+  private:
++  nrhi::Buffer* CreateStaticMeshUpload(const nrhi::BufferDesc& desc) {
++    if (desc.size > UINT64_MAX - 3) return nullptr;
++    const uint64_t copy_size = (desc.size + 3) & ~uint64_t(3);
++    nrhi::BufferDesc target_desc = desc;
++    target_desc.size = copy_size;  // VkBufferCopy size must be a multiple of four
++    target_desc.heap = HeapKind::kDefault;
++    target_desc.static_upload = false;  // no recursive specialization
++    auto* target = static_cast<NrBufferVulkan*>(CreateBuffer(target_desc));
++    if (!target) return nullptr;
++    // Logical size and the live-byte ledger retain the caller's exact size.
++    (target->device_local ? g_buf_bytes_default_dl : g_buf_bytes_default_host)
++        .fetch_sub(copy_size - desc.size, std::memory_order_relaxed);
++    target->size_ = desc.size;
++    nrhi::BufferDesc upload_desc;
++    upload_desc.size = copy_size;
++    upload_desc.heap = HeapKind::kUpload;
++    upload_desc.bind_class = nrhi::BufferBindClass::kCopySrc;
++    auto* upload = static_cast<NrBufferVulkan*>(CreateBuffer(upload_desc));
++    if (!upload || !upload->mapping) {
++      DestroyDeferred(upload);
++      DestroyDeferred(target);
++      return nullptr;
++    }
++    if (copy_size != desc.size)
++      std::memset(static_cast<uint8_t*>(upload->mapping) + desc.size, 0,
++                  size_t(copy_size - desc.size));
++    target->static_upload = true;
++    target->staging = upload;
++    target->mapping = upload->mapping;
++    return target;
++  }
++
+   struct RetiredObject {
+     uint64_t submission = 0;
+     VkBuffer buffer = VK_NULL_HANDLE;
+@@ -1795,6 +1971,69 @@ class NrDeviceVulkan : public nrhi::Device {
+     }
+   };
+ 
++  // Bounded lookup index only: table_sets_ owns every set and all lifetime
++  // bookkeeping. Exact ordered keys, no negative entries, collision -> map.
++  static constexpr size_t kTableLookupCacheSlots = 4096;
++  static constexpr size_t kTableLookupCacheBuckets = kTableLookupCacheSlots / 2;
++  struct TableLookupEntry {
++    TableKey key{};
++    VkDescriptorSet set = VK_NULL_HANDLE;
++    uint64_t epoch = 0;
++  };
++  TableLookupEntry table_lookup_cache_[kTableLookupCacheSlots]{};
++  uint8_t table_lookup_victim_[kTableLookupCacheBuckets]{};
++  uint64_t table_lookup_epoch_ = 1;
++
++  static size_t TableLookupIndex(const TableKey& key) {
++    uint64_t hash = uint64_t(std::hash<VkDescriptorSetLayout>{}(key.layout));
++    hash = (hash ^ key.count) * UINT64_C(1099511628211);
++    for (uint32_t i = 0; i < key.count; ++i) {
++      hash = (hash ^ uint64_t(std::hash<NrTextureViewVulkan*>{}(key.views[i]))) *
++             UINT64_C(1099511628211);
++    }
++    hash ^= hash >> 32;
++    return size_t(hash) & (kTableLookupCacheBuckets - 1);
++  }
++
++  VkDescriptorSet FindTableLookup(const TableKey& key) {
++    const size_t bucket = TableLookupIndex(key);
++    for (uint32_t way = 0; way < 2; ++way) {
++      const auto& cached = table_lookup_cache_[bucket * 2 + way];
++      if (cached.epoch != table_lookup_epoch_ || cached.key.layout != key.layout ||
++          cached.key.count != key.count) continue;
++      uint32_t i = 0;
++      while (i < key.count && cached.key.views[i] == key.views[i]) ++i;
++      if (i != key.count) continue;
++      table_lookup_victim_[bucket] = uint8_t(way ^ 1);
++      return cached.set;
++    }
++    return VK_NULL_HANDLE;
++  }
++
++  void RememberTableLookup(const TableKey& key, VkDescriptorSet set) {
++    const size_t bucket = TableLookupIndex(key);
++    uint32_t way = table_lookup_victim_[bucket];
++    // Prefer an invalid way after retirement, preserving the live neighbor.
++    for (uint32_t i = 0; i < 2; ++i) {
++      if (table_lookup_cache_[bucket * 2 + i].epoch != table_lookup_epoch_) {
++        way = i;
++        break;
++      }
++    }
++    auto& cached = table_lookup_cache_[bucket * 2 + way];
++    cached.key = key;
++    cached.set = set;
++    cached.epoch = table_lookup_epoch_;
++    table_lookup_victim_[bucket] = uint8_t(way ^ 1);
++  }
++
++  void InvalidateTableLookupCache() {
++    if (++table_lookup_epoch_ == 0) {
++      for (auto& cached : table_lookup_cache_) cached.epoch = 0;
++      table_lookup_epoch_ = 1;
++    }
++  }
++
+   bool AllocateDescriptorSet(VkDescriptorSetLayout layout, SetEntry* out) {
+     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+     const VkDevice device = vulkan_device_->device();
+@@ -1846,32 +2085,88 @@ class NrDeviceVulkan : public nrhi::Device {
      retired_.push_back(r);
    }
  
@@ -754,7 +1237,17 @@ index 28fd5b0..77808e6 100644
    }
  
    void DestroyGuestOutputWrapper(NrTextureVulkan* wrapper) {
-@@ -2028,6 +2118,9 @@ class NrDeviceVulkan : public nrhi::Device {
++    if (wrapper->sampled_output_view != nullptr) {
++      // Retire cached descriptor sets on the normal submission timeline. The
++      // host view allocation is held until the next dissolved-view flush, so
++      // neither descriptor keys nor the lookup index can see address reuse.
++      DestroyDeferred(wrapper->sampled_output_view);
++      wrapper->sampled_output_view = nullptr;
++    }
+     RetireFramebuffersForView(wrapper->attachment_view);
+     if (cmd_.rt_color_ == wrapper) cmd_.rt_color_ = nullptr;
+     std::erase(pending_clear_textures_, wrapper);
+@@ -2028,6 +2323,9 @@ class NrDeviceVulkan : public nrhi::Device {
      // winding is unchanged.
      raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
      raster.lineWidth = 1.0f;
@@ -764,7 +1257,7 @@ index 28fd5b0..77808e6 100644
  
      VkPipelineMultisampleStateCreateInfo multisample = {};
      multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-@@ -2130,6 +2223,14 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -2130,6 +2428,14 @@ class NrDeviceVulkan : public nrhi::Device {
    // destruction are thread-safe); the caches below are render-thread-only.
    std::mutex mutex_;
    std::vector<RetiredObject> retired_;
@@ -779,7 +1272,7 @@ index 28fd5b0..77808e6 100644
    // Every app-created object still alive (inserted at Create*, erased at
    // DestroyDeferred). The app holds its caches (meshes, texture store,
    // rings, PSOs) across the whole session and has no device-teardown
-@@ -2152,6 +2253,9 @@ class NrDeviceVulkan : public nrhi::Device {
+@@ -2152,6 +2458,9 @@ class NrDeviceVulkan : public nrhi::Device {
    std::vector<VkDescriptorPool> descriptor_pools_;
    std::map<Set0Key, SetEntry> set0_sets_;
    std::map<TableKey, SetEntry> table_sets_;
@@ -789,6 +1282,85 @@ index 28fd5b0..77808e6 100644
    std::vector<NrBindingLayoutVulkan*> layouts_;  // owned; no destroy API on the interface
    std::map<VkImage, NrTextureVulkan*> guest_outputs_;
    std::vector<NrTextureVulkan*> pending_clear_textures_;
+@@ -2175,6 +2484,8 @@ void NrCmdVulkan::ResetFrameState() {
+   set0_bound_ = VK_NULL_HANDLE;
+   std::memset(table_views_, 0, sizeof(table_views_));
+   std::memset(table_dirty_, 0, sizeof(table_dirty_));
++  table_lookup_enabled_ = false;
++  table_lookup_stats_ = {};
+   rt_color_ = nullptr;
+   rt_depth_ = nullptr;
+   if (render_pass_open_) {
+@@ -2366,7 +2677,8 @@ bool NrCmdVulkan::EnsureDrawState() {
+     if (p.kind != nrhi::BindingParamKind::kTextureTable) continue;
+     if (!table_dirty_[p.table_index]) continue;
+     VkDescriptorSet set = device->GetTableSet(layout_->table_layouts[p.table_index],
+-                                              table_views_[p.table_index], p.table_size);
++                                              table_views_[p.table_index], p.table_size,
++                                              table_lookup_enabled_ ? &table_lookup_stats_ : nullptr);
+     if (set != VK_NULL_HANDLE) {
+       cmd.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, layout_->pipeline_layout,
+                                   p.set_index, 1, &set, 0, nullptr);
+@@ -2522,11 +2834,36 @@ void NrCmdVulkan::SetScissor(const nrhi::Rect& rect) {
+   device->cp()->deferred_command_buffer().CmdVkSetScissor(0, 1, &scissor);
+ }
+ 
++void NrCmdVulkan::PrepareBufferUpload(nrhi::Buffer* buffer) {
++  if (!buffer) return;
++  auto* b = static_cast<NrBufferVulkan*>(buffer);
++  if (!b->staging) return;
++  // Normal commits prepare accepted meshes before starting any passes.
++  // First-bind also calls here for inline decodes; close the pass and let
++  // EnsureDrawState reopen it with the existing load/pipeline state.
++  EndRenderPassIfOpen();
++  device->cp()->SubmitBarriers(true);
++  VkBufferCopy copy = {};
++  copy.size = (b->size_ + 3) & ~uint64_t(3);
++  device->cp()->deferred_command_buffer().CmdVkCopyBuffer(
++      b->staging->buffer, b->buffer, 1, &copy);
++  device->cp()->PushBufferMemoryBarrier(
++      b->buffer, 0, b->size_, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
++  // Keep exactly the same strict completion gate as texture staging and
++  // other buffers. No CPU wait, extra queue submit or early readiness signal.
++  device->DestroyDeferred(b->staging);
++  b->staging = nullptr;
++  b->mapping = nullptr;  // the static-upload contract forbids remapping
++}
++
+ void NrCmdVulkan::SetVertexBuffer(nrhi::Buffer* buffer, uint64_t offset, uint32_t size_bytes,
+                                   uint32_t stride) {
+   (void)size_bytes;  // the pipeline's vertex stride governs fetch; Vulkan
+                      // binds (buffer, offset) only
+   (void)stride;
++  PrepareBufferUpload(buffer);
+   VkBuffer vk_buffer = static_cast<NrBufferVulkan*>(buffer)->buffer;
+   VkDeviceSize vk_offset = offset;
+   device->cp()->deferred_command_buffer().CmdVkBindVertexBuffers(0, 1, &vk_buffer, &vk_offset);
+@@ -2534,6 +2871,7 @@ void NrCmdVulkan::SetVertexBuffer(nrhi::Buffer* buffer, uint64_t offset, uint32_
+ 
+ void NrCmdVulkan::SetIndexBuffer(nrhi::Buffer* buffer, uint64_t offset, uint32_t size_bytes) {
+   (void)size_bytes;
++  PrepareBufferUpload(buffer);
+   device->cp()->deferred_command_buffer().CmdVkBindIndexBuffer(
+       static_cast<NrBufferVulkan*>(buffer)->buffer, offset, VK_INDEX_TYPE_UINT16);
+ }
+@@ -2745,10 +3083,12 @@ void DestroyNativeRhiDevice(nrhi::Device* device) {
+ 
+ nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, VkImage guest_output_image,
+                                VkImageView guest_output_image_view,
+-                               bool guest_output_ever_written_previously, uint32_t width,
++                               bool guest_output_ever_written_previously, uint64_t guest_output_image_version,
++                               uint32_t width,
+                                uint32_t height, nrhi::Texture** guest_output_out) {
+   return static_cast<NrDeviceVulkan*>(device)->BeginFrame(
+-      guest_output_image, guest_output_image_view, guest_output_ever_written_previously, width,
++      guest_output_image, guest_output_image_view, guest_output_ever_written_previously,
++      guest_output_image_version, width,
+       height, guest_output_out);
+ }
+ 
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
 index 50a26d0..b64ed8e 100644
 --- a/src/ui/imgui_drawer.cpp
@@ -1527,3 +2099,21 @@ index b404ec8..627ff2b 100644
    const auto timing_present_end = std::chrono::steady_clock::now();
    AccumulateAndMaybeLogPresentTiming(
        execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
+diff --git a/include/rex/graphics/vulkan/native_rhi_vulkan.h b/include/rex/graphics/vulkan/native_rhi_vulkan.h
+index d4c99fd..7d36bc4 100644
+--- a/include/rex/graphics/vulkan/native_rhi_vulkan.h
++++ b/include/rex/graphics/vulkan/native_rhi_vulkan.h
+@@ -29,10 +29,12 @@ void DestroyNativeRhiDevice(nrhi::Device* device);
+ // resets the frame Cmd latches. guest_output_ever_written_previously selects
+ // the wrapper's initial tracked layout (UNDEFINED on the image's first ever
+ // write, the presenter's internal SHADER_READ_ONLY_OPTIMAL otherwise).
++// image_version is the presenter lifetime token (handles may be reused).
+ // guest_output_out receives the wrapped texture.
+ nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, VkImage guest_output_image,
+                                VkImageView guest_output_image_view,
+-                               bool guest_output_ever_written_previously, uint32_t width,
++                               bool guest_output_ever_written_previously, uint64_t guest_output_image_version,
++                               uint32_t width,
+                                uint32_t height, nrhi::Texture** guest_output_out);
+ 
+ // Vulkan-only frame epilogue: ends any render pass still open in the frame

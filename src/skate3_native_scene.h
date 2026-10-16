@@ -726,7 +726,7 @@ void OnUnregisterTexture(uint64_t guid, uint32_t texture);
 
 // Queue one mesh for the prewarm decode workers (guest thread; deduped per
 // load).
-void OnMeshRegistered(uint8_t* base, uint32_t mesh);
+void OnMeshRegistered(uint8_t* base, uint32_t mesh, bool new_content = true);
 
 // Called (post-call) from the pegasus::tRModelData::Fixup hook: the
 // rw-arena LOAD-time pointer resolve, fired per model while its arena

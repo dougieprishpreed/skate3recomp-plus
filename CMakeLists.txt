@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 0.1.1 LANGUAGES CXX)
+project(skate3 VERSION 0.1.2 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "0.1a")
+set(SKATE3_FULL_VERSION "0.1b")
 set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
@@ -254,6 +254,7 @@ set(SKATE3_COMMON_SOURCES
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp
+    src/native/skate3_native_cull_probe.cpp
     src/native/skate3_native_palette.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
@@ -267,6 +268,8 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_title_update_installer.cpp
     src/skate3_user_settings.cpp
     src/skate3_world_loading.cpp
+    src/skate3_texture_lookup.cpp
+    src/skate3_context_resource_search.cpp
     src/skate3_pedestrian_speech.cpp
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp

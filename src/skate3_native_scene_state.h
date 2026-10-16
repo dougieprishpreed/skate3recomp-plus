@@ -24,6 +24,7 @@
 #include <rex/logging.h>
 
 #include "skate3_native_scene.h"
+#include "native/skate3_native_item_proof.h"
 
 REXCVAR_DECLARE(bool, skate3_native_render_scene);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_ring);
@@ -119,10 +120,30 @@ struct PrewarmEntry {
   // content probe in the 2D resolve is the heal path for torn reads, the
   // same exposure the old inline decode had.
   bool ui = false;
+  uint64_t core_generation = 0;  // NSV one-shot item-core lifetime token
+  bool core_only = false;  // metadata warming must not defeat GPU decode dedup
 };
 inline std::mutex g_prewarm_mutex;
 inline std::condition_variable g_prewarm_cv;  // wakes the decode workers
 inline std::vector<PrewarmEntry> g_prewarm_queue;
+// Optional NSV metadata preparation must not jump ahead of GPU prefetch work.
+// Same mutex/cap/lifetime proofs as the original queue; workers service it last.
+inline std::vector<PrewarmEntry> g_prewarm_core_queue;
+// Independent optional host metadata: never selected by the GPU workers and
+// never counted against their existing registration capacity. Same queue mutex;
+// separate wakeup, bounded storage and no resource creation/command recording.
+inline constexpr size_t kItemCoreQueueCap = 2048;
+struct ItemCoreEntry {
+  uint32_t mesh;
+  uint16_t retries;
+  uint64_t generation, epoch;
+};
+inline std::vector<ItemCoreEntry> g_item_core_queue, g_item_core_retry;
+inline uint64_t g_item_core_epoch = 1;  // queue mutex, never reset across clears
+inline std::atomic<uint32_t> g_item_core_pending{0};
+inline std::condition_variable g_item_core_cv;
+inline std::atomic<uint32_t> g_item_core_queued{0};
+inline std::atomic<uint64_t> g_item_core_started{0};
 // Draw-path misses (EnqueueMeshMiss/EnqueueWordsMiss/EnqueueCubeMiss):
 // content that is visible RIGHT NOW (white / skipped),
 // served FIFO with strict priority over the speculative registration
@@ -1262,7 +1283,15 @@ struct ItemBindingWatch {
 // items off the queue without a live capture). `watch`, when given,
 // receives the channel bindings read.
 bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
-                       ItemBindingWatch* watch = nullptr);
+                       ItemBindingWatch* watch = nullptr,
+                       ItemCoreProof* proof = nullptr);
+// Complete a dropped/unqueued metadata attempt without changing its lifetime.
+void FinishItemWarmAttempt(uint32_t mesh, uint64_t generation);
+bool ItemWarmAttemptCurrent(uint32_t mesh, uint64_t generation);
+bool EnsureItemCoreWorker();
+// Publish only a fully resolved static NSV walk for its registration generation.
+void PublishWarmedItemCore(uint8_t* base, uint64_t generation, const DrawItem& item,
+                           const ItemBindingWatch& watch, ItemCoreProof&& proof);
 
 // Render-side helper the capture thread calls (defined in
 // skate3_native_scene_gpu.cpp): photo-editor detection shared by the yield

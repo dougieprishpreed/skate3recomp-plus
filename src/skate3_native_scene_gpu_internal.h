@@ -587,7 +587,7 @@ struct RendererState {
   uint32_t depth_width = 0;
   uint32_t depth_height = 0;
   // Cached guest-output texture identity (context.guest_output) for change
-  // detection: the presenter recreates the output image on resize.
+  // detection on the legacy path; Vulkan rotates a small output mailbox.
   nrhi::Texture* rtv_resource = nullptr;
   // MSAA: the scene draws into msaa_color (+ MSAA depth) and a fullscreen
   // pass averages the samples into the guest output texture (the RHI command
@@ -607,6 +607,9 @@ struct RendererState {
   nrhi::TextureView* blur_srv[2] = {nullptr, nullptr};
   nrhi::TextureView* output_srv_slot = nullptr;
   bool output_srv_allocated = false;
+  bool output_srv_owned = true;
+  // Per-callback coverage; reset before EnsurePipeline, no per-view clocks.
+  uint32_t output_view_borrows = 0, output_view_reuses = 0;
   nrhi::Pipeline* pso_blur = nullptr;
   nrhi::Pipeline* pso_blur_blit = nullptr;
   nrhi::Pipeline* pso_blur_down = nullptr;
@@ -1247,6 +1250,7 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context);
 // Umbrella builder: runs every group above (plus the base device/queue
 // setup) and latches g_r.failed on an unrecoverable failure.
 bool EnsurePipeline(const NativeGuestOutputRenderContext& context);
+bool EnsureOutputSampleView(const NativeGuestOutputRenderContext& context);
 // Shader-desc helper: pairs the HLSL source with its offline-compiled
 // SPIR-V blob (Vulkan) by {file, entry, variant}.
 nrhi::ShaderDesc MakeShaderDesc(nrhi::ShaderStage stage, const char* file,

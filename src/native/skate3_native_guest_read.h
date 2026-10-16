@@ -31,9 +31,20 @@ struct SkinSampleVert {
 // SEH-guarded bulk copy of guest memory (host pointers; callers pass
 // base + guest_addr). Returns false when the range faults (streaming
 // decommit, bogus candidate pointer). ANY guarded guest read must go
-// through this function; see the compiler-trap comment at the definition:
+// through the shared guards here; see the compiler-trap comment at the definition:
 // open-coded __try{memcpy}__except compiles to an UNPROTECTED `jmp memcpy`.
 bool GuestTryCopy(void* dst, const void* src, size_t size);
+
+// Same guarded-read contract for an ordered set of 8-byte samples. Trusted
+// host pointer/output arrays; guest payloads may be unaligned or decommitted.
+// A null sample is a rejected address, without a read or counted copy fault.
+// Windows batches samples under one non-inlined opaque-call SEH guard; other
+// platforms retain the existing per-sample GuestTryCopy recovery path.
+bool GuestTryGatherU64(uint64_t* dst, const void* const* sources, size_t count);
+
+// Failed copies on THIS thread only (no clock, lock or global aggregation).
+// The NSV scene-detail recorder snapshots the difference around scene build.
+uint64_t GuestCopyFaultCountForThread();
 
 // Read-fault recovery for the renderer's RAW guest loads (the REX_LOAD-style
 // structure walks that do not route through GuestTryCopy). World streaming

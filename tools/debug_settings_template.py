@@ -32,10 +32,17 @@ def defaults():
 
 def release_text():
     values = defaults()
-    for name in ('skate3_perf_recorder', 'skate3_perf_profiler', 'skate3_native_render_scene_perf_log'):
+    for name in (
+        'skate3_perf_event_detail', 'skate3_perf_profile_on_home',
+        'skate3_perf_profiler', 'skate3_perf_recorder', 'skate3_perf_recorder_auto',
+        'skate3_perf_recorder_system', 'skate3_perf_scene_detail',
+        'skate3_perf_work_timeline', 'skate3_sim_freeze_capture',
+        'skate3_native_render_scene_perf_items', 'skate3_native_render_scene_perf_log',
+        'native_rhi_vulkan_profiling', 'native_rhi_vulkan_memory_log',
+    ):
         values[name] = 'false'
-    return ('# Host controls, including diagnostics. Performance capture is off.\n'
-            '# The runtime adds available SDK diagnostic controls on first startup.\n'
-            '# Set skate3_perf_recorder=true for capture; native_render_scene_perf_log\n'
-            '# controls periodic renderer timing logs. Restart after editing.\n\n' +
+    values['log_level'] = "'warn'"
+    return ('# Host controls. Extra diagnostics and performance capture are off.\n'
+            '# The runtime adds available SDK controls on first startup.\n'
+            '# Enable only the diagnostics needed for a specific investigation.\n\n' +
             ''.join(f'{name} = {value}\n' for name, value in sorted(values.items())))

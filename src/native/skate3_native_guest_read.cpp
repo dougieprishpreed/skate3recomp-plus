@@ -26,6 +26,13 @@
 
 namespace skate3::native_scene {
 
+namespace {
+thread_local uint64_t tl_guest_copy_faults = 0;
+}
+uint64_t GuestCopyFaultCountForThread() {
+  return tl_guest_copy_faults;
+}
+
 // Lock-free guarded bulk copy for reads of guest payloads (shared here so
 // every TU uses the one correctly-built guard). GuestRangeReadable's
 // VirtualQuery loop takes the
@@ -46,8 +53,8 @@ namespace skate3::native_scene {
 //    personality (__CxxFrameHandler3), the __except scope is dropped in the
 //    merge, hence the noinline.
 // This means plain `__try { std::memcpy(...) } __except` NEVER protected
-// anything in optimized builds; any future guarded read must go through
-// this function.
+// anything in optimized builds; guarded reads must use the shared
+// protected entry points here (including the gather guard below).
 namespace {
 typedef void* (*GuestMemcpyFn)(void*, const void*, size_t);
 volatile GuestMemcpyFn g_guest_memcpy_fn = std::memcpy;
@@ -60,9 +67,36 @@ __declspec(noinline) bool GuestTryCopy(void* dst, const void* src, size_t size) 
                GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
                   ? EXCEPTION_EXECUTE_HANDLER
                   : EXCEPTION_CONTINUE_SEARCH) {  // NOLINT
+    ++tl_guest_copy_faults;
     return false;
   }
 }
+namespace {
+bool GatherGuestU64(uint64_t* dst, const void* const* sources, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    if (sources[i] == nullptr) return false;
+    std::memcpy(dst + i, sources[i], sizeof(uint64_t));
+  }
+  return true;
+}
+using GuestGatherFn = bool (*)(uint64_t*, const void* const*, size_t);
+volatile GuestGatherFn g_guest_gather_fn = GatherGuestU64;
+}  // namespace
+// Preserve BOTH protections above: opaque volatile call and a non-inlined SEH
+// frame. Never open-code guarded loads in the C++-EH fingerprint caller.
+__declspec(noinline) bool GuestTryGatherU64(uint64_t* dst, const void* const* sources,
+                                         size_t count) {
+  __try {
+    return g_guest_gather_fn(dst, sources, count);
+  } __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+               GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR)
+                  ? EXCEPTION_EXECUTE_HANDLER
+                  : EXCEPTION_CONTINUE_SEARCH) {  // NOLINT
+    ++tl_guest_copy_faults;
+    return false;
+  }
+}
+
 #else
 // POSIX guard with the same clean-failure semantics as the SEH path: a
 // handler registered in the runtime's exception chain (SIGSEGV/SIGBUS both
@@ -100,6 +134,7 @@ void EnsureGuestCopyHandler() {
 bool GuestTryCopy(void* dst, const void* src, size_t size) {
   EnsureGuestCopyHandler();
   if (sigsetjmp(tl_guest_copy_jmp, 0) != 0) {
+    ++tl_guest_copy_faults;
     // Faulted mid-copy and jumped out of the signal handler: the signal is
     // still in this thread's blocked mask (handler entry blocked it, the
     // longjmp skipped the normal return that would restore it). Rare path -
@@ -114,6 +149,12 @@ bool GuestTryCopy(void* dst, const void* src, size_t size) {
   tl_in_guest_copy = true;
   std::memcpy(dst, src, size);
   tl_in_guest_copy = false;
+  return true;
+}
+
+bool GuestTryGatherU64(uint64_t* dst, const void* const* sources, size_t count) {
+  for (size_t i = 0; i < count; ++i)
+    if (sources[i] == nullptr || !GuestTryCopy(dst + i, sources[i], sizeof(uint64_t))) return false;
   return true;
 }
 
