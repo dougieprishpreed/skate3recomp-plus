@@ -76,14 +76,16 @@ def main():
     else:
         run(sys.executable, 'tools/ci/package_posix.py', '--build', build,
             '--output', output, '--platform', a.platform)
+    compiler = next(line.split('=', 1)[1] for line in (build / 'CMakeCache.txt').read_text().splitlines()
+                    if line.startswith('CMAKE_CXX_COMPILER:'))
     provenance = {
         'platform': a.platform,
         'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
         'runner_image': os.environ.get('ImageOS'), 'runner_image_version': os.environ.get('ImageVersion'),
-        'compiler': subprocess.check_output(['clang++', '--version'], text=True).splitlines()[0],
+        'compiler_path': compiler,
+        'compiler': subprocess.check_output([compiler, '--version'], text=True).splitlines()[0],
         'build_stamp': (build / 'include/skate3_version.h').read_text(),
         'game_launched': False, 'gameplay_validation': 'awaiting platform testers'}
-    (ROOT / 'out/packages' / (a.platform + '-build.json')).write_text(json.dumps(provenance, indent=2) + '\n')
     symbols = ROOT / 'out/symbols'
     symbols.mkdir()
     # Keep a matching executable/runtime pair separate from the normal download.
@@ -93,8 +95,26 @@ def main():
     if windows:
         members += [build / 'skate3.pdb']
         members += list((ROOT / 'third_party/rexglue-sdk/out/win-amd64').glob('rexruntime*.pdb'))
+    elif a.platform == 'macos-arm64':
+        # Darwin binaries contain an object-file debug map. Link its DWARF into
+        # dSYMs before the ephemeral runner/object files disappear.
+        identities = {}
+        for binary in [p for p in members if p.name == 'skate3' or 'rexruntime' in p.name]:
+            dsym = symbols / (binary.name + '.dSYM')
+            run('dsymutil', '-j', '1', '-o', dsym, binary)
+            def uuids(path):
+                text = subprocess.check_output(['dwarfdump', '--uuid', str(path)], text=True)
+                return sorted(line.split()[1] for line in text.splitlines() if line.startswith('UUID:'))
+            identity = uuids(binary)
+            packaged = output / 'Skate 3 Recompiled+.app/Contents/MacOS' / binary.name
+            if not identity or uuids(dsym) != identity or uuids(packaged) != identity:
+                raise ValueError('macOS debug symbols do not match the packaged image')
+            identities[binary.name] = identity
+            members += sorted(p for p in dsym.rglob('*') if p.is_file())
+        provenance['macos_image_uuids'] = identities
     if any(not p.is_file() for p in members):
         raise ValueError('Matching symbol input missing')
+    (ROOT / 'out/packages' / (a.platform + '-build.json')).write_text(json.dumps(provenance, indent=2) + '\n')
     with zipfile.ZipFile(symbols / (a.platform + '-matching-symbols.zip'), 'x', zipfile.ZIP_DEFLATED) as z:
         manifest = {}
         for p in members:

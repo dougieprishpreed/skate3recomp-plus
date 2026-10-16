@@ -56,6 +56,8 @@ FFmpeg distribution. Packages include the shared preparation modules, sidecars,
 Recast baker and dependency notices. Tool versions and source identities are
 recorded with each build. Linux targets Ubuntu 24.04/glibc 2.39; macOS packages
 are ARM64 app bundles with vendored Vulkan/MoltenVK libraries and ad-hoc signing.
+The native media tools must also pass a synthetic RGB scaling, pipe and frame-rate
+probe check immediately after compilation and from their final packaged location.
 
 Linux/macOS start the same NSV wizard as Windows. GTK/Cocoa keep their normal
 event loop; installation runs on the existing worker. Direct process arguments
@@ -71,6 +73,9 @@ Actions uploads only explicit package archives, checksums and build metadata
 from `out/packages`. It never uploads a whole build directory, raw inputs or
 generated C++. Downloadable build artifacts expire after 14 days; retain the
 approved packages and matching symbols before expiration or another build.
+Build metadata records the compiler selected in CMake, including its path and
+version. macOS symbol archives include dSYMs for the application and runtime;
+their UUIDs must match both the build images and the packaged app images.
 Renderer/backend work remains Vulkan/native, with the Windows D3D12 fallback
 preserved. Compilation, installer imports and synthetic tests are separate from
 gameplay/complete real-data installation acceptance. Follow `PLATFORM_SETUP.md`

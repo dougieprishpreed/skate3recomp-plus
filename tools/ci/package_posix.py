@@ -13,6 +13,7 @@ import tarfile
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
 from platform_settings import settings_for
+from test_media_runtime import verify_media
 
 
 def run(*args, **kwargs):
@@ -80,10 +81,12 @@ def verify_installer(resources, platform):
     run(python, '-E', '-s', '-c', 'import numpy, ssl, ctypes, multiprocessing', cwd=resources.parent)
     for name in ('ffmpeg', 'ffprobe'):
         run(installer / 'media' / name, '-version')
+    verify_media(installer / 'media/ffmpeg', installer / 'media/ffprobe')
     env = dict(os.environ, PYTHONPATH=str(installer / 'tools'))
     run(python, '-s', '-c', 'import prepare_new_san_van,build_skate2_dlc_maps,build_skate2_audio', env=env)
     return {'private_python': True, 'numpy_and_preparation_imports': True,
-            'media_tools': True, 'game_launched': False, 'runtime_tested': False}
+            'media_tools': True, 'media_pipeline_fixture': True,
+            'game_launched': False, 'runtime_tested': False}
 
 
 def package(build, output, platform):

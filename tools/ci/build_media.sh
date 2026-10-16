@@ -23,8 +23,8 @@ cd "$output_root/obj"
   --cc="${CC:-clang}" --disable-doc --disable-debug --disable-autodetect \
   --disable-shared --enable-static --disable-x86asm --disable-network \
   --disable-everything --enable-ffmpeg --enable-ffprobe \
-  --enable-protocol=file,pipe --enable-demuxer=ea,avi,mov,matroska \
-  --enable-decoder=vp6,vp6f,vp6a --enable-filter=scale,format \
+  --enable-protocol=file,pipe --enable-demuxer=ea,avi,mov,matroska,rawvideo \
+  --enable-decoder=vp6,vp6f,vp6a,rawvideo --enable-filter=scale,format \
   --enable-muxer=rawvideo --enable-encoder=rawvideo --enable-swscale --enable-avfilter
 make -j2
 make install

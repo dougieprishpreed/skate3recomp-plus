@@ -90,6 +90,7 @@ jobs:
         run: |
           python tools/ci/prepare_runtime.py --platform '${{ matrix.platform }}' --output out/installer-runtime
           bash tools/ci/build_media.sh third_party/rexglue-sdk/thirdparty/FFmpeg out/media
+          python tools/test_media_runtime.py --ffmpeg out/media/bin/ffmpeg --ffprobe out/media/bin/ffprobe
       - name: Record runner resources
         shell: bash
         run: |
