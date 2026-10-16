@@ -62,6 +62,7 @@ def main():
     run(sys.executable, 'tools/test_nsv_navigation.py', '--baker',
         build / ('nsv_nav_bake.exe' if windows else 'nsv_nav_bake'))
     run(sys.executable, 'tools/test_platform_installer.py')
+    run(sys.executable, 'tools/test_platform_settings.py')
     output = ROOT / 'out/packages' / ('Skate3Recomp-Plus-' + a.platform)
     if windows:
         run(sys.executable, 'tools/package_release.py', '--build', build, '--output', output)

@@ -7,9 +7,12 @@ from pathlib import Path
 import plistlib
 import shutil
 import subprocess
+import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'tools'))
+from platform_settings import settings_for
 
 
 def run(*args, **kwargs):
@@ -110,7 +113,7 @@ def package(build, output, platform):
         shutil.copy2(p, binaries / p.name)
     shutil.copytree(build / 'installer', resources / 'installer', symlinks=True,
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-    shutil.copy2(ROOT / 'config/release-defaults.toml', resources / 'settings.toml')
+    (resources / 'settings.toml').write_bytes(settings_for('Darwin' if platform == 'macos-arm64' else 'Linux'))
     shutil.copy2(ROOT / 'packaging/README.txt', output / 'README.txt')
     shutil.copy2(ROOT / 'packaging/PLATFORM_SETUP.md', output / 'PLATFORM_SETUP.md')
     notices(resources / 'licenses')

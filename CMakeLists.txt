@@ -399,6 +399,8 @@ add_custom_target(skate3_stage_default_settings
     COMMAND "${CMAKE_COMMAND}"
         "-DSKATE3_BUILD_ROOT=$<TARGET_FILE_DIR:skate3>"
         "-DSKATE3_DEFAULT_SETTINGS=${CMAKE_CURRENT_SOURCE_DIR}/config/release-defaults.toml"
+        "-DSKATE3_HOST_PLATFORM=${CMAKE_SYSTEM_NAME}"
+        "-DSKATE3_PYTHON=${Python3_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageDefaultSettings.cmake"
     VERBATIM)
 add_dependencies(skate3 skate3_stage_default_settings)

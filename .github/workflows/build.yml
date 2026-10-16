@@ -9,10 +9,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: native-build-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   build:
     if: >-
@@ -29,6 +25,9 @@ jobs:
           - platform: win-amd64
             os: windows-2022
     runs-on: ${{ matrix.os }}
+    concurrency:
+      group: native-build-${{ matrix.platform }}-${{ github.ref }}
+      cancel-in-progress: false
     timeout-minutes: 180
     steps:
       - name: Check out reviewed source without recursive submodules
