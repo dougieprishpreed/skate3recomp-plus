@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "0.2-dev")
+set(SKATE3_FULL_VERSION "0.2")
 set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.

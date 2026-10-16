@@ -2,7 +2,7 @@
 
 Development starts at the published v0.1b source `f39eca6d333c7cbaceb0a95ef4ee29237c16c36a`.
 The development branch is `v0.2-dev`; its Windows preset and authored release
-settings remain unchanged. The application identity is `0.2-dev`, numeric `0.2.0`.
+settings remain unchanged. The final application identity is `0.2`, numeric `0.2.0`.
 
 `.github/workflows/build.yml` builds Windows x64 on `windows-2022`, Linux x64
 on `ubuntu-24.04`, and macOS ARM64 on `macos-15`. These are native builds on
@@ -10,7 +10,8 @@ GitHub-hosted machines. Each job generates both guest translations, configures
 again to discover the generated sources, builds, runs offline installer checks,
 and creates a package. The workflow never starts the game or publishes a release.
 
-Pushes to the trusted `v0.2-dev` branch trigger development builds. Manual
+Pushes to trusted `main` and `v0.2-dev` branches trigger builds. After promotion,
+`main` is the unified v0.2 development baseline. Manual
 `workflow_dispatch` becomes available in the Actions UI after the workflow is
 present on the default branch. The job additionally checks the repository and
 trusted branch; there are no PR, fork or `pull_request_target` triggers.
@@ -56,6 +57,9 @@ FFmpeg distribution. Packages include the shared preparation modules, sidecars,
 Recast baker and dependency notices. Tool versions and source identities are
 recorded with each build. Linux targets Ubuntu 24.04/glibc 2.39; macOS packages
 are ARM64 app bundles with vendored Vulkan/MoltenVK libraries and ad-hoc signing.
+The macOS app minimum is derived from all bundled Mach-O runtime deployment
+targets and recorded in its Info.plist/provenance; gameplay compatibility still
+requires platform testing.
 The native media tools must also pass a synthetic RGB scaling, pipe and frame-rate
 probe check immediately after compilation and from their final packaged location.
 

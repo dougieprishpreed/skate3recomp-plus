@@ -92,6 +92,21 @@ def verify_installer(resources, platform):
             'game_launched': False, 'runtime_tested': False}
 
 
+def mac_minimum(binary):
+    # The app must satisfy the actual deployment targets of vendored runtimes,
+    # including Python/NumPy, rather than only the application's CMake target.
+    versions = [(12, 0, 0)]
+    field = None
+    for line in run('otool', '-l', binary).splitlines():
+        parts = line.split()
+        if parts[:1] == ['cmd']:
+            field = {'LC_BUILD_VERSION': 'minos', 'LC_VERSION_MIN_MACOSX': 'version'}.get(parts[1])
+        elif field and parts[:1] == [field]:
+            values = [int(v) for v in parts[1].split('.')]
+            versions.append(tuple((values + [0, 0])[:3]))
+    return max(versions)
+
+
 def archive_package(output, platform):
     archive = output.with_suffix('.zip')
     if archive.exists():
@@ -186,12 +201,18 @@ def package(build, output, platform):
         mac_dependencies(binaries)
         # Sign the entire portable interpreter (extensions and media/baker too),
         # then the outer app. Ad-hoc signing is not notarization.
-        for p in resources.rglob('*'):
+        minimum = (12, 0, 0)
+        for p in app.rglob('*'):
             if not p.is_file() or p.is_symlink():
                 continue
-            magic = p.read_bytes()[:4]
-            if magic in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe'):
+            with p.open('rb') as stream:
+                magic = stream.read(4)
+            if magic in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'):
+                minimum = max(minimum, mac_minimum(p))
                 run('codesign', '--force', '--sign', '-', p)
+        info['LSMinimumSystemVersion'] = '.'.join(map(str, minimum))
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+        print('Bundled runtime minimum macOS: ' + info['LSMinimumSystemVersion'], flush=True)
         run('codesign', '--force', '--sign', '-', app)
         run('codesign', '--verify', '--deep', '--strict', app)
     else:
@@ -209,6 +230,8 @@ def package(build, output, platform):
         'installer_policy': {'navigation': 4, 'dlc_livingworld': 5},
         'upgrade': 'Existing complete v0.1b Windows installs need program files only; no NSV rebake. '
                    'Fresh Linux/macOS installs run the shared setup wizard.'}
+    if platform == 'macos-arm64':
+        provenance['macos_minimum_system_version'] = info['LSMinimumSystemVersion']
     (output / 'build-provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
     # Explicit package contents: original inputs, generated C++ and game patches
     # can never enter through a broad build-directory copy.

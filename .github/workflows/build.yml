@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # Bootstrap and repair builds from the explicitly trusted development branch.
   push:
-    branches: [v0.2-dev]
+    branches: [main, v0.2-dev]
 
 permissions:
   contents: read
