@@ -19,6 +19,19 @@ spec.loader.exec_module(inputs)
 
 
 class PortableInputs(unittest.TestCase):
+    def test_preparation_children_preserve_read_only_resources(self):
+        with tempfile.TemporaryDirectory(prefix="NSV signed user's ") as tmp:
+            root = Path(tmp)
+            (root / 'payload.py').write_text('value = 17\n')
+            (root / 'child.py').write_text(
+                'import payload,sys\nfrom pathlib import Path\n'
+                'assert payload.value == 17\nPath(sys.argv[1]).write_text("prepared")\n')
+            result = root / 'result.txt'
+            with patch.object(install, 'HERE', root), patch.object(sys, 'dont_write_bytecode', True):
+                install.run('child', result)
+            self.assertEqual(result.read_text(), 'prepared')
+            self.assertFalse((root / '__pycache__').exists())
+
     def test_extra_and_traversal_entries_rejected_before_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

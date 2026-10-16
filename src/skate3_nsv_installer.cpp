@@ -188,7 +188,11 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
     for (const auto& p : input.dlc3)
       if (ok) ok = StageSetupDlc(p, scratch / "prepared", 0x454108E6, copied, error);
     if (ok) {
-      const std::vector<std::string> args = {"-E", "-s", rex::path_to_utf8(script),
+      const std::vector<std::string> args = {
+#if !defined(_WIN32)
+          "-B",  // Keep read-only resources and the macOS app signature intact.
+#endif
+          "-E", "-s", rex::path_to_utf8(script),
           "--source", rex::path_to_utf8(fs::absolute(source / "data")),
           "--native-data", rex::path_to_utf8(fs::absolute(paths.game_data_root / "data")),
           "--dlc-source", rex::path_to_utf8(scratch / "dlc"),

@@ -64,11 +64,18 @@ event loop; installation runs on the existing worker. Direct process arguments
 preserve spaces, Unicode and apostrophes without invoking a shell. Packaged
 resources are read-only; installed game/mod/content/settings data use the user
 data root, outside the macOS app bundle. Windows portable paths are preserved.
-The existing transactional preparation, V4 navigation, V5 DLC livingworld,
+The native installer and its preparation children disable bytecode writes to
+keep read-only resources and macOS app signatures intact. Windows keeps its
+existing invocation. Transactional preparation, V4 navigation, V5 DLC livingworld,
 validation, readiness and rollback mechanisms are shared without rebake changes.
 
 ## Artifacts and acceptance
 
+All three platform downloads are ZIPs. Linux ZIPs retain executable modes and
+relative interpreter symlinks; macOS uses the system app-bundle ZIP tool.
+Linux/macOS jobs extract their ZIPs to a new directory, check modes/links and
+rerun only the private installer tools there. macOS also verifies the extracted
+app signature.
 Actions uploads only explicit package archives, checksums and build metadata
 from `out/packages`. It never uploads a whole build directory, raw inputs or
 generated C++. Downloadable build artifacts expire after 14 days; retain the
@@ -89,4 +96,5 @@ upgrade/rebake requirements. Existing README files remain the author's text.
 References: [runner images](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 [private checkouts](https://github.com/actions/checkout#checkout-multiple-repos-private),
 [redistributable Python](https://github.com/astral-sh/python-build-standalone),
-[LLVM 20](https://formulae.brew.sh/formula/llvm@20).
+[LLVM 20](https://formulae.brew.sh/formula/llvm@20),
+[Apple ZIP packaging](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution).

@@ -6,9 +6,10 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
-import tarfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -78,15 +79,72 @@ def verify_installer(resources, platform):
         if not (installer / name).is_file():
             raise ValueError(f'Installer component missing: {name}')
     # Run only the private preparation tools. Never execute the game in CI.
-    run(python, '-E', '-s', '-c', 'import numpy, ssl, ctypes, multiprocessing', cwd=resources.parent)
+    run(python, '-B', '-E', '-s', '-c', 'import numpy, ssl, ctypes, multiprocessing', cwd=resources.parent)
     for name in ('ffmpeg', 'ffprobe'):
         run(installer / 'media' / name, '-version')
     verify_media(installer / 'media/ffmpeg', installer / 'media/ffprobe')
     env = dict(os.environ, PYTHONPATH=str(installer / 'tools'))
-    run(python, '-s', '-c', 'import prepare_new_san_van,build_skate2_dlc_maps,build_skate2_audio', env=env)
+    run(python, '-B', '-s', '-c', 'import prepare_new_san_van,build_skate2_dlc_maps,build_skate2_audio', env=env)
+    if any(installer.rglob('__pycache__')) or any(installer.rglob('*.pyc')):
+        raise ValueError('Installer verification modified bundled Python resources')
     return {'private_python': True, 'numpy_and_preparation_imports': True,
             'media_tools': True, 'media_pipeline_fixture': True,
             'game_launched': False, 'runtime_tested': False}
+
+
+def archive_package(output, platform):
+    archive = output.with_suffix('.zip')
+    if archive.exists():
+        raise FileExistsError(archive)
+    if platform == 'macos-arm64':
+        # Preserve app-bundle metadata, executable modes and interpreter links.
+        run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', output, archive)
+    else:
+        with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
+            for p in [output, *sorted(output.rglob('*'))]:
+                name = p.relative_to(output.parent).as_posix()
+                if p.is_symlink():
+                    info = zipfile.ZipInfo(name)
+                    info.create_system = 3
+                    info.external_attr = p.lstat().st_mode << 16
+                    z.writestr(info, os.fsencode(p.readlink()), compress_type=zipfile.ZIP_DEFLATED)
+                else:
+                    z.write(p, name)
+    with zipfile.ZipFile(archive) as z:
+        if z.testzip() is not None:
+            raise ValueError('Package ZIP CRC verification failed')
+    # Test the download after a normal native extraction to a new location.
+    # Never run the game; execute only its installer interpreter/media tools.
+    check_root = ROOT / 'out/package-check' / output.name
+    check_root.mkdir(parents=True)
+    if platform == 'macos-arm64':
+        run('/usr/bin/ditto', '-x', '-k', archive, check_root)
+    else:
+        run('unzip', '-q', archive, '-d', check_root)
+    restored = check_root / output.name
+    for p in output.rglob('*'):
+        q = restored / p.relative_to(output)
+        if p.is_symlink():
+            if (not q.is_symlink() or not q.exists() or q.readlink() != p.readlink()
+                    or not q.resolve().is_relative_to(restored)):
+                raise ValueError('Package ZIP did not preserve a relocatable link: ' + str(p))
+        elif p.is_file():
+            expected = stat.S_IMODE(p.stat().st_mode) & 0o111
+            if not q.is_file() or stat.S_IMODE(q.stat().st_mode) & 0o111 != expected:
+                raise ValueError('Package ZIP did not preserve executable modes: ' + str(p))
+    if platform == 'macos-arm64':
+        app = restored / 'Skate 3 Recompiled+.app'
+        run('codesign', '--verify', '--deep', '--strict', app)
+        resources = app / 'Contents/Resources'
+    else:
+        dependencies = run('ldd', restored / 'skate3')
+        if 'not found' in dependencies or not any(
+                'rexruntime' in line and str(restored) in line for line in dependencies.splitlines()):
+            raise ValueError('Extracted Linux runtime is not self-contained:\n' + dependencies)
+        resources = restored
+    verify_installer(resources, platform)
+    print('ZIP CRC, extracted links/modes and relocated installer checks passed.', flush=True)
+    return archive
 
 
 def package(build, output, platform):
@@ -157,9 +215,7 @@ def package(build, output, platform):
     for p in output.rglob('*'):
         if p.suffix.lower() in ('.xex', '.xexp', '.iso', '.big', '.rx2', '.bh'):
             raise ValueError('Unexpected game data in release payload')
-    archive = output.with_suffix('.tar.gz')
-    with tarfile.open(archive, 'x:gz') as t:
-        t.add(output, arcname=output.name, filter=lambda info: None if '__pycache__' in info.name else info)
+    archive = archive_package(output, platform)
     digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
     archive.with_suffix(archive.suffix + '.sha256').write_text(digest + '  ' + archive.name + '\n')
     print(archive)

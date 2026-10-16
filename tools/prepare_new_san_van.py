@@ -28,7 +28,9 @@ FOLDERS = ('world-support-gvr-v1', 'proxy-v1', 'sky-water-v1', 'jumbotron',
 
 def run(name, *args):
     print(f'Preparing {name}', flush=True)
-    subprocess.run([sys.executable, '-E', '-s', str(HERE / (name + '.py')),
+    # Honor the host's read-only/signed resources policy in preparation children.
+    bytecode = ['-B'] if sys.dont_write_bytecode else []
+    subprocess.run([sys.executable, *bytecode, '-E', '-s', str(HERE / (name + '.py')),
                     *map(str, args)], check=True)
 
 

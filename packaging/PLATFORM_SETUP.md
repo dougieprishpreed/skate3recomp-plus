@@ -7,11 +7,13 @@ Install the desktop runtime dependencies before starting:
 sudo apt install libgtk-3-0t64 libx11-xcb1 libvulkan1 libasound2t64 libpulse0 libpipewire-0.3-0
 ```
 
-Extract the archive and run `./skate3`. Keep the archive's executable permissions.
+Extract the ZIP with a tool that preserves Unix permissions and symbolic links
+(for example, `unzip`), then run `./skate3`.
 The default writable data location is `$XDG_DATA_HOME/skate3` or
 `~/.local/share/skate3`. Explicit user data overrides are respected.
 
-macOS targets Apple Silicon. Extract the archive and open `Skate 3 Recompiled+.app`.
+macOS targets Apple Silicon. Extract the ZIP with Archive Utility and open
+`Skate 3 Recompiled+.app`.
 Vulkan uses the bundled MoltenVK runtime. The experimental app is ad-hoc signed,
 not Developer ID signed or notarized. macOS may require the user to approve opening
 it using Privacy & Security. Keep installed game data outside the app bundle.
