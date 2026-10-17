@@ -39,7 +39,7 @@ def notices(destination):
 
 def mac_dependencies(binary_dir):
     """Vendor non-system dylibs and rewrite every reference before ad-hoc signing."""
-    queue = [p for p in binary_dir.iterdir() if p.is_file() and p.name != 'MoltenVK_icd.json']
+    queue = [p for p in binary_dir.iterdir() if p.is_file()]
     seen = set()
     while queue:
         binary = queue.pop()
@@ -74,6 +74,20 @@ def mac_dependencies(binary_dir):
             dep = line.strip().split(' (', 1)[0]
             if not dep.startswith(('/System/', '/usr/lib/', '@loader_path/', '@rpath/')):
                 raise ValueError(f'Nonportable macOS load command: {dep}')
+
+
+def mac_bundle_icd(source, app):
+    # MacOS is a code-only signing location. The loader discovers manifests in
+    # Resources/vulkan/icd.d; their library paths are relative to the JSON file.
+    library = app / 'Contents/MacOS/libMoltenVK.dylib'
+    if not library.is_file():
+        raise ValueError('Missing bundled MoltenVK library')
+    manifest = app / 'Contents/Resources/vulkan/icd.d/MoltenVK_icd.json'
+    data = json.loads(source.read_text())
+    data['ICD']['library_path'] = '../../../MacOS/libMoltenVK.dylib'
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_bytes((json.dumps(data, indent=2) + '\n').encode('utf-8'))
+    return manifest
 
 
 def verify_installer(resources, platform):
@@ -233,7 +247,7 @@ def package(build, output, platform):
         for name in ('libvulkan.1.dylib', 'libMoltenVK.dylib', 'MoltenVK_icd.json'):
             if not (build / name).is_file():
                 raise ValueError('Missing Vulkan/MoltenVK runtime: ' + name)
-        shutil.copy2(build / 'MoltenVK_icd.json', binaries / 'MoltenVK_icd.json')
+        mac_bundle_icd(build / 'MoltenVK_icd.json', app)
         mac_dependencies(binaries)
         mac_sign_app(app, info)
     else:

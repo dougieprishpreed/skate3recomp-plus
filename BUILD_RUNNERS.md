@@ -64,6 +64,10 @@ Relocation and metadata updates finish before signing. Nested loadable code is
 signed inside out, then the enclosing app signs its main executable and seals
 resources. Object files stay resources. A small native signing/ZIP fixture runs
 before the long application build; failed tool stdout/stderr stays in the log.
+The MoltenVK driver JSON is a resource in `Contents/Resources/vulkan/icd.d`,
+the Vulkan loader's standard app-bundle discovery location. Its relative path
+points back to the bundled dylib in `Contents/MacOS`. The early fixture covers
+the manifest, its relocated library path and signing before/after ZIP extraction.
 The native media tools must also pass a synthetic RGB scaling, pipe and frame-rate
 probe check immediately after compilation and from their final packaged location.
 
