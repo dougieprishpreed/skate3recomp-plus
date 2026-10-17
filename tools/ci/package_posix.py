@@ -18,8 +18,14 @@ from test_media_runtime import verify_media
 
 
 def run(*args, **kwargs):
-    return subprocess.run([str(a) for a in args], check=True, capture_output=True,
-                          text=True, **kwargs).stdout
+    try:
+        return subprocess.run([str(a) for a in args], check=True, capture_output=True,
+                              text=True, **kwargs).stdout
+    except subprocess.CalledProcessError as error:
+        # Captured diagnostics must survive in the job log, especially codesign.
+        print(error.stdout or '', end='', file=sys.stderr)
+        print(error.stderr or '', end='', file=sys.stderr)
+        raise
 
 
 def notices(destination):
@@ -61,11 +67,9 @@ def mac_dependencies(binary_dir):
                 run('install_name_tool', '-change', dependency, '@loader_path/' + name, binary)
         if binary.suffix == '.dylib':
             run('install_name_tool', '-id', '@rpath/' + binary.name, binary)
-    # Sign after all load commands have been rewritten. Python's standalone tree
-    # keeps its relocatable paths and is separately verified from the final location.
-    for p in seen:
-        run('codesign', '--force', '--sign', '-', p)
-    for p in seen:
+    # Relocation and signing are separate phases. The main executable is signed
+    # through the completed app bundle only after nested code and metadata.
+    for p in sorted(seen):
         for line in run('otool', '-L', p).splitlines()[1:]:
             dep = line.strip().split(' (', 1)[0]
             if not dep.startswith(('/System/', '/usr/lib/', '@loader_path/', '@rpath/')):
@@ -105,6 +109,38 @@ def mac_minimum(binary):
             values = [int(v) for v in parts[1].split('.')]
             versions.append(tuple((values + [0, 0])[:3]))
     return max(versions)
+
+
+def mac_loadable(binary):
+    with binary.open('rb') as stream:
+        header = stream.read(16)
+    byteorder = {b'\xcf\xfa\xed\xfe': 'little', b'\xfe\xed\xfa\xcf': 'big'}.get(header[:4])
+    if byteorder:
+        # A relocatable object (MH_OBJECT) is a resource, not
+        # executable code to sign. Only MH_EXECUTE, MH_DYLIB and MH_BUNDLE load.
+        return len(header) == 16 and int.from_bytes(header[12:16], byteorder) in (2, 6, 8)
+    if header[:4] in (b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+                      b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
+        return bool({'EXECUTE', 'DYLIB', 'BUNDLE'} & set(run('otool', '-hv', binary).split()))
+    return False
+
+
+def mac_sign_app(app, info):
+    main = app / 'Contents/MacOS' / info['CFBundleExecutable']
+    images = [p for p in app.rglob('*') if p.is_file() and not p.is_symlink() and mac_loadable(p)]
+    if main not in images:
+        raise ValueError('The app main executable is not a loadable Mach-O image')
+    minimum = max(mac_minimum(p) for p in images)
+    info['LSMinimumSystemVersion'] = '.'.join(map(str, minimum))
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+    print('Bundled runtime minimum macOS: ' + info['LSMinimumSystemVersion'], flush=True)
+    # Sign nested code inside out. Signing the enclosing app handles its main
+    # executable and seals resources once, after every bundle mutation is done.
+    for p in sorted(images, key=lambda p: (len(p.parts), p.as_posix()), reverse=True):
+        if p != main:
+            run('codesign', '--force', '--sign', '-', p)
+    run('codesign', '--force', '--sign', '-', app)
+    run('codesign', '--verify', '--deep', '--strict', app)
 
 
 def archive_package(output, platform):
@@ -199,22 +235,7 @@ def package(build, output, platform):
                 raise ValueError('Missing Vulkan/MoltenVK runtime: ' + name)
         shutil.copy2(build / 'MoltenVK_icd.json', binaries / 'MoltenVK_icd.json')
         mac_dependencies(binaries)
-        # Sign the entire portable interpreter (extensions and media/baker too),
-        # then the outer app. Ad-hoc signing is not notarization.
-        minimum = (12, 0, 0)
-        for p in app.rglob('*'):
-            if not p.is_file() or p.is_symlink():
-                continue
-            with p.open('rb') as stream:
-                magic = stream.read(4)
-            if magic in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'):
-                minimum = max(minimum, mac_minimum(p))
-                run('codesign', '--force', '--sign', '-', p)
-        info['LSMinimumSystemVersion'] = '.'.join(map(str, minimum))
-        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-        print('Bundled runtime minimum macOS: ' + info['LSMinimumSystemVersion'], flush=True)
-        run('codesign', '--force', '--sign', '-', app)
-        run('codesign', '--verify', '--deep', '--strict', app)
+        mac_sign_app(app, info)
     else:
         dependencies = run('ldd', binaries / 'skate3')
         if 'not found' in dependencies:

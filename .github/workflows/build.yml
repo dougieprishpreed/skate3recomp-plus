@@ -96,6 +96,8 @@ jobs:
         run: |
           df -h .
           python -c "import os,platform; print(platform.platform()); print('CPUs',os.cpu_count())"
+      - name: Check package diagnostics and native signing before the application build
+        run: python tools/test_macos_package.py
       - name: Compile, check installer tools and package (never launch the game)
         run: python tools/ci/run_build.py --platform ${{ matrix.platform }}
       - name: Upload verified packages only

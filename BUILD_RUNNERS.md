@@ -60,6 +60,10 @@ are ARM64 app bundles with vendored Vulkan/MoltenVK libraries and ad-hoc signing
 The macOS app minimum is derived from all bundled Mach-O runtime deployment
 targets and recorded in its Info.plist/provenance; gameplay compatibility still
 requires platform testing.
+Relocation and metadata updates finish before signing. Nested loadable code is
+signed inside out, then the enclosing app signs its main executable and seals
+resources. Object files stay resources. A small native signing/ZIP fixture runs
+before the long application build; failed tool stdout/stderr stays in the log.
 The native media tools must also pass a synthetic RGB scaling, pipe and frame-rate
 probe check immediately after compilation and from their final packaged location.
 
