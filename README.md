@@ -25,7 +25,6 @@ Many native renderer issues have also been resolved. These fixes affect all Skat
 - ported motion blur and vignette shaders
 - hair now looks normal in shadows
 - enhanced shadows no longer briefly drop out
-- smoothing of enhanced shadow gradients
 - feet no longer detach during forward man
 - tattoos, dirt on clothes, scrapes on knees are all visible now
 - enabled traffic lights in Skate 3 and New San Van
