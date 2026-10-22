@@ -1,4 +1,6 @@
 #include "skate3_nsv_installer.h"
+#include "skate3_nsv_components.h"
+#include "skate3_updater.h"
 #include "skate3_install_paths.h"
 #include "skate3_setup_sources.h"
 #include "skate3_title_update_installer.h"
@@ -38,6 +40,8 @@
 REXCVAR_DECLARE(bool, skate3_skate2_sky);
 // New San Vanelona at night (Sanitarium sky); takes priority over the above.
 REXCVAR_DECLARE(bool, skate3_skate2_night);
+// Startup update check (skate3_updater.cpp).
+REXCVAR_DECLARE(bool, skate3_update_check);
 
 namespace skate3 {
 #if defined(__APPLE__)
@@ -176,10 +180,12 @@ struct Row { bool ready = false; std::string detail, error; };
 
 class SetupDialog final : public rex::ui::ImGuiDialog {
  public:
+  // update: the New San Van components this build needs updated (empty = full setup).
   SetupDialog(rex::ui::ImGuiDrawer* drawer, rex::PathConfig paths, fs::path settings_path,
-              std::shared_ptr<bool> finished, std::function<void(bool)> closed = {})
+              std::shared_ptr<bool> finished, std::function<void(bool)> closed = {},
+              NsvStatus update = {})
       : ImGuiDialog(drawer), paths_(std::move(paths)), settings_path_(std::move(settings_path)),
-        finished_(std::move(finished)), closed_(std::move(closed)) {
+        finished_(std::move(finished)), closed_(std::move(closed)), update_(std::move(update)) {
     sky_choice_ = REXCVAR_GET(skate3_skate2_night) ? 2 : REXCVAR_GET(skate3_skate2_sky) ? 0 : 1;
     inputs_.s3 = {paths_.game_data_root, true};
     rows_[0].ready = ValidateSetupGame(inputs_.s3, 0x454108E6, rows_[0].error);
@@ -240,11 +246,14 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
     draw->AddRect(point(66,208), point(1214,686), IM_COL32(101,131,150,65), 14*s);
     ImGui::SetCursorScreenPos(point(90,225));
     ImGui::PushFont(imgui_drawer()->ui_font_semibold(), 25*s);
-    ImGui::TextUnformatted(sky_step_ ? "Choose your sky" : "Welcome to New San Van"); ImGui::PopFont();
+    ImGui::TextUnformatted(sky_step_ ? "Choose your sky" : Updating() ? "New San Van update"
+                                                                    : "Welcome to New San Van");
+    ImGui::PopFont();
     ImGui::SetCursorScreenPos(point(90,262));
     ImGui::TextColored(ImVec4(.65f,.73f,.78f,1), "%s", sky_step_
         ? "Pick the sky over New San Vanelona. You can change it later in Settings > World."
-        : "Choose your files. Installation starts when you're ready.");
+        : Updating() ? "This version improves New San Van. Your city needs a quick update before you skate."
+                     : "Choose your files. Installation starts when you're ready.");
     if (sky_step_) {
       // Install step 2: the sky over New San Vanelona (skate3_skate2_sky, and
       // skate3_skate2_night, which needs the Sanitarium download).
@@ -314,8 +323,23 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
         "Download the update or use your own file", "Optional  /  packages or extracted content",
         "Required  /  Throwback, Maloof and Fantasy Plaza"};
     ImGui::BeginDisabled(busy_ || installed_);
-    for (int i=0;i<5;++i) {
-      const float y = 300.f + i*57.f;
+    // A city update shows only the sources the changed parts need.
+    std::vector<int> visible;
+    for (int i=0;i<5;++i)
+      if (!Updating() || (i==1 && update_.needs_skate2) || (i==4 && update_.needs_skate2_dlc))
+        visible.push_back(i);
+    if (Updating()) {
+      ImGui::SetCursorScreenPos(point(90,300.f+visible.size()*57.f+8.f));
+      ImGui::PushTextWrapPos(point(1186,0).x);
+      ImGui::TextColored(ImVec4(.66f,.75f,.80f,1), "%s", visible.empty()
+          ? "No files are needed. Only the parts of the city that changed are updated."
+          : "Select the same files you used when you installed. Only the parts of the city that "
+            "changed are updated; your Skate 3 files, settings and saves stay as they are.");
+      ImGui::PopTextWrapPos();
+    }
+    for (size_t slot=0;slot<visible.size();++slot) {
+      const int i = visible[slot];
+      const float y = 300.f + slot*57.f;
       ImGui::PushID(i);
       ImVec2 mark = point(102,y+14);
       if (rows_[i].ready) {
@@ -348,7 +372,7 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
           if (ImGui::Button("X",ImVec2(50*s,34*s))) { rows_[3]={}; inputs_.dlc3.clear(); }
         }
       }
-      if (i<4) draw->AddLine(point(122,y+51),point(1186,y+51),IM_COL32(73,99,118,75));
+      if (slot+1<visible.size()) draw->AddLine(point(122,y+51),point(1186,y+51),IM_COL32(73,99,118,75));
       ImGui::PopID();
     }
     ImGui::EndDisabled();
@@ -360,16 +384,21 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
       ImGui::ProgressBar(total ? std::min(1.f,float(done)/float(total)) : -float(ImGui::GetTime()),
                          ImVec2(1096*s,12*s), "");
     } else {
-      const bool ready = rows_[0].ready && rows_[1].ready && rows_[2].ready && rows_[4].ready && rows_[3].error.empty();
+      const bool ready = Updating()
+          ? (!update_.needs_skate2 || rows_[1].ready) && (!update_.needs_skate2_dlc || rows_[4].ready)
+          : rows_[0].ready && rows_[1].ready && rows_[2].ready && rows_[4].ready && rows_[3].error.empty();
       ImGui::PushTextWrapPos(point(844,0).x);
       ImGui::TextColored(error_.empty()?ImVec4(.66f,.75f,.80f,1):ImVec4(.96f,.60f,.53f,1), "%s",
-          error_.empty() ? installed_ ? "Your city is ready." : ready ? "All required files are ready." : "Add the required files to continue." : error_.c_str());
+          error_.empty() ? installed_ ? (Updating() ? "Your city is up to date." : "Your city is ready.")
+                                      : ready ? "All required files are ready." : "Add the required files to continue."
+                         : error_.c_str());
       ImGui::PopTextWrapPos();
       ImGui::SetCursorScreenPos(point(864,610));
       ImGui::BeginDisabled(!ready && !installed_);
       ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.18f,.49f,.37f,1));
-      if (ImGui::Button(installed_ ? "Start skating" : "Install",ImVec2(318*s,44*s))) {
+      if (ImGui::Button(installed_ ? "Start skating" : Updating() ? "Update city" : "Install",ImVec2(318*s,44*s))) {
         if (installed_) { *finished_=true; Close(); }
+        else if (Updating()) StartUpdate();
         else {
           // The sky choice, then installation. Night is offered only when the
           // Sanitarium download will be installed (or already is).
@@ -399,6 +428,16 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
     for (const auto& entry : fs::directory_iterator(root, ec))
       if (fs::is_regular_file(entry.path() / std::string(kArchive), ec)) return true;
     return false;
+  }
+  bool Updating() const { return !update_.components.empty(); }
+  void StartUpdate() {
+    const auto input=inputs_; const auto paths=paths_; const auto components=update_.components;
+    Job("Updating New San Van. This may take a few minutes...", [this,input,paths,components] {
+      std::string error; const bool ok=UpdateNewSanVan(input,paths,components,copied_,total_,error);
+      if (!ok) REXLOG_ERROR("New San Van update failed: {}",error);
+      else REXLOG_INFO("New San Van update completed ({})",JoinNsvComponents(components));
+      return [this,ok,error] { installed_=ok; error_=error; };
+    });
   }
   void StartInstall() {
     const auto input=inputs_; const auto paths=paths_;
@@ -465,6 +504,7 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
   fs::path settings_path_;
   std::shared_ptr<bool> finished_;
   std::function<void(bool)> closed_;
+  NsvStatus update_;
   SetupInputs inputs_;
   std::array<Row,5> rows_{};
   bool busy_=false,installed_=false,background_attempted_=false;
@@ -478,6 +518,232 @@ class SetupDialog final : public rex::ui::ImGuiDialog {
   std::vector<fs::path> tu_stages_;
   rex::ui::ImmediateTexture* background_ = nullptr;
 };
+
+// Startup check for a newer release, and its download/installation. Shown only
+// when an update exists (or once the player asks to install it).
+struct UpdateOutcome {
+  bool done = false;     // the dialog has finished
+  bool proceed = false;  // continue starting the game (false: quit, or restart into the update)
+};
+
+class UpdateDialog final : public rex::ui::ImGuiDialog {
+ public:
+  UpdateDialog(rex::ui::ImGuiDrawer* drawer, fs::path settings_path,
+               std::shared_ptr<UpdateOutcome> outcome, std::function<void()> closed = {})
+      : ImGuiDialog(drawer), settings_path_(std::move(settings_path)), outcome_(std::move(outcome)),
+        closed_(std::move(closed)) {
+    worker_ = std::thread([this] {
+      std::string detail;
+      result_ = updater::CheckForUpdate(release_, detail);
+      if (result_ != updater::CheckResult::kAvailable && !detail.empty())
+        REXLOG_INFO("update: check skipped ({})", detail);
+      checked_.store(true, std::memory_order_release);
+    });
+  }
+  ~UpdateDialog() { if (worker_.joinable()) worker_.join(); }
+
+ protected:
+  void OnClose() override {
+    if (worker_.joinable()) worker_.join();
+    background_ = nullptr;
+    outcome_->done = true;
+    if (closed_) closed_();
+  }
+  void OnDraw(ImGuiIO& io) override {
+    if (state_ == State::kChecking && checked_.load(std::memory_order_acquire)) {
+      worker_.join();
+      if (result_ == updater::CheckResult::kAvailable) {
+        state_ = State::kAvailable;
+        in_place_ = updater::CanInstallInPlace(in_place_reason_);
+      } else {
+        Finish(true);
+        return;
+      }
+    }
+    // Nothing is drawn until a newer release is confirmed: up to date, offline
+    // or a failed check goes straight on to the game without a flash.
+    if (state_ == State::kChecking) return;
+    if (state_ == State::kInstalling && installed_.load(std::memory_order_acquire)) {
+      worker_.join();
+      if (install_ok_) {
+        std::string error;
+        if (updater::Relaunch(error)) {
+          Finish(false);  // the new version starts; this one quits
+          return;
+        }
+        error_ = error;
+        state_ = State::kRestartManually;
+      } else {
+        state_ = State::kFailed;
+      }
+    }
+    const float saved_dpi=ImGui::GetStyle().FontScaleDpi;
+    ImGui::GetStyle().FontScaleDpi=1.f;
+    if (!background_attempted_) { background_ = Background(imgui_drawer()); background_attempted_ = true; }
+    const float scale = std::min(io.DisplaySize.x / 1280.f, io.DisplaySize.y / 720.f);
+    const float s = std::max(scale, 0.4f);
+    const ImVec2 origin((io.DisplaySize.x - 1280*s)*0.5f, (io.DisplaySize.y - 720*s)*0.5f);
+    auto point = [&](float x, float y) { return ImVec2(origin.x+x*s, origin.y+y*s); };
+    auto* bg = ImGui::GetBackgroundDrawList();
+    if (background_) {
+      const float cover = std::max(io.DisplaySize.x/background_->width, io.DisplaySize.y/background_->height);
+      ImVec2 size(background_->width*cover, background_->height*cover);
+      ImVec2 start((io.DisplaySize.x-size.x)*0.5f, (io.DisplaySize.y-size.y)*0.5f);
+      bg->AddImage(reinterpret_cast<ImTextureID>(background_), start, ImVec2(start.x+size.x,start.y+size.y));
+    }
+    bg->AddRectFilled(ImVec2(0,0), io.DisplaySize, IM_COL32(4,10,17,110));
+    ImGui::SetNextWindowPos(ImVec2(0,0)); ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.93f,.95f,.96f,1));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.15f,.22f,.28f,1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.23f,.33f,.40f,1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.30f,.42f,.48f,1));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6*s);
+    ImGui::PushFont(imgui_drawer()->ui_font(), 16*s);
+    ImGui::Begin("Update", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollWithMouse |
+                 ImGuiWindowFlags_NoScrollbar);
+    DrawPanel(point, s);
+    ImGui::End(); ImGui::PopFont(); ImGui::PopStyleVar(); ImGui::PopStyleColor(5);
+    ImGui::GetStyle().FontScaleDpi=saved_dpi;
+  }
+
+ private:
+  enum class State { kChecking, kAvailable, kInstalling, kFailed, kRestartManually };
+
+  template <typename Point>
+  void DrawPanel(Point point, float s) {
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(point(66,330), point(1214,620), IM_COL32(10,17,24,235), 14*s);
+    draw->AddRect(point(66,330), point(1214,620), IM_COL32(101,131,150,65), 14*s);
+    ImGui::SetCursorScreenPos(point(90,350));
+    ImGui::PushFont(imgui_drawer()->ui_font_semibold(), 25*s);
+    const char* title = state_ == State::kFailed ? "The update couldn't be installed"
+                        : state_ == State::kRestartManually ? "Update installed"
+                                                            : "Update available";
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+    ImGui::SetCursorScreenPos(point(90,392));
+    ImGui::PushTextWrapPos(point(1186,0).x);
+    const std::string current = updater::CurrentVersionDisplay();
+    if (state_ == State::kAvailable) {
+      ImGui::Text("Skate 3 Recompiled+ %s is ready to install. You have %s.", release_.display.c_str(),
+                  current.c_str());
+      ImGui::Spacing();
+      ImGui::TextColored(ImVec4(.66f,.75f,.80f,1), "%s", in_place_
+          ? "The game restarts after updating. Your game files, cities, settings and saves stay as "
+            "they are. If the new version improves New San Van, it asks for your Skate 2 files "
+            "when it starts."
+          : in_place_reason_.c_str());
+    } else if (state_ == State::kInstalling) {
+      const int phase = phase_.load();
+      const uint64_t done = done_.load(), total = total_.load();
+      if (phase == int(updater::Phase::kDownloading) && total) {
+        ImGui::Text("Downloading %s...  %llu of %llu MB", release_.display.c_str(),
+                    (unsigned long long)(done >> 20), (unsigned long long)(total >> 20));
+      } else {
+        ImGui::Text("%s", phase == int(updater::Phase::kDownloading) ? "Downloading..."
+                          : phase == int(updater::Phase::kVerifying) ? "Checking the download..."
+                                                                    : "Installing...");
+      }
+      ImGui::SetCursorScreenPos(point(90,450));
+      const float fraction = phase == int(updater::Phase::kDownloading) && total
+                                 ? std::min(1.f, float(done) / float(total))
+                                 : -float(ImGui::GetTime());
+      ImGui::ProgressBar(fraction, ImVec2(1096*s,12*s), "");
+    } else if (state_ == State::kFailed) {
+      ImGui::TextColored(ImVec4(.96f,.60f,.53f,1), "%s", error_.c_str());
+      ImGui::Spacing();
+      ImGui::TextColored(ImVec4(.66f,.75f,.80f,1),
+          "Your installation hasn't changed. You can download the new version from its release page.");
+    } else {
+      ImGui::TextColored(ImVec4(.66f,.75f,.80f,1), "%s", error_.c_str());
+    }
+    ImGui::PopTextWrapPos();
+    if (state_ == State::kInstalling) return;
+    ImGui::SetCursorScreenPos(point(90,556));
+    if (state_ == State::kAvailable) {
+      if (ImGui::Button("What's new",ImVec2(160*s,44*s))) updater::OpenInBrowser(release_.page_url);
+      ImGui::SetCursorScreenPos(point(520,556));
+      if (ImGui::Button("Don't ask again",ImVec2(200*s,44*s))) {
+        REXCVAR_SET(skate3_update_check, false);
+        rex::cvar::SaveConfigValues(settings_path_, {"skate3_update_check"});
+        REXLOG_INFO("update: checks turned off (Settings > System > Check for Updates)");
+        Finish(true);
+        return;
+      }
+      ImGui::SameLine(0,10*s);
+      if (ImGui::Button("Not now",ImVec2(160*s,44*s))) { Finish(true); return; }
+      ImGui::SameLine(0,10*s);
+      ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.18f,.49f,.37f,1));
+      if (in_place_) {
+        if (ImGui::Button("Update now",ImVec2(300*s,44*s))) StartInstall();
+      } else if (ImGui::Button("Open download page",ImVec2(300*s,44*s))) {
+        updater::OpenInBrowser(release_.page_url);
+      }
+      ImGui::PopStyleColor();
+    } else if (state_ == State::kFailed) {
+      if (ImGui::Button("Open download page",ImVec2(240*s,44*s))) updater::OpenInBrowser(release_.page_url);
+      ImGui::SetCursorScreenPos(point(864,556));
+      ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.18f,.49f,.37f,1));
+      if (ImGui::Button("Continue",ImVec2(318*s,44*s))) Finish(true);
+      ImGui::PopStyleColor();
+    } else {
+      ImGui::SetCursorScreenPos(point(864,556));
+      if (ImGui::Button("Quit",ImVec2(318*s,44*s))) Finish(false);
+    }
+  }
+  void StartInstall() {
+    state_ = State::kInstalling;
+    installed_ = false;
+    worker_ = std::thread([this] {
+      std::string error;
+      install_ok_ = updater::DownloadAndInstall(release_, done_, total_, phase_, error);
+      error_ = error;
+      installed_.store(true, std::memory_order_release);
+    });
+  }
+  void Finish(bool proceed) {
+    outcome_->proceed = proceed;
+    Close();
+  }
+
+  fs::path settings_path_;
+  std::shared_ptr<UpdateOutcome> outcome_;
+  std::function<void()> closed_;
+  State state_ = State::kChecking;
+  std::thread worker_;
+  std::atomic<bool> checked_{false}, installed_{false};
+  updater::CheckResult result_ = updater::CheckResult::kUnavailable;
+  updater::Release release_;
+  bool in_place_ = false, install_ok_ = false;
+  std::string in_place_reason_, error_;
+  std::atomic<uint64_t> done_{0}, total_{0};
+  std::atomic<int> phase_{0};
+  bool background_attempted_ = false;
+  rex::ui::ImmediateTexture* background_ = nullptr;
+};
+
+#if defined(_WIN32)
+// Runs a startup dialog's message loop until `done` (Windows finalizes paths synchronously).
+void RunModal(rex::ui::WindowedAppContext& context, rex::ui::Window* window,
+              const std::function<bool()>& done) {
+  while (!done() && !context.HasQuitFromUIThread()) {
+    context.ExecutePendingFunctionsFromUIThread();
+    MSG message;
+    while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+      if (message.message==WM_QUIT) { context.QuitFromUIThread(); break; }
+      TranslateMessage(&message); DispatchMessageW(&message);
+    }
+    if (window) {
+      window->RequestPaint();
+      if (auto* win=dynamic_cast<rex::ui::Win32Window*>(window))
+        RedrawWindow(win->hwnd(),nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+  }
+}
+#endif
 }
 
 void ShowNewSanVanSetup(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer,
@@ -499,24 +765,63 @@ bool RunNewSanVanSetup(rex::ui::WindowedAppContext& context,rex::ui::Window* win
 #if defined(_WIN32)
   auto finished=std::make_shared<bool>(false);
   auto* dialog=new SetupDialog(drawer,paths,settings_path,finished);
-  while (!*finished && !context.HasQuitFromUIThread()) {
-    context.ExecutePendingFunctionsFromUIThread();
-    MSG message;
-    while (PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
-      if (message.message==WM_QUIT) { context.QuitFromUIThread(); break; }
-      TranslateMessage(&message); DispatchMessageW(&message);
-    }
-    if (window) {
-      window->RequestPaint();
-      if (auto* win=dynamic_cast<rex::ui::Win32Window*>(window))
-        RedrawWindow(win->hwnd(),nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOERASE);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
-  }
+  RunModal(context,window,[&] { return *finished; });
   if (!*finished) dialog->Shutdown();
   return *finished;
 #else
   return false;
+#endif
+}
+
+void ShowNewSanVanUpdate(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer,
+                         rex::PathConfig paths, const fs::path& settings_path, NsvStatus status,
+                         std::function<void(rex::PathConfig)> resume) {
+  auto finished = std::make_shared<bool>(false);
+  auto closed = [&context, paths, resume = std::move(resume)](bool ok) mutable {
+    context.CallInUIThreadDeferred([&context, ok, paths, resume = std::move(resume)]() mutable {
+      if (ok) resume(std::move(paths));
+      else context.QuitFromUIThread();
+    });
+  };
+  new SetupDialog(drawer, std::move(paths), settings_path, finished, std::move(closed),
+                  std::move(status));
+}
+
+bool RunNewSanVanUpdate(rex::ui::WindowedAppContext& context, rex::ui::Window* window,
+                        rex::ui::ImGuiDrawer* drawer, const rex::PathConfig& paths,
+                        const std::filesystem::path& settings_path, NsvStatus status) {
+#if defined(_WIN32)
+  auto finished=std::make_shared<bool>(false);
+  auto* dialog=new SetupDialog(drawer,paths,settings_path,finished,{},std::move(status));
+  RunModal(context,window,[&] { return *finished; });
+  if (!*finished) dialog->Shutdown();
+  return *finished;
+#else
+  return false;
+#endif
+}
+
+void ShowUpdateCheck(rex::ui::WindowedAppContext& context, rex::ui::ImGuiDrawer* drawer,
+                     const fs::path& settings_path, std::function<void()> proceed) {
+  auto outcome = std::make_shared<UpdateOutcome>();
+  auto closed = [&context, outcome, proceed = std::move(proceed)]() mutable {
+    context.CallInUIThreadDeferred([&context, outcome, proceed = std::move(proceed)]() mutable {
+      if (outcome->proceed) proceed();
+      else context.QuitFromUIThread();
+    });
+  };
+  new UpdateDialog(drawer, settings_path, outcome, std::move(closed));
+}
+
+bool RunUpdateCheck(rex::ui::WindowedAppContext& context, rex::ui::Window* window,
+                    rex::ui::ImGuiDrawer* drawer, const std::filesystem::path& settings_path) {
+#if defined(_WIN32)
+  auto outcome=std::make_shared<UpdateOutcome>();
+  new UpdateDialog(drawer,settings_path,outcome);
+  RunModal(context,window,[&] { return outcome->done; });
+  return outcome->done && outcome->proceed;
+#else
+  return true;
 #endif
 }
 }

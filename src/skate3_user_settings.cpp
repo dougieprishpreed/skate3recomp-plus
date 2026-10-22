@@ -12,6 +12,11 @@
 
 #include <toml++/toml.hpp>
 
+REXCVAR_DEFINE_INT32(skate3_settings_revision, 0, "Skate 3",
+                     "One-time settings corrections already applied to this settings.toml "
+                     "(managed by the game; 1 = v0.2a present-mode reset)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace skate3 {
 namespace {
 
@@ -91,6 +96,31 @@ void EnsureDiagnosticSettings(const std::filesystem::path& path) {
       diagnostic |= flag.name.find(term) != std::string::npos;
     if (diagnostic) names.push_back(flag.name);
   }
+  rex::cvar::SaveConfigValues(path, names);
+}
+
+void ApplySettingsRevisions(const std::filesystem::path& path) {
+  // 1 (v0.2a): before v0.2a the settings menu's VRR / Tearing row read the
+  // D3D12 flag (shipped on) while Vulkan ran, and applying any Display setting
+  // then allowed Vulkan immediate / FIFO-relaxed presentation. Reset the
+  // present modes once to the shipped no-tearing setup (mailbox); a choice
+  // made afterwards is kept.
+  if (REXCVAR_GET(skate3_settings_revision) >= 1) {
+    return;
+  }
+  std::vector<std::string_view> names;
+  const auto set = [&names](std::string_view name, const char* value) {
+    if (rex::cvar::GetFlagInfo(name)) {
+      rex::cvar::SetFlagByName(name, value);
+      names.push_back(name);
+    }
+  };
+  set("vulkan_allow_present_mode_immediate", "false");
+  set("vulkan_allow_present_mode_fifo_relaxed", "false");
+  set("vulkan_allow_present_mode_mailbox", "true");
+  set("d3d12_allow_variable_refresh_rate_and_tearing", "false");
+  REXCVAR_SET(skate3_settings_revision, 1);
+  names.push_back("skate3_settings_revision");
   rex::cvar::SaveConfigValues(path, names);
 }
 

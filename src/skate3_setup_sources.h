@@ -28,4 +28,9 @@ bool StageSetupDlc(const SetupDlcSource& source, const std::filesystem::path& st
 bool InstallSetupInputs(const SetupInputs& input, const rex::PathConfig& paths,
                          std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total,
                          std::string& error);
+// Updates only the given New San Van components (skate3_nsv_components.h) of an
+// existing installation, from the Skate 2 sources they need.
+bool UpdateNewSanVan(const SetupInputs& input, const rex::PathConfig& paths,
+                     const std::vector<std::string>& components, std::atomic<uint64_t>& copied,
+                     std::atomic<uint64_t>& total, std::string& error);
 }

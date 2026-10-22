@@ -1,5 +1,6 @@
 #include "generated/skate3_init.h"
 #include "skate3_texture_lookup.h"
+#include "native/skate3_native_performance.h"
 #include "skate3_world_loading.h"
 #include "skate3_perf_recorder.h"
 
@@ -42,7 +43,13 @@ struct Index {
     nodes.clear(); built.clear();
   }
 };
-thread_local Index index;
+// Per thread, built on first use: a namespace-scope thread_local with an
+// allocating constructor runs in every new thread's TLS callback, including
+// threads a DLL starts before this executable's CRT heap exists.
+Index& ThreadIndex() {
+  static thread_local Index index;
+  return index;
+}
 std::atomic<uint32_t> active_batches{0}, mutations{0};
 std::atomic<uint32_t> active_table{0};
 std::atomic<uint64_t> revision{0};
@@ -63,6 +70,7 @@ class Mutation {
     active_ = true;
     mutations.fetch_add(1, std::memory_order_acq_rel);
     before_ = revision.fetch_add(1, std::memory_order_acq_rel);
+    Index& index = ThreadIndex();
     preserve_ = insert_ && index.depth && index.table == table_ &&
                 index.revision == before_;
     if (!preserve_) index.Clear();
@@ -70,6 +78,7 @@ class Mutation {
   void Inserted(uint32_t node) { node_ = node; }
   ~Mutation() {
     if (!active_) return;
+    Index& index = ThreadIndex();
     const auto current = revision.fetch_add(1, std::memory_order_acq_rel);
     const auto remaining = mutations.fetch_sub(1, std::memory_order_acq_rel) - 1;
     uint8_t* base = base_;
@@ -99,7 +108,7 @@ class Mutation {
 }  // namespace
 
 TextureLookupBatch::TextureLookupBatch() {
-  if (!IsSkate2Gameplay()) return;
+  if (!IsSkate2Gameplay() || !skate3::native_scene::PerformanceOptimizationsEnabled(true)) return;
   native_entered_ = true;
   if (native_depth++ == 0) {
     g_native_scenery_registers = REXCVAR_GET(skate3_skate2_native_activation_registers);
@@ -110,6 +119,7 @@ TextureLookupBatch::TextureLookupBatch() {
   }
   if (!REXCVAR_GET(skate3_skate2_texture_lookup_index)) return;
   entered_ = true;
+  Index& index = ThreadIndex();
   if (index.depth++ == 0) {
     index.Clear(); index.disabled = false;
     std::lock_guard lock(batch_registry);
@@ -118,7 +128,9 @@ TextureLookupBatch::TextureLookupBatch() {
 }
 TextureLookupBatch::~TextureLookupBatch() {
   if (native_entered_ && --native_depth == 0) g_native_scenery_registers = false;
-  if (!entered_ || --index.depth != 0) return;
+  if (!entered_) return;
+  Index& index = ThreadIndex();
+  if (--index.depth != 0) return;
   index.Clear(); // Nothing survives the callback, a load, or a map transition.
   std::lock_guard lock(batch_registry);
   if (active_batches.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -131,7 +143,7 @@ TextureLookupResetScope::TextureLookupResetScope(uint32_t table) {
   entered_ = true;
   mutations.fetch_add(1, std::memory_order_acq_rel);
   revision.fetch_add(1, std::memory_order_acq_rel);
-  index.Clear();
+  ThreadIndex().Clear();
 }
 TextureLookupResetScope::~TextureLookupResetScope() {
   if (!entered_) return;
@@ -140,8 +152,10 @@ TextureLookupResetScope::~TextureLookupResetScope() {
 }
 
 bool TryIndexedTextureLookup(PPCContext& ctx, uint8_t* base) {
+  Index& index = ThreadIndex();
   if (!index.depth || index.disabled || uint32_t(ctx.lr) != 0x8280AC8C ||
-      !IsSkate2Gameplay() || !REXCVAR_GET(skate3_skate2_texture_lookup_index)) return false;
+      !IsSkate2Gameplay() || !skate3::native_scene::PerformanceOptimizationsEnabled(true) ||
+      !REXCVAR_GET(skate3_skate2_texture_lookup_index)) return false;
   // This one caller passes separate stack-local key/iterator storage. Do
   // not accelerate another caller with potentially aliased table storage.
   const uint32_t sp = ctx.r1.u32;

@@ -399,3 +399,13 @@ execute_process(
 if(NOT _nsv_cull_register_result EQUAL 0)
   message(FATAL_ERROR "NSV vectorized culling register localization failed")
 endif()
+
+# Scale only current pedestrian speech at the computed gain, under the native
+# lock. No temporary writes to shared speakers or modifications to audio data.
+execute_process(
+  COMMAND "${_nsv_hash_python}" "${SKATE3_SOURCE_DIR}/cmake/PatchPedestrianVolume.py"
+          "${SKATE3_SOURCE_DIR}/generated"
+  RESULT_VARIABLE _pedestrian_volume_result)
+if(NOT _pedestrian_volume_result EQUAL 0)
+  message(FATAL_ERROR "Pedestrian voice volume patch failed")
+endif()

@@ -112,7 +112,8 @@ def stage_shared_tools(out):
     copy(here.parent / 'third_party/recast/License.txt', out / 'tools/LICENSE-Recast.txt')
     copy(here.parent / 'assets/installer/title.png', out / 'title.png')
     todo = ['prepare_new_san_van', 'build_skate2_dlc_maps', 'build_skate2_audio',
-            'build_skate2_livingworld', 'build_jumbotron_video', 'build_nsv_dlc']
+            'build_skate2_livingworld', 'build_jumbotron_video', 'build_nsv_dlc',
+            'extract_update_archive']  # the in-game updater's Linux unpacker
     done = set()
     while todo:
         name = todo.pop()

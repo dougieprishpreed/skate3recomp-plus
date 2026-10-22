@@ -77,6 +77,8 @@ Texture2D<float4> spec2_map : register(t9);
 // sun, rendered natively each frame. Sampled by SampleStaticSun as an
 // additional receive term on every lit branch.
 Texture2D<float2> static_sun : register(t10);
+// Immutable authored indoor footprints, the fifth entry of the t8 table.
+Texture2D<float4> indoor_regions : register(t12);
 // Raw bone palette: 3 float4 rows per bone, column-vector affine [R | t],
 // applied with explicit dots (StructuredBuffer<float4x4> default packing is
 // column-major and would silently transpose the matrices).
@@ -332,6 +334,7 @@ bool ShowcaseLayerOn(float px_x, int bit) {
   int m = ShowcaseMask(px_x);
   return m < 0 || (m & bit) != 0;
 }
+#include "scene_indoor.hlsli"
 #include "scene_shadows.hlsli"
 #include "scene_common.hlsli"
 #include "scene_char.hlsli"
@@ -364,7 +367,7 @@ float4 ShadeSkate2Transparent(VSOut i, float4 albedo, float fog_a,
                           overlay.y > 0.5);
   }
   fog_a *= sh_env.x;  // material multiplier (PS c11.y)
-  lin *= NightGrade();
+  lin *= WorldNightGrade(i.rpos + cam_pos.xyz);
   return ToneOut((lin * fog_a + fog_rgb) * expo, a2, false);
 }
 // The full material shading for every family (see ps_main below; the
@@ -545,7 +548,7 @@ float4 ShadePixel(VSOut i) {
       float3 lmf = float3(1.0, 1.0, 1.0);
       if (misc.z > 0.0) {
         float3 lmg = SampleWorldLightmap(i.uv2);
-        lmf = lerp(lmf, lmg * lmg * NightGrade(), misc.z);
+        lmf = lerp(lmf, lmg * lmg * WorldNightGrade(i.rpos + cam_pos.xyz), misc.z);
       }
       lin = dlin * lmf * misc.w;
       out_a = albedo.a;
@@ -586,7 +589,7 @@ float4 ShadePixel(VSOut i) {
       // (misc.w = m_params[0].x; 0 on native Skate 3 items).
       if (misc.w > 0.0) {
         float3 slm = SampleWorldLightmap(i.uv2);
-        lin *= lerp(float3(1.0, 1.0, 1.0), slm * slm * NightGrade(), misc.w);
+        lin *= lerp(float3(1.0, 1.0, 1.0), slm * slm * WorldNightGrade(i.rpos + cam_pos.xyz), misc.w);
       }
     } else {
       // Environment families: macro overlay (0.5-neutral, fades under decal
@@ -651,9 +654,14 @@ float4 ShadePixel(VSOut i) {
       // keeping the stands in the roof's shade while the floodlit floor
       // shows its own baked lighting.
       float nsm_strength = (fam > 1.5 && fam < 2.5 && misc.y < -0.5) ? scene_opts.z : nsm_p.x;
-      float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, i.nrm, i.pos.xy),
-                    SampleStaticSunStrength(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy,
-                                            nsm_strength));
+      // The static term first: it finds the covering ceiling (headroom), and
+      // the CSM term then ignores casters above that ceiling (CsmCeilingLimit).
+      float night_sun = 0.0, night_open = 0.0, headroom = 0.0;
+      float s_static = SampleStaticSunStrengthNight(i.rpos + cam_pos.xyz, i.nrm, i.pos.xy,
+                                                    nsm_strength, night_sun, night_open, headroom);
+      float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, i.nrm, i.pos.xy,
+                                        CsmCeilingLimit(headroom)),
+                    s_static);
       // Lightmap fetch = the console's semantics: BILINEAR, CLAMPED, mip 0.
       // The composed atlas pages are single-level on console and the fetch
       // constants carry clamp_x/clamp_y = 2. Sampling them with the aniso-8
@@ -687,6 +695,23 @@ float4 ShadePixel(VSOut i) {
       // patches for the decode window (the ramp-stencil "black square
       // flash"); serve unshadowed brightness until the real page lands.
       float3 lml = tint.r > 0.0 ? min(lmg * lmg, s + sh_color.rgb) : lmg * lmg;
+      // Night: the sun the lightmap holds is gone (everywhere outdoors and in
+      // semi-open areas; in an enclosed interior where it reaches by day), so
+      // that share falls to the shade level, as under the live shadow. No
+      // facing test: stored vertex normals are not reliably oriented (every
+      // other use takes abs()).
+      float3 lml_day = lml;
+      lml = lerp(lml, min(lml, sh_color.rgb), night_sun);
+      // A semi-open area at night keeps its own baked colour at its lamp
+      // level: the luminance is capped at (night_grade.w's fraction x 10)
+      // times the shade colour's (skate3_skate2_night_open_area_light), so
+      // no baked sun patch or sun shadow survives; WorldNightGrade leaves it
+      // ungraded.
+      if (night_open > 0.0) {
+        float lamp = frac(night_grade.w) * 10.0 * dot(sh_color.rgb, float3(0.299, 0.587, 0.114));
+        float lum = dot(lml_day, float3(0.299, 0.587, 0.114));
+        lml = lerp(lml, lml_day * min(1.0, lamp / max(lum, 1e-4)), night_open);
+      }
       // GetTangentLight (world-shading v2). vnd is the tangent-space mapped
       // normal from the material's base normal map (t5) + detail map (t8 at
       // uv * misc.w): xy = 2*base + 2*detail - 2, z = 2*base.z - 1.
@@ -901,11 +926,12 @@ float4 ShadePixel(VSOut i) {
     }
     // New San Vanelona at night: baked and pre-lit world light (every family
     // here except the emissive 12 incandescent, 14 scrollincandescent and 16
-    // Skate 2 incandescent, whose lightmap shares dim above).
+    // Skate 2 incandescent, whose lightmap shares dim above). Authored
+    // interiors keep their light (WorldNightGrade).
     bool emissive = (fam > 11.5 && fam < 12.5) || (fam > 13.5 && fam < 14.5) ||
                     (fam > 15.5 && fam < 16.5);
     if (!emissive) {
-      lin *= NightGrade();
+      lin *= WorldNightGrade(i.rpos + cam_pos.xyz);
     }
     // Fog -> exposure -> tonemap -> sqrt, then the postfx uber's measured
     // 1.41 scene multiplier (same as the character branch).
@@ -993,7 +1019,8 @@ float4 ShadePixel(VSOut i) {
     light = min(light, sqrt(s + sh_color.rgb));
   }
   if (tint.r > 0.0 && tint.b == 0.0) {
-    light *= sqrt(NightGrade());  // New San Vanelona at night (gamma space)
+    // New San Vanelona at night (gamma space); interiors keep their light.
+    light *= sqrt(WorldNightGrade(i.rpos + cam_pos.xyz));
   }
   float3 lit = albedo.rgb * light;
   if (tint.r < 1.5 && mat_tint.w > 0.0 && misc.x <= 0.0) {

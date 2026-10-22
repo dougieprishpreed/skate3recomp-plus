@@ -13,6 +13,7 @@
 #include <rex/ui/presenter.h>
 
 #include "skate3_native_scene.h"
+#include "skate3_demo_path.h"
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
                     "Small top-right corner readout of which renderer produced the "
@@ -96,6 +97,12 @@ REXCVAR_DECLARE(double, skate3_native_render_scene_refl_bias_y);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_refl_bias_auto);
 // Smoothness / pacing.
 REXCVAR_DECLARE(bool, skate3_native_render_scene_smooth_camera);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_smooth_entities);
+REXCVAR_DECLARE(bool, skate3_native_performance_skate3);
+REXCVAR_DECLARE(bool, skate3_native_performance_nsv);
+REXCVAR_DECLARE(bool, vulkan_allow_present_mode_immediate);
+REXCVAR_DECLARE(bool, vulkan_allow_present_mode_mailbox);
+REXCVAR_DECLARE(bool, vulkan_allow_present_mode_fifo_relaxed);
 REXCVAR_DECLARE(double, skate3_native_render_scene_smooth_camera_filter_ms);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_sort_opaque);
 REXCVAR_DECLARE(double, skate3_guest_fps_cap);
@@ -958,12 +965,19 @@ void DrawSceneContentSection() {
 
 void DrawPacingSection() {
   REXCVAR_SET(skate3_native_render_scene_smooth_camera,
-              CvarCheckbox("Smooth camera + entity poses",
+              CvarCheckbox("Smooth camera",
                            REXCVAR_GET(skate3_native_render_scene_smooth_camera),
                            "The guest updates its camera/entities on its own ~200 Hz "
                            "sim tick; raw poses judder at high render rates. Re-times "
                            "them on the host clock (1 kHz camera sampler + pose "
                            "interpolation, a few ms of camera latency)."));
+  REXCVAR_SET(skate3_native_render_scene_smooth_entities,
+              CvarCheckbox("Smooth entity poses",
+                           REXCVAR_GET(skate3_native_render_scene_smooth_entities),
+                           "Retime player, clothing, traffic and prop poses with the "
+                           "smoothed camera. Off isolates pose history; capture, foot "
+                           "and cloth fixes stay active. Raw poses may judder against "
+                           "a smoothed camera. Re-enabling starts fresh histories."));
   {
     float w = float(REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms));
     if (ImGui::SliderFloat("camera filter (ms, 0 = off)", &w, 0.0f, 100.0f, "%.0f")) {
@@ -977,6 +991,48 @@ void DrawPacingSection() {
           "exactly for ~25 ms extra camera latency. 0 reverts to raw "
           "interpolation.");
     }
+  }
+  ImGui::SeparatorText("Performance comparisons (restart)");
+  REXCVAR_SET(skate3_native_performance_skate3,
+              CvarCheckbox("Recent optimizations: Skate 3 maps",
+                           REXCVAR_GET(skate3_native_performance_skate3),
+                           "Compare the four shared mesh decode, descriptor lookup, "
+                           "output-view and scene-capacity optimizations. Restart "
+                           "after changing. New San Van uses its separate switch."));
+  REXCVAR_SET(skate3_native_performance_nsv,
+              CvarCheckbox("Recent optimizations: New San Van",
+                           REXCVAR_GET(skate3_native_performance_nsv),
+                           "Compare optional host preparation, lookup and upload "
+                           "optimizations, including the four shared paths. Restart "
+                           "after changing. Visual, streaming-readiness, shadow and "
+                           "character fixes remain active."));
+  ImGui::SeparatorText("Vulkan presentation (restart)");
+  {
+    // These are the existing SDK controls, read at swapchain creation. Request
+    // one mode, allowing its normal guaranteed FIFO fallback when unavailable.
+    const bool immediate = REXCVAR_GET(vulkan_allow_present_mode_immediate);
+    const bool mailbox = REXCVAR_GET(vulkan_allow_present_mode_mailbox);
+    const bool relaxed = REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed);
+    int preference = !immediate && mailbox && !relaxed ? 0 :
+                     !immediate && !mailbox && !relaxed ? 1 :
+                     !immediate && !mailbox && relaxed ? 2 :
+                     immediate && !mailbox && !relaxed ? 3 : 4;
+    const char* labels[] = {"Mailbox (no tearing)", "FIFO (VSync)",
+                            "FIFO relaxed (may tear)", "Immediate (may tear)",
+                            "Custom allowed modes"};
+    if (ImGui::Combo("Preferred mode", &preference, labels, 5) && preference < 4) {
+      REXCVAR_SET(vulkan_allow_present_mode_immediate, preference == 3);
+      REXCVAR_SET(vulkan_allow_present_mode_mailbox, preference == 0);
+      REXCVAR_SET(vulkan_allow_present_mode_fifo_relaxed, preference == 2);
+    }
+    ImGui::TextWrapped("Restart after changing. Unsupported modes fall back to FIFO. "
+                       "The guest FPS cap is separate.");
+    using Presenter = rex::ui::Presenter;
+    const auto sync = Presenter::GetHostPresentSync();
+    ImGui::Text("Current presentation: %s",
+                sync == Presenter::HostPresentSync::kMailbox ? "Mailbox" :
+                sync == Presenter::HostPresentSync::kFifo ? "FIFO / FIFO relaxed" :
+                sync == Presenter::HostPresentSync::kTearing ? "Tearing" : "Unknown");
   }
   REXCVAR_SET(skate3_native_render_scene_sort_opaque,
               CvarCheckbox("Front-to-back opaque sort",
@@ -1279,6 +1335,7 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
 }
 
 void RenderModeIndicator::OnDraw(ImGuiIO& io) {
+  skate3::demo_path::UpdateStartup();
   // Force-show while the native scene renderer is switched off (F5, the
   // settings Renderer row, or the boot-time hook-layer master) or has hit an
   // unrecoverable failure and permanently yields to the emulated output:

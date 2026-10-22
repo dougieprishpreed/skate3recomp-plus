@@ -26,6 +26,19 @@ class CommandDiagnostics(unittest.TestCase):
 
 
 class MacManifest(unittest.TestCase):
+    def test_app_version_follows_generated_build_header(self):
+        with tempfile.TemporaryDirectory(prefix='NSV version ') as tmp:
+            build = Path(tmp)
+            header = build / 'include/skate3_version.h'
+            header.parent.mkdir()
+            for version in ('0.2.1', '1.20.3'):
+                header.write_text('#define SKATE3_VERSION_STRING "0.2a-dev"\n'
+                                  f'#define SKATE3_VERSION_NUMERIC "{version}"\n')
+                self.assertEqual(package.numeric_build_version(build), version)
+            header.write_text('#define SKATE3_VERSION_NUMERIC "0.2a-dev"\n')
+            with self.assertRaisesRegex(ValueError, 'Missing numeric build version'):
+                package.numeric_build_version(build)
+
     def test_bundled_manifest_is_relocatable_and_preserves_driver_metadata(self):
         with tempfile.TemporaryDirectory(prefix="NSV manifest user's ") as tmp:
             root = Path(tmp)

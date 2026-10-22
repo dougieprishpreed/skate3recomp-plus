@@ -352,7 +352,10 @@ struct DrawItem {
   // rescue, 4 = ropa state rescue, 5 = ropa mode-flip hold (previous state
   // re-published while the flipped mode's decode is still in flight),
   // 6 = publish-time incoherent-palette heal (cached palette substituted
-  // after the dense 32-sample spread gate failed).
+  // after the dense 32-sample spread gate failed). Later producers:
+  // 9 = LW gap fill, 10 = LW native palette serve,
+  // 11 = authoritative packed palette serve (including player pieces),
+  // 12 = rigid-world clone rescue. Copies preserve the original tag.
   uint8_t dbg_src = 0;
   // The palette was captured from an ORTHOGRAPHIC (CSM caster-cascade)
   // bank. The game does not reliably re-evaluate fine bone animation for
@@ -454,6 +457,8 @@ inline unsigned BamGeometryProbeGroup(const DrawItem& item) {
 
 struct FrameScene {
   uint64_t generation = 0;
+  uint64_t world_identity = 0;  // map-load serial and destination NSV bit
+  uint32_t indoor_lighting_map = 0;  // destination-scoped authored coverage
   float view_proj[16] = {};
   float cam_pos[3] = {};
   // Raw guest projection matrix (viewcam +0x60, row-vector, m23 = 1),
@@ -484,6 +489,7 @@ struct FrameScene {
   // Guest frames since those rows were last captured (0 = this frame);
   // the static sun-shadow gate and its flash diagnostics key on it.
   uint32_t shadow_age = 0;
+  uint64_t shadow_capture_frame = 0;  // distinct guest receiver observation
   // Extended to c0..c11: c10.x = scene exposure (2.5), c11.y = the material
   // multiplier (1.0), consumed by the exact world-shading tone chain.
   float shadow_rows[48] = {};

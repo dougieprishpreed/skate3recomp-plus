@@ -1,4 +1,6 @@
 #include "native/skate3_native_draw_shader_paths.h"
+#include "native/skate3_native_world_policy.h"
+#include "native/skate3_native_actor_history.h"
 // Native scene renderer, game-thread half: captures the hooked MeshContext
 // stream and guest render state, and builds/publishes the per-frame
 // FrameScene. The render-thread RHI half lives in
@@ -6,6 +8,7 @@
 // skate3_native_scene_state.h.
 
 #include "skate3_native_scene.h"
+#include "skate3_freecam_input.h"
 #include "native/skate3_native_scene_capacity.h"
 #include "native/skate3_native_world_item_storage.h"
 #include "native/skate3_native_cull_probe.h"
@@ -38,12 +41,22 @@
 #endif
 
 #include <rex/cvar.h>
+#include "native/skate3_native_performance.h"
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_BOOL(skate3_skate2_hide_inherited_backdrop, true, "Skate 3",
                     "Hide native district proxies and Danny Way backdrop assets inherited by New San Van")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_performance_skate3, true, "Skate 3",
+                    "Enable the four shared native performance paths in Skate 3 maps; restart to compare")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_performance_nsv, true, "Skate 3",
+                    "Enable optional NSV host preparation, lookup and upload optimizations; restart to compare")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_smooth_entities, true, "Skate 3",
+                    "Retime entity poses with the smoothed camera; off isolates pose history while preserving capture fixes")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_scene_item_reserve_growth, true, "Skate 3",
                     "Grow pooled native scene-item capacity geometrically without changing items")
@@ -72,6 +85,10 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_env_specular, true, "Skate 3",
                     "environment-cube reflections weighted by its fresnel (storefront "
                     "glass, the Waterfront railing symbols), and its transparent-surface "
                     "lighting. Off = the Skate 3 formulas.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_local_indoor_lighting, true, "Skate 3",
+                    "Keep original baked lighting beneath authored Downtown ceilings and "
+                    "in Community Center's subway while outdoor enhanced shadows remain.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_skate2_stadium_crowd_shade, true, "Skate 3",
                     "Keep the Stadium's crowd seating in the roof's shade while the rest "
@@ -120,7 +137,7 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, true, "Skate 3",
                     "sun/shadow/AO structure), and the texture payload revalidation "
                     "re-decodes pages that were captured before composition.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmap_smooth, true, "Skate 3",
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmap_smooth, false, "Skate 3",
                     "Smooth baked lighting: reconstruct the lightmap atlas with a "
                     "cubic B-spline (four bilinear taps) instead of the games' single "
                     "bilinear tap, which draws the low-resolution baked shadows as "
@@ -137,7 +154,7 @@ REXCVAR_DEFINE_INT32(skate3_native_render_scene_debug, 0, "Skate 3",
                      "3=limit to 20 items, 4=depth test disabled")
     .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 4, "Skate 3",
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_msaa, 2, "Skate 3",
                      "MSAA sample count for the native scene (1 = off, 2/4/8). Distant "
                      "thin geometry (railings, wires) shimmers without it; mipmaps only "
                      "fix texture aliasing. Applies live: the scene pipeline family and "
@@ -809,7 +826,7 @@ REXCVAR_DEFINE_DOUBLE(skate3_native_render_scene_shadow_static_budget_ms, 1.5,
                       "(a hitch that grows with the session in dense areas).")
     .range(0.0, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 4096,
+REXCVAR_DEFINE_INT32(skate3_native_render_scene_shadow_static_size, 2048,
                      "Skate 3",
                      "Static sun-shadow map resolution per cascade tile "
                      "(the map is three tiles). At the default radius the "
@@ -3097,6 +3114,7 @@ struct ItemWarmStats {
 uint64_t BeginItemWarm(uint32_t mesh, bool new_content, bool& fresh) {
   fresh = false;
   if (!skate3::world_loading::IsSkate2Gameplay() ||
+      !PerformanceOptimizationsEnabled(true) ||
       !REXCVAR_GET(skate3_skate2_worker_item_cores)) return 0;
   std::lock_guard lock(g_item_cache_mutex);
   // At the cap, new addresses fall back to the original walk. Never free a
@@ -3128,6 +3146,7 @@ uint64_t BeginItemWarm(uint32_t mesh, bool new_content, bool& fresh) {
 bool TryWarmedItemCore(uint8_t* base, uint32_t mesh, DrawItem& item,
                        ItemBindingWatch& watch) {
   if (!skate3::world_loading::IsSkate2Gameplay() ||
+      !PerformanceOptimizationsEnabled(true) ||
       !REXCVAR_GET(skate3_skate2_worker_item_cores)) return false;
   std::unique_ptr<WarmedItemCore> ready;
   uint64_t generation = 0;
@@ -5992,6 +6011,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // The bank / PS-bank / pending-fixup reads below are raw loads; recover
   // read faults for the whole post-draw path (POSIX; no-op on Windows).
   GuestReadRecoveryScope guest_read_recovery(base);
+  const uint64_t world_identity = skate3::world_loading::RenderWorldIdentity();
   // Fog rows: grab c5/c6 from the first 3D draw whose bank c4 row matches
   // the last built scene's camera (main-pass layout; tolerant of one frame
   // of camera motion). See g_fog_rows. The same camera-keyed draws also
@@ -6060,6 +6080,11 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
             return 0;
           }
           static std::unordered_map<uint32_t, int> cache;
+          static uint64_t cache_world = ~uint64_t(0);
+          if (cache_world != world_identity) {
+            cache.clear();  // shader-object addresses are reused by map loads
+            cache_world = world_identity;
+          }
           auto it = cache.find(obj);
           if (it != cache.end()) {
             return it->second;
@@ -6426,6 +6451,7 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
           g_shadow_have = true;
           g_shadow_frame_done = true;
           g_shadow_rows_frame = g_guest_frame;
+          g_shadow_world_identity = world_identity;
         }
       }
       // tree / proxyworld frame rows (see FrameScene::family_rows): their PS
@@ -7977,6 +8003,30 @@ bool UpdateFreecam(FrameScene& scene, const float cam_view[16], double now) {
   } else {
     fc.mouse_anchored = false;
   }
+#else
+  // Cross-platform host input (skate3_freecam_input.h, from upstream PR #148):
+  // the window's key state and right-drag mouse deltas, mirrored on the UI
+  // thread and drained here. VirtualKey values equal the Win32 VK_* codes above.
+  using rex::ui::VirtualKey;
+  const auto down = [](VirtualKey vk) { return freecam_input::IsKeyDown(vk); };
+  mv_f = (down(VirtualKey::kW) ? 1.0 : 0.0) - (down(VirtualKey::kS) ? 1.0 : 0.0);
+  mv_r = (down(VirtualKey::kD) ? 1.0 : 0.0) - (down(VirtualKey::kA) ? 1.0 : 0.0);
+  mv_u = ((down(VirtualKey::kE) || down(VirtualKey::kSpace)) ? 1.0 : 0.0) -
+         ((down(VirtualKey::kQ) || down(VirtualKey::kC)) ? 1.0 : 0.0);
+  lk_yaw = (down(VirtualKey::kRight) ? 1.0 : 0.0) - (down(VirtualKey::kLeft) ? 1.0 : 0.0);
+  lk_pitch = (down(VirtualKey::kUp) ? 1.0 : 0.0) - (down(VirtualKey::kDown) ? 1.0 : 0.0);
+  zoom_dir = (down(VirtualKey::kZ) ? 1.0 : 0.0) - (down(VirtualKey::kX) ? 1.0 : 0.0);
+  if (down(VirtualKey::kShift) || down(VirtualKey::kLShift) || down(VirtualKey::kRShift)) {
+    speed_mult = 4.0;
+  } else if (down(VirtualKey::kControl) || down(VirtualKey::kLControl) ||
+             down(VirtualKey::kRControl)) {
+    speed_mult = 0.2;
+  }
+  int32_t mouse_dx = 0, mouse_dy = 0;
+  freecam_input::DrainMouseDelta(mouse_dx, mouse_dy);
+  constexpr double kRadPerPixel = 0.0022;  // ~0.13 deg per pixel
+  mouse_yaw = mouse_dx * kRadPerPixel;
+  mouse_pitch = -mouse_dy * kRadPerPixel;
 #endif
 
   // Look: arrow keys drive a smoothed angular velocity (cinematic ease-in/
@@ -8441,8 +8491,20 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // stream) or holds (perspective stream fresh; interleaving the two
     // sawtooths the wheel phase).
     double last_persp_t = 0.0;
+    // Consecutive ingests from the same captured instance/world. Used only
+    // to distinguish motion across a missing observation from a teleport;
+    // this does not change ring keys or permit cross-instance claims.
+    uint32_t motion_ctx = 0;
+    uint32_t motion_owner = 0;
+    uint64_t motion_world = 0;
+    unsigned motion_samples = 0;
   };
   static std::unordered_map<uint64_t, DynHist> s_hist;
+  if (!REXCVAR_GET(skate3_native_render_scene_smooth_entities)) {
+    // A re-enable starts fresh; no old pose ring can bridge the comparison.
+    s_hist.clear();
+    return;
+  }
   static uint64_t s_frame = 0;
   ++s_frame;
   // Bone-signal recorder window state (see BoneSigAppend). Written on a
@@ -8745,6 +8807,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       }
     }
     DynHist& h = *hp;
+    skate3::actor_history::Retime(item, key, h.count, h.period, 0.0);
     h.seen = s_frame;
     if (trk != nullptr) {
       trk->ring_n = h.count;
@@ -8935,6 +8998,77 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           // its smoothed lag (the speed-scaled garment jumping). Genuine
           // teleports/respawns still clear the 1.5 m character gate.
           discontinuity = d2 > (skinned || item.ropa ? 2.25f : 0.09f);
+          // The distance gate above assumes one ordinary observation. A
+          // hitch can contain several ticks of valid travel (run259: 1.88m
+          // in 79ms). Resetting that history renders a zero-lag actor against
+          // the delayed camera, then steps backward as history fills again.
+          // For an established SAME instance across a missing observation,
+          // test deviation from its preceding motion over a comparable time span, using sample times.
+          // Prediction is only a continuity test: rendering still interpolates
+          // the original observed poses. Normal ticks, clone claims, stale
+          // histories, size changes and rigid props retain their old gates.
+          const double motion_dt = stamp - latest.t;
+          if (discontinuity && (skinned || item.ropa) && h.count >= 3 &&
+              h.motion_samples >= 3 && item.ctx != 0 &&
+              h.motion_ctx == item.ctx && h.motion_owner == item.lw_entity &&
+              scene.world_identity != 0 && h.motion_world == scene.world_identity &&
+              !item.retained && !item.caster_bank &&
+              motion_dt > 1.5 * h.period && motion_dt <= 0.1) {
+            // Match the velocity-measurement interval to the missing interval.
+            // Extrapolating a single tick magnifies ordinary limb animation
+            // and timestamp noise by the hitch/tick ratio. Only use observed
+            // samples from this same instance; never borrow an older owner.
+            int back = 1;
+            const int available = std::min(h.count, int(h.motion_samples));
+            while (back + 1 < available &&
+                   latest.t - h.ring[(h.newest + kRing - back) % kRing].t < motion_dt) {
+              ++back;
+            }
+            const DynPose& prev = h.ring[(h.newest + kRing - back) % kRing];
+            const double prev_dt = latest.t - prev.t;
+            if (prev_dt >= motion_dt && prev_dt <= 0.1 + h.period &&
+                (!skinned || prev.b.size() == item.bones.size())) {
+              const float ratio = float(motion_dt / prev_dt);
+              const auto residual2 = [&](const float* cur, const float* last,
+                                         const float* old, size_t offset,
+                                         size_t stride) {
+                float sum = 0.0f;
+                for (size_t axis = 0; axis < 3; ++axis) {
+                  const size_t j = offset + axis * stride;
+                  const float e = cur[j] - last[j] - (last[j] - old[j]) * ratio;
+                  sum += e * e;
+                }
+                return sum;
+              };
+              float error2 = 1e30f;
+              if (skinned) {
+                // Same non-spinning weighted reference policy as the original
+                // jump gate; a wheel's affine translation is not body travel.
+                const size_t n = std::min(h.cen.size(), item.bones.size() / 12);
+                for (size_t bone = 0; bone < n; ++bone) {
+                  if (h.cen[bone][0] > 0.5f) {
+                    error2 = std::min(error2, residual2(item.bones.data(),
+                        latest.b.data(), prev.b.data(), bone * 12 + 3, 4));
+                  }
+                }
+                if (error2 == 1e30f) {
+                  error2 = residual2(item.bones.data(), latest.b.data(),
+                                     prev.b.data(), 3, 4);
+                }
+              } else {
+                error2 = residual2(item.world, latest.w, prev.w, 12, 1);
+                // Do not excuse a rigid garment's rotation discontinuity.
+                for (int row = 0; row < 3; ++row) {
+                  for (int col = 0; col < 3; ++col) {
+                    const int j = row * 4 + col;
+                    const float delta = item.world[j] - latest.w[j];
+                    error2 = std::max(error2, delta * delta * 4.0f);
+                  }
+                }
+              }
+              discontinuity = !(error2 <= 2.25f);
+            }
+          }
           if (discontinuity && !skinned && d2 < 2.25f) {
             // A rigid step that only the tightened bound caught = a
             // close-clone mispair that would have LERPED (the prop jitter).
@@ -8959,6 +9093,15 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       if (trk != nullptr) {
         trk->ing = 1;
       }
+      const bool fresh_motion = !item.retained && !item.caster_bank;
+      const bool same_motion_instance = fresh_motion && h.count != 0 &&
+          h.motion_ctx == item.ctx && h.motion_owner == item.lw_entity &&
+          h.motion_world == scene.world_identity;
+      h.motion_samples = !fresh_motion ? 0 :
+          (same_motion_instance ? std::min(h.motion_samples + 1, unsigned(kRing)) : 1);
+      h.motion_ctx = item.ctx;
+      h.motion_owner = item.lw_entity;
+      h.motion_world = scene.world_identity;
       h.newest = h.count == 0 ? 0 : (h.newest + 1) % kRing;
       DynPose& p = h.ring[h.newest];
       p.t = stamp;
@@ -9437,6 +9580,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         }
       }
     }
+    skate3::actor_history::Retime(item, key, h.count, h.period, play_e);
     if (bs_rec) {
       BoneSigAppend(1, key, now, play_e,
                     skinned ? item.bones.data() : item.world,
@@ -10235,6 +10379,8 @@ void DumpNsvSubmissions(uint8_t* base, const SubmitRecord* records, size_t count
 }  // namespace
 
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
+  const uint64_t world_identity = skate3::world_loading::RenderWorldIdentity();
+  const uint32_t indoor_map = skate3::world_loading::NativeIndoorLightingMap(world_identity);
   skate3::native_cull_probe::OnGuestFrame(g_guest_frame + 1);
   if (!SceneEnabled()) {
     return;
@@ -10441,8 +10587,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   }
 
   FrameScene scene;
+  scene.world_identity = world_identity;
+  scene.indoor_lighting_map = indoor_map;
   const bool nsv_items = skate3::world_loading::IsSkate2Gameplay();
-  const bool reuse_world_draws = nsv_items && REXCVAR_GET(skate3_skate2_world_item_storage);
+  const bool reuse_world_draws = nsv_items && PerformanceOptimizationsEnabled(true) &&
+      REXCVAR_GET(skate3_skate2_world_item_storage);
   WorldDrawBuffers world_draw_buffers;
   scene.items = TakeSceneItems(reuse_world_draws ? &world_draw_buffers : nullptr);
   if (reuse_world_draws) {
@@ -10452,7 +10601,8 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       REXLOG_INFO("native-scene: NSV world-item storage reuse enabled (fresh draw lists, bounded host buffers)");
     }
   }
-  const bool geometric_items = REXCVAR_GET(skate3_native_scene_item_reserve_growth) &&
+  const bool geometric_items = PerformanceOptimizationsEnabled(nsv_items) &&
+      REXCVAR_GET(skate3_native_scene_item_reserve_growth) &&
       (!nsv_items || REXCVAR_GET(skate3_skate2_scene_item_reserve_growth));
   if (nsv_items || geometric_items) {
     const size_t before_capacity = scene.items.capacity();
@@ -11136,6 +11286,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  skate3::actor_history::Begin(base, scene, frame_clock_s, g_guest_frame);
   // Publish-gap telemetry and fill ("skater flickered invisible for a
   // moment"): a skinned/ropa/character mesh that published recently can
   // vanish from the publish stream for 1-2 built frames at high render
@@ -11147,10 +11298,11 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // diagnosable.
   {
     struct PubTrack {
-      uint64_t frame = 0;
+      uint64_t frame = 0, seen = 0, world = 0;
+      uint32_t owner = 0;
       DrawItem item;
     };
-    static std::unordered_map<uint32_t, PubTrack> s_last_pub;
+    static std::unordered_map<uint64_t, PubTrack> s_last_pub;
     static uint64_t s_pub_frame = 0;
     ++s_pub_frame;
     if (s_last_pub.size() > 4096) {
@@ -11161,7 +11313,19 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             (item.skinned && !item.bones.empty()))) {
         continue;
       }
-      PubTrack& t = s_last_pub[item.mesh];
+      // Mesh assets are shared by player/AI/cars. A fallback may only
+      // reuse THIS live context's same owner in this exact world epoch.
+      skate3::native_entity::CtxInfo ident;
+      if (item.ctx == 0 || !skate3::native_entity::LookupCtx(item.ctx, &ident) ||
+          !ident.view_live) continue;
+      const uint64_t key = (uint64_t(item.mesh) << 32) | item.ctx;
+      PubTrack& t = s_last_pub[key];
+      if (t.world != scene.world_identity || t.owner != ident.entity) {
+        t = {};
+        t.world = scene.world_identity;
+        t.owner = ident.entity;
+      }
+      t.seen = s_pub_frame;
       const uint64_t gap = t.frame != 0 ? s_pub_frame - t.frame : 0;
       if (item.char_family != 0 && item.caster_bank) {
         // The main-pass fixup missed and this piece reached publish as its
@@ -11172,7 +11336,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         // store shadow-bank state as the good copy.
         if (t.frame != 0 && gap <= 2 && !t.item.caster_bank) {
           item = t.item;
-          t.frame = s_pub_frame;
+          // Keep frame at the last REAL main-view observation: refreshing
+          // it here let a caster-only pose renew itself indefinitely.
+          // Preserve the original producer tag;11 is an authoritative
+          // pack serve and12 is a rigid-world rescue, not fallback kinds.
           static std::atomic<uint64_t> s_bank_swaps{0};
           const uint64_t n = s_bank_swaps.fetch_add(1, std::memory_order_relaxed);
           if (n < 8 || (n & 255u) == 0) {
@@ -11200,11 +11367,14 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
     if (REXCVAR_GET(skate3_native_render_scene_dyn_gap_fill)) {
-      for (auto& [mesh, t] : s_last_pub) {
-        if (t.frame == 0 || t.frame == s_pub_frame) {
+      for (auto& [key, t] : s_last_pub) {
+        if (t.frame == 0 || t.seen == s_pub_frame || t.world != scene.world_identity) {
           continue;  // published this frame (or placeholder)
         }
         const uint64_t gap = s_pub_frame - t.frame;
+        skate3::native_entity::CtxInfo live;
+        if (!skate3::native_entity::LookupCtx(t.item.ctx, &live) ||
+            !live.view_live || live.entity != t.owner) continue;
         if (gap <= 2) {
           // t.frame stays at the last REAL publish, so the fill self-limits
           // to two frames and the telemetry above still sees the true gap
@@ -11215,11 +11385,20 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
           if (n < 8 || (n & 1023u) == 0) {
             REXLOG_INFO(
                 "native-scene: dyn gap fill mesh={:08X} age={} ropa={} fam={} (n={})",
-                mesh, gap, t.item.ropa ? 1 : 0, t.item.char_family, n + 1);
+                uint32_t(key >> 32), gap, t.item.ropa ? 1 : 0, t.item.char_family, n + 1);
           }
         }
       }
     }
+    // Context keys are per instance, unlike the old mesh-only cache. Retire
+    // unseen owners promptly instead of accumulating retired actors until
+    // the growth backstop clears every live fallback at once.
+    for (auto it = s_last_pub.begin(); it != s_last_pub.end();) {
+      if (it->second.world != scene.world_identity ||
+          s_pub_frame - it->second.seen > 8) it = s_last_pub.erase(it);
+      else ++it;
+    }
+
   }
   trace_capture(scene.items.empty() ? "empty-scene" : "scene-built", view, scene.items.size());
   if (scene.items.empty()) {
@@ -11717,6 +11896,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // pose with a host-clock-interpolated one so panning is smooth at render
   // rate. All consumers (items, sky follow, sorting, outline) use the
   // smoothed pose coherently.
+  bool retime_entities = false;
   if (REXCVAR_GET(skate3_native_render_scene_smooth_camera)) {
     // Publish the ViewCamera for the ~1 kHz sampler thread and make sure it
     // runs (see CamSamplerLoop).
@@ -11801,9 +11981,17 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       std::memcpy(scene.cam_pos, smooth_cam, sizeof(smooth_cam));
       // Keep the skater/NPCs/props in phase with the smoothed camera:
       // interpolate their palettes/worlds at the same playback time.
-      InterpolateDynamicItems(base, scene, now_s);
+      retime_entities = true;
     }
   }
+
+  // Even with camera smoothing off, disabling entity retiming clears its
+  // histories. A later re-enable cannot inherit poses from before the toggle.
+  if (retime_entities || !REXCVAR_GET(skate3_native_render_scene_smooth_entities)) {
+    InterpolateDynamicItems(base, scene, frame_clock_s);
+  }
+
+  skate3::actor_history::End(scene, g_latest_cam_tick, retime_entities);
 
   // Hor+ ultrawide scale for this frame's camera (1.0 when the output is not
   // wide). The matrices are widened after the camera overrides below; the
@@ -12130,9 +12318,10 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       scene.traffic_valid[k] = true;
     }
   }
-  if (g_shadow_have) {
+  if (g_shadow_have && g_shadow_world_identity == scene.world_identity) {
     std::memcpy(scene.shadow_rows, g_shadow_rows, sizeof(g_shadow_rows));
     scene.shadow_valid = true;
+    scene.shadow_capture_frame = g_shadow_rows_frame;
     // Same freshness pattern as the char CSM biases below: outdoor scenes
     // re-capture every frame, so anything past a couple of seconds means the
     // current venue's environment shader never produces a sane bank.
@@ -12681,6 +12870,9 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  // A loader can finish on another guest thread while this frame is built.
+  // Never relabel or publish outgoing records as a destination-world scene.
+  if (skate3::world_loading::RenderWorldIdentity() != scene.world_identity) return;
   g_last_publish_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::steady_clock::now().time_since_epoch())
                               .count(),

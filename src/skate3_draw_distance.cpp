@@ -60,7 +60,7 @@
 // World streaming diagnostics (skate3_world_loading.cpp).
 REXCVAR_DECLARE(bool, skate3_world_load_probe);
 
-REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 2.0, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_draw_distance_scale, 1.0, "Skate 3",
                       "Scale the distance at which small world meshes "
                       "(foliage, props, street furniture) stop being drawn. "
                       "1 = original console behavior. Larger values draw more "
@@ -73,7 +73,7 @@ REXCVAR_DEFINE_DOUBLE(skate3_skate2_draw_distance_scale, 0.0, "Skate 3",
                       "world contribution culling, not just buildings.")
     .range(0.0, 16.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 2.0, "Skate 3",
+REXCVAR_DEFINE_DOUBLE(skate3_lod_distance_scale, 1.0, "Skate 3",
                       "Scale the distances at which skaters, pedestrians and "
                       "vehicles switch to lower-detail models. 1 = original "
                       "console behavior.")

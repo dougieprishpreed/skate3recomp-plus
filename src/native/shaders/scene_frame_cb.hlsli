@@ -111,6 +111,16 @@ cbuffer S : register(b1) {
   // world's baked light, matched to the Sanitarium's night lightmaps (see
   // kNightGrade); w > 0.5 enables. Zero outside night mode and New San Van.
   float4 night_grade;
+  // Designated interior zones (cb[228..235]): minXZ, inverse cell size, width;
+  // height, header address, vertical feather reciprocal (negative = covered
+  // open places off), lattice texels per metre.
+  // Width0 disables it; all Skate3/other-map frames keep these rows zero.
+  float4 indoor_grid;
+  float4 indoor_info;
+  // cb[236..239]: z = live shadows of things above a zone's roof stop at it
+  // (skate3_skate2_indoor_ceiling_shadows); x, y, w unused. Zero outside
+  // New San Van.
+  float4 indoor_day;
 };
 // The night factor for baked and pre-lit world light (1 when off). Applied
 // after the shadow clamp, so live shadows keep their daylight contrast.

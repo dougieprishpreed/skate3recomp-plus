@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 0.2.0 LANGUAGES CXX)
+project(skate3 VERSION 0.2.1 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "0.2")
+set(SKATE3_FULL_VERSION "0.2a")
 set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.
@@ -243,8 +243,12 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_demo_path.cpp
     src/skate3_draw_distance.cpp
     src/skate3_fov.cpp
+    src/skate3_freecam_input.cpp
+    src/skate3_instance_free_defer.cpp
     src/skate3_iso_installer.cpp
     src/skate3_nsv_installer.cpp
+    src/skate3_nsv_components.cpp
+    src/skate3_updater.cpp
     src/skate3_setup_sources.cpp
     src/skate3_setup_process.cpp
     src/skate3_setup_dialog.cpp
@@ -252,6 +256,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_menu_probe.cpp
     src/skate3_nsv_menu.cpp
     src/native/skate3_native_diagnostics.cpp
+    src/native/skate3_native_actor_history.cpp
     src/native/skate3_native_entity.cpp
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp

@@ -1,4 +1,5 @@
 #include "skate3_nsv_installer.h"
+#include "skate3_nsv_components.h"
 #include "skate3_install_paths.h"
 #include "skate3_setup_process.h"
 #include "skate3_iso_installer.h"
@@ -134,25 +135,16 @@ bool ExtractDlcForSetup(const fs::path& source, const fs::path& stage, uint32_t 
 }
 
 bool IsNewSanVanInstalled(const fs::path& app_root, const fs::path& content_root) {
-  if (fs::exists(app_root / "install-state/nsv-transaction.json")) return false;
-  const auto mods = app_root / "mods/skate2";
-  // Older navigation policies need the water/road/crosswalk rebake.
-  const char* required[] = {"world-support-gvr-v1/BAM_COMPLETE_V2",
-      "world-support-gvr-v1/NAVIGATION_COMPLETE_V4", "proxy-v1/manifest.json",
-      "sky-water-v1/SKY_WATER_COMPLETE_V1", "jumbotron/attract.s2jv",
-      "dlc-maps-v1/DLC_MAPS_COMPLETE_V1",
-      "dlc-maps-v1/DLC_School/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_School/LIVINGWORLD_COMPLETE_V5",
-      "dlc-maps-v1/DLC_Community_Center/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Community_Center/LIVINGWORLD_COMPLETE_V5",
-      "dlc-maps-v1/DLC_Parkade/NAVIGATION_COMPLETE_V4", "dlc-maps-v1/DLC_Parkade/LIVINGWORLD_COMPLETE_V5",
-      "audio-v1/AUDIO_COMPLETE_V2",
-      "livingworld-v1/LIVINGWORLD_COMPLETE_V1", "nsv_spawns.txt"};
-  for (auto name : required) if (!fs::is_regular_file(mods / name)) return false;
-  return fs::is_regular_file(content_root / kContent / kMenu);
+  // Every component at the version this build needs (skate3_nsv_components.cpp).
+  return GetNewSanVanStatus(app_root, content_root).state == NsvInstallState::kComplete;
 }
 
 namespace {
+// components empty: the complete installation. Otherwise only those components
+// (an update of an existing installation): only the sources they need are read.
 bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
-             std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total, std::string& error) {
+             std::atomic<uint64_t>& copied, std::atomic<uint64_t>& total, std::string& error,
+             const std::vector<std::string>& components = {}) {
   fs::path scratch;
   const auto app = ContentInstallRoot(paths.user_data_root);
   const auto resources = SetupResourceRoot();
@@ -175,31 +167,53 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
     fs::create_directories(app / "install-state");
     scratch = app / "install-state" / ("nsv-" + std::to_string(std::random_device{}()));
     if (!fs::create_directory(scratch)) { error = "Unable to create installer scratch."; return false; }
+    const bool full = components.empty();
+    bool needs_skate2 = full, needs_dlc = full;
+    for (const auto& component : NsvComponents())
+      if (std::find(components.begin(), components.end(), component.id) != components.end()) {
+        needs_skate2 |= component.needs_skate2;
+        needs_dlc |= component.needs_skate2_dlc;
+      }
     fs::path source = input.s2.path;
     bool ok = true;
-    if (!input.s2.extracted) {
+    if (needs_skate2 && !input.s2.extracted) {
       source = scratch / "source";
       ok = ExtractXboxIso(input.s2.path, source, 0x4541087F, copied, total, error);
     }
     // Preparation has no useful byte total; show the wizard's indeterminate state.
     total = 0;
-    for (const auto& p : input.dlc2)
-      if (ok) ok = StageSetupDlc(p, scratch / "dlc", 0x4541087F, copied, error);
-    for (const auto& p : input.dlc3)
-      if (ok) ok = StageSetupDlc(p, scratch / "prepared", 0x454108E6, copied, error);
+    if (needs_dlc)
+      for (const auto& p : input.dlc2)
+        if (ok) ok = StageSetupDlc(p, scratch / "dlc", 0x4541087F, copied, error);
+    // Skate 3 DLC is installed with the city only; an update leaves it alone.
+    if (full)
+      for (const auto& p : input.dlc3)
+        if (ok) ok = StageSetupDlc(p, scratch / "prepared", 0x454108E6, copied, error);
+    fs::create_directories(scratch / "prepared");
     if (ok) {
-      const std::vector<std::string> args = {
+      std::vector<std::string> args = {
 #if !defined(_WIN32)
           "-B",  // Keep read-only resources and the macOS app signature intact.
 #endif
           "-E", "-s", rex::path_to_utf8(script),
-          "--source", rex::path_to_utf8(fs::absolute(source / "data")),
           "--native-data", rex::path_to_utf8(fs::absolute(paths.game_data_root / "data")),
-          "--dlc-source", rex::path_to_utf8(scratch / "dlc"),
           "--stage", rex::path_to_utf8(scratch / "prepared"),
           "--root", rex::path_to_utf8(app), "--content-root", rex::path_to_utf8(paths.user_data_root),
           "--ffmpeg", rex::path_to_utf8(media), "--nav-baker", rex::path_to_utf8(baker)};
+      if (needs_skate2) {
+        args.push_back("--source");
+        args.push_back(rex::path_to_utf8(fs::absolute(source / "data")));
+      }
+      if (needs_dlc) {
+        args.push_back("--dlc-source");
+        args.push_back(rex::path_to_utf8(scratch / "dlc"));
+      }
+      if (!full) {
+        args.push_back("--components");
+        args.push_back(JoinNsvComponents(components));
+      }
       ok = RunSetupProcess(python, args, app / "install-state/new-san-van.log", error);
+      if (!ok && !full) error = "The city update did not finish. Your previous city is unchanged. " + error;
     }
     std::error_code ec; fs::remove_all(scratch, ec);
     return ok;
@@ -209,6 +223,25 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
     return false;
   }
 }
+}
+
+bool UpdateNewSanVan(const SetupInputs& input, const rex::PathConfig& paths,
+                     const std::vector<std::string>& components, std::atomic<uint64_t>& copied,
+                     std::atomic<uint64_t>& total, std::string& error) {
+  if (components.empty()) {
+    error = "Nothing to update.";
+    return false;
+  }
+  auto s2 = input.s2;
+  bool needs_skate2 = false;
+  for (const auto& component : NsvComponents())
+    if (std::find(components.begin(), components.end(), component.id) != components.end())
+      needs_skate2 |= component.needs_skate2;
+  if (needs_skate2 && !ValidateSetupGame(s2, 0x4541087F, error)) {
+    if (error.empty()) error = "Select the Skate 2 game files.";
+    return false;
+  }
+  return Prepare(input, paths, copied, total, error, components);
 }
 
 bool InstallSetupInputs(const SetupInputs& input, const rex::PathConfig& paths,

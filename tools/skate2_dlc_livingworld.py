@@ -5,7 +5,6 @@ shared Recast/NavPower bake. Traffic is derived separately from connected,
 authored street surfaces; open map edges are never invented as destinations.
 Only unpublished streams are modified. Source archives are read-only.
 """
-from collections import deque
 import json
 import mmap
 import struct
@@ -13,13 +12,14 @@ from pathlib import Path
 
 import numpy as np
 
-from inspect_sfil import assets, dictionary
+from inspect_sfil import assets, dictionary, materials, resolve_reference
 from world_archive import entries, decode_archive_payload
 from build_skate2_world_support import records, make_catalog, guid
 from skate2_pedestrian_areas import pedestrian_surface_triangles, rain_footprints
 from skate2_navigation import collision, bake_cell
 from navpower_resource import read_rw_object
 from vlt64 import h64
+import skate2_dlc_roads as roads
 
 STREAMS = ('DLC_School', 'DLC_Community_Center', 'DLC_Parkade')
 
@@ -169,74 +169,6 @@ class StreetRaster:
         return result
 
 
-def skeleton(mask):
-    """Topology-preserving thinning; no machine-installed SciPy dependency."""
-    mask=np.pad(mask,1).astype(bool)
-    for iteration in range(512):
-        changed=False
-        for step in (0,1):
-            p=[mask[:-2,1:-1],mask[:-2,2:],mask[1:-1,2:],mask[2:,2:],
-               mask[2:,1:-1],mask[2:,:-2],mask[1:-1,:-2],mask[:-2,:-2]]
-            neighbors=sum(a.astype(np.uint8) for a in p)
-            transitions=sum((~p[i]&p[(i+1)%8]).astype(np.uint8) for i in range(8))
-            a,b,c,d=(p[0],p[2],p[4],p[6])
-            cond=(~(a&b&c)&~(b&c&d)) if step==0 else (~(a&b&d)&~(a&c&d))
-            remove=mask[1:-1,1:-1]&(neighbors>=2)&(neighbors<=6)&(transitions==1)&cond
-            if remove.any():changed=True;mask[1:-1,1:-1][remove]=False
-        if not changed:return mask[1:-1,1:-1]
-    raise ValueError('street thinning did not converge')
-
-
-def street_cycles(raster):
-    mask=np.isfinite(raster.y)
-    # Preserve only a driveable street core, not one-pixel texture seams.
-    for _ in range(2):
-        padded=np.pad(mask,1)
-        mask &= padded[:-2,1:-1]&padded[2:,1:-1]&padded[1:-1,:-2]&padded[1:-1,2:]
-    points=set(map(tuple,np.argwhere(skeleton(mask))))
-    graph={}
-    for p in points:
-        neighbors=[]
-        for dx,dz in ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)):
-            q=(p[0]+dx,p[1]+dz)
-            if q not in points:continue
-            if dx and dz and ((p[0]+dx,p[1]) in points or (p[0],p[1]+dz) in points):continue
-            if abs(float(raster.y[p])-float(raster.y[q]))<=.5:neighbors.append(q)
-        graph[p]=neighbors
-    # Remove dead ends: traffic must have a complete supported continuation.
-    dead=deque(p for p,n in graph.items() if len(n)<2)
-    while dead:
-        p=dead.popleft()
-        if p not in graph:continue
-        for q in graph.pop(p):
-            if q in graph:
-                graph[q].remove(p)
-                if len(graph[q])<2:dead.append(q)
-    seen=set();cycles=[]
-    for root in sorted(graph):
-        if root in seen:continue
-        parent={root:None};depth={root:0};seen.add(root)
-        stack=[(root,iter(sorted(graph[root])))]
-        component=[]
-        while stack:
-            p,it=stack[-1]
-            q=next(it,None)
-            if q is None:stack.pop();continue
-            if q==parent[p]:continue
-            if q not in seen:
-                seen.add(q);parent[q]=p;depth[q]=depth[p]+1
-                stack.append((q,iter(sorted(graph[q]))));continue
-            if q not in depth or depth[q]>=depth[p]:continue
-            chain=[p];cursor=p
-            while cursor is not None and cursor!=q:cursor=parent[cursor];chain.append(cursor)
-            if cursor==q and len(chain)>120:
-                component.append(chain)
-        # One coherent circuit per connected street component avoids placing
-        # independent, conflicting traffic streams on the same lane.
-        if component:cycles.append(max(component,key=len))
-    return cycles
-
-
 def collision_clear(points,mesh):
     """Swept center/side rays reject walls and low ceilings along a lane."""
     low,high=mesh.min(1),mesh.max(1)
@@ -286,45 +218,99 @@ def raster_hits(tris,p):
     return np.where(good&(u>=0)&(v>=0)&(u+v<=1),u*a[:,1]+v*b[:,1]+(1-u-v)*c[:,1],np.inf)
 
 
-def boundary_cycles(raster):
-    """Complete continuations around supported street islands, including caps.
+def rendered_triangles(stream):
+    """Every drawn static triangle of the high cells and Global (sky and LOD proxies excluded)."""
+    parts=[];seen=set()
+    for path in sorted(p for p in stream.iterdir() if p.name.startswith('cPres_') and
+                       (p.name.endswith('_high.xsf') or p.name=='cPres_Global.xsf')):
+        for ident,_,(arena,res) in assets(path.read_bytes()):
+            if ident in seen:continue
+            seen.add(ident);objects=list(dictionary(arena));mats=dict(materials(arena))
+            for obj in objects:
+                if obj['kind']!=0xeb0023:continue
+                at=obj['pointer']
+                _,offset=resolve_reference(arena,struct.unpack_from('>I',arena,at+36)[0])
+                shader=mats[(offset-20)//12].get('AttribulatorMaterialName',{}).get('text','').lower()
+                if shader.startswith(('sky.','proxyworld')):continue
+                declaration=objects[struct.unpack_from('>I',arena,at+40)[0]]['pointer']
+                stride=arena[declaration+(struct.unpack_from('>H',arena,declaration+8)[0]+1)*16]
+                if struct.unpack_from('>I',arena,declaration+20)[0]&63!=57 or stride<12:continue
+                vb=objects[struct.unpack_from('>I',arena,at+52)[0]-1];ib=objects[struct.unpack_from('>I',arena,at+48)[0]-1]
+                vertices=np.ndarray((vb['size']//stride,3),'>f4',buffer=res,offset=vb['pointer'],strides=(stride,4)).astype(np.float32)
+                indices=np.frombuffer(res,'>u2',ib['size']//2,ib['pointer'])
+                draws,relative=struct.unpack_from('>I',arena,at+56)[0],struct.unpack_from('>I',arena,at+68)[0]
+                for i in range(draws):
+                    # Xenos primitives: 4 list, 5 fan, 6 strip (winding is irrelevant here).
+                    primitive,base,start,count=struct.unpack_from('>4I',arena,at+relative+i*16)
+                    seq=indices[start:start+count].astype(np.int64)+base
+                    if primitive==4:idx=seq[:len(seq)//3*3].reshape(-1,3)
+                    elif primitive==6 and len(seq)>=3:idx=np.stack((seq[:-2],seq[1:-1],seq[2:]),1)
+                    elif primitive==5 and len(seq)>=3:idx=np.stack((np.full(len(seq)-2,seq[0]),seq[1:-1],seq[2:]),1)
+                    else:continue
+                    if len(idx) and idx.max()<len(vertices):parts.append(vertices[idx])
+    return np.concatenate(parts) if parts else np.empty((0,3,3),np.float32)
 
-    Used when barriers divide a street network into open strips. A circuit
-    follows the two sides of a strip and rounds its supported end; it never
-    creates a continuation beyond the geometry or through a collision barrier.
+
+def visible_collision(mesh,tags,rendered,reach=.3):
+    """Collision a driver can see: tagged surfaces, and tag-0 faces with a drawn surface on them.
+
+    Tag 0 marks the invisible walls that hold the skater inside the play
+    area, but the same tag is also used on the collision of drawn props such
+    as construction fencing. A tag-0 face counts as solid when at least half
+    of its sample points lie within `reach` of a drawn triangle.
     """
-    mask=np.isfinite(raster.y)
-    for _ in range(2):
-        padded=np.pad(mask,1)
-        mask &= padded[:-2,1:-1]&padded[2:,1:-1]&padded[1:-1,:-2]&padded[1:-1,2:]
-    edges={}
-    for x,z in np.argwhere(mask):
-        for dx,dz,a,b in ((0,-1,(x-.5,z-.5),(x+.5,z-.5)),
-                          (1,0,(x+.5,z-.5),(x+.5,z+.5)),
-                          (0,1,(x+.5,z+.5),(x-.5,z+.5)),
-                          (-1,0,(x-.5,z+.5),(x-.5,z-.5))):
-            xx,zz=x+dx,z+dz
-            if xx<0 or zz<0 or xx>=mask.shape[0] or zz>=mask.shape[1] or not mask[xx,zz]:edges.setdefault(a,[]).append(b)
-    cycles=[]
-    while edges:
-        start=min(edges);chain=[start];p=start
-        while p in edges:
-            q=edges[p].pop()
-            if not edges[p]:del edges[p]
-            if q==start:break
-            chain.append(q);p=q
-        if q==start and len(chain)>150:
-            points=np.array(chain)
-            # Raster corners lie between samples; recover their street floor
-            # from the nearest supported corner rather than merging heights.
-            points=np.floor(points+.5).astype(int)
-            for i,ij in enumerate(points):
-                x,z=ij
-                if not np.isfinite(raster.y[x,z]):
-                    candidates=[(xx,zz) for xx in (x-1,x) for zz in (z-1,z) if np.isfinite(raster.y[xx,zz])]
-                    if candidates:points[i]=candidates[0]
-            cycles.append(points.tolist())
-    return cycles
+    visible=tags[:,1]!=0
+    hidden=np.flatnonzero(~visible)
+    if not len(hidden) or not len(rendered):return visible
+    tris=mesh[hidden].astype(np.float64)
+    span=np.maximum.reduce([np.linalg.norm(tris[:,1]-tris[:,0],axis=1),np.linalg.norm(tris[:,2]-tris[:,0],axis=1),
+                            np.linalg.norm(tris[:,2]-tris[:,1],axis=1)])
+    steps=np.clip(np.ceil(span/.5).astype(int),1,100);points,owner=[],[]
+    for n in np.unique(steps):
+        sel=np.flatnonzero(steps==n)
+        u,v=np.meshgrid(np.linspace(0,1,n+1),np.linspace(0,1,n+1),indexing='ij');keep=u+v<=1+1e-9
+        u,v=u[keep],v[keep];t=tris[sel]
+        points.append((t[:,None,0]+u[None,:,None]*(t[:,None,1]-t[:,None,0])+v[None,:,None]*(t[:,None,2]-t[:,None,0])).reshape(-1,3))
+        owner.append(np.repeat(sel,len(u)))
+    points,owner=np.concatenate(points),np.concatenate(owner)
+    face=np.cross(tris[:,1]-tris[:,0],tris[:,2]-tris[:,0])
+    face/=np.maximum(np.linalg.norm(face,axis=1),1e-12)[:,None]
+    size=2.;cells=np.floor(points[:,[0,2]]/size).astype(np.int64)
+    order=np.lexsort((cells[:,1],cells[:,0]));cells,points,owner=cells[order],points[order],owner[order]
+    pnormal=face[owner]
+    wanted={tuple(c) for c in np.unique(cells,axis=0)}
+    drawn=rendered.astype(np.float64)
+    lo=np.floor((drawn.min(1)[:,[0,2]]-reach)/size).astype(np.int64);hi=np.floor((drawn.max(1)[:,[0,2]]+reach)/size).astype(np.int64)
+    bucket={}
+    for k in np.flatnonzero(((hi-lo)<4096).all(1)):
+        for x in range(lo[k,0],hi[k,0]+1):
+            for z in range(lo[k,1],hi[k,1]+1):
+                if (x,z) in wanted:bucket.setdefault((x,z),[]).append(k)
+    normal=np.cross(drawn[:,1]-drawn[:,0],drawn[:,2]-drawn[:,0])
+    area=np.linalg.norm(normal,axis=1);good=area>1e-9
+    normal=np.divide(normal,area[:,None],out=np.zeros_like(normal),where=good[:,None])
+    hit=np.zeros(len(points),bool)
+    bounds=np.flatnonzero(np.any(np.diff(cells,axis=0)!=0,axis=1))+1
+    for s0,s1 in zip(np.r_[0,bounds],np.r_[bounds,len(points)]):
+        ids=bucket.get(tuple(cells[s0]))
+        if not ids:continue
+        ids=np.array(ids);ids=ids[good[ids]];t,nn,p=drawn[ids],normal[ids],points[s0:s1]
+        rel=p[:,None,:]-t[None,:,0]
+        d=np.einsum('pti,ti->pt',rel,nn)
+        q=rel-d[...,None]*nn[None]
+        e0,e1=t[:,1]-t[:,0],t[:,2]-t[:,0]
+        d00,d01,d11=(e0*e0).sum(1),(e0*e1).sum(1),(e1*e1).sum(1);den=d00*d11-d01*d01
+        d20,d21=np.einsum('pti,ti->pt',q,e0),np.einsum('pti,ti->pt',q,e1)
+        bv=(d11*d20-d01*d21)/den;bw=(d00*d21-d01*d20)/den;bu=1-bv-bw
+        # Inside the drawn triangle, or within `reach` of it across an edge.
+        slack=reach/np.sqrt(np.maximum(den/np.maximum(np.maximum(d00,d11),1e-12),1e-12))
+        inside=(bu>=-slack)&(bv>=-slack)&(bw>=-slack)
+        # The drawn surface must lie along the face (not the road it stands on).
+        along=np.abs(pnormal[s0:s1]@nn.T)>.7
+        hit[s0:s1]=(inside&along&(np.abs(d)<=reach)).any(1)
+    share=np.bincount(owner,hit,len(hidden))/np.maximum(np.bincount(owner,minlength=len(hidden)),1)
+    visible=visible.copy();visible[hidden[share>=.5]]=True
+    return visible
 
 
 def vehicle_geometry(stream,areas,mesh,helper,scratch):
@@ -380,134 +366,33 @@ def native_lane_normals(points):
     return normals/np.maximum(lengths[:,None],1e-12)
 
 
-def refine_boundary_lane(lane,raster,core):
-    """Keep turnaround ribbons on pavement at concave street corners.
-
-    Smoothing a supported contour can cut a corner with its outer boundary,
-    discarding an otherwise usable open-road circuit. Move adjacent centers
-    away from unsupported boundary samples, taper the correction, then run
-    the ordinary native-normal, slope, curve and collision qualification.
-    No correction may leave the Recast floor or move more than 1.5 metres.
-    Failed refinements retain the original candidate for normal rejection.
-    """
-    original=lane.copy()
-    ts=np.linspace(0,1,9)
-    for _ in range(20):
-        sums=np.zeros_like(lane);weights=np.zeros(len(lane));bad_count=0
-        def inspect(centers,sides):
-            nonlocal bad_count
-            for edge in sides:
-                heights=raster.height(edge.reshape(-1,3)).reshape(len(lane),9)
-                bad=~np.isfinite(heights)|(np.abs(heights-edge[:,:,1])>.6)
-                bad_count+=int(bad.sum())
-                for j,k in np.argwhere(bad):
-                    delta=edge[j,k]-centers[j,k];delta[1]=0
-                    length=np.linalg.norm(delta)
-                    if length<.01:continue
-                    push=-delta/length
-                    for at,w in ((j,1-ts[k]),((j+1)%len(lane),ts[k])):
-                        sums[at]+=push*w;weights[at]+=w
-        curves=curve_samples(lane)
-        inspect(curves[0],curves[1:])
-        d=np.roll(lane,-1,axis=0)-lane
-        n=np.column_stack((-d[:,2],np.zeros(len(lane)),d[:,0]))
-        n/=np.maximum(np.linalg.norm(n,axis=1)[:,None],1e-9)
-        line=lane[:,None]+ts[None,:,None]*d[:,None]
-        inspect(line,[line-1.75*n[:,None],line+1.75*n[:,None]])
-        if not bad_count:return lane
-        delta=sums/np.maximum(weights[:,None],1)
-        for _ in range(3):delta=(np.roll(delta,1,axis=0)+2*delta+np.roll(delta,-1,axis=0))/4
-        lane=lane+.3*delta
-        height=core.height(lane)
-        if not np.isfinite(height).all():return original
-        lane[:,1]=height
-        if np.linalg.norm((lane-original)[:,[0,2]],axis=1).max()>1.5:return original
-    return original
+def lane_support_failures(lane,raster,core):
+    """Segments failing the existing native ribbon/floor qualification."""
+    direction=np.roll(lane,-1,axis=0)-lane
+    length=np.linalg.norm(direction,axis=1)
+    bad=(length<.1)|(np.abs(direction[:,1])/np.maximum(length,1e-9)>.35)
+    bad|=native_lane_normals(lane)[:,1]<np.cos(np.radians(20))
+    for curve in curve_samples(lane,17):
+        y=raster.height(curve.reshape(-1,3)).reshape(len(lane),17)
+        bad|=(~np.isfinite(y)|(np.abs(y-curve[:,:,1])>.6)).any(1)
+    normals=np.column_stack((-direction[:,2],np.zeros(len(lane)),direction[:,0]))
+    normals/=np.maximum(np.linalg.norm(normals,axis=1)[:,None],1e-9)
+    for t in np.linspace(0,1,17):
+        center=lane+t*direction
+        for side in (-1.75,0.,1.75):
+            y=raster.height(center+side*normals)
+            bad|=~np.isfinite(y)|(np.abs(y-center[:,1])>.6)
+    bad|=~np.isfinite(core.height(lane))
+    return bad
 
 
-def _driving_candidates(areas,mesh,driveable=None,boundary=False):
-    street=np.concatenate((areas['road'],areas['crosswalk']))
-    if not len(street):return [],dict(candidates=0,rejected=0)
-    if driveable is not None and not len(driveable):return [],dict(candidates=0,rejected=0)
-    raster=StreetRaster(street);core=StreetRaster(driveable) if driveable is not None and len(driveable) else raster
-    routes=[];cycles=boundary_cycles(core) if boundary else street_cycles(core);details=[]
-    for cycle in cycles:
-        ij=np.array(cycle);p=np.column_stack((ij[:,0]+core.origin[0],core.y[ij[:,0],ij[:,1]],ij[:,1]+core.origin[1])).astype(float)
-        # Smooth the one-meter survey; evaluate its actual street support after
-        # smoothing, rather than trusting a skeleton through a junction.
-        for _ in range(36 if boundary else 12):p=(np.roll(p,1,axis=0)+2*p+np.roll(p,-1,axis=0))/4
-        p=p[::4]
-        d=np.roll(p,-1,axis=0)-np.roll(p,1,axis=0)
-        normal=np.column_stack((-d[:,2],np.zeros(len(p)),d[:,0]))
-        normal/=np.maximum(np.linalg.norm(normal,axis=1)[:,None],1e-9)
-        before=len(routes)
-        for sign in ((0,) if boundary else (1,-1,0)):
-            if sign==0 and len(routes)>before:break
-            lane=p+sign*2.1*normal
-            if boundary:
-                lane=core.project(lane)
-                distinct=np.linalg.norm(lane-np.roll(lane,1,axis=0),axis=1)>.1
-                lane=lane[distinct]
-            height=core.height(lane)
-            if not np.isfinite(height).all():
-                details.append(dict(stage='center-support',point=lane[np.flatnonzero(~np.isfinite(height))[0]].tolist()));continue
-            lane[:,1]=height
-            if sign<0:lane=lane[::-1].copy()
-            if boundary:lane=refine_boundary_lane(lane,raster,core)
-            if (native_lane_normals(lane)[:,1]<np.cos(np.radians(20))).any():
-                details.append(dict(stage='native-lane-normal',point=lane[0].tolist()));continue
-            direction=np.roll(lane,-1,axis=0)-lane
-            length=np.linalg.norm(direction,axis=1)
-            if (length<.1).any() or (np.abs(direction[:,1])/length>.35).any():
-                details.append(dict(stage='slope',max_slope=float((np.abs(direction[:,1])/length).max())));continue
-            # Both boundaries, at intermediate samples, must stay on the same
-            # street floor. This keeps lanes off sidewalks and stacked decks.
-            normal=np.column_stack((-direction[:,2],np.zeros(len(lane)),direction[:,0]))
-            normal/=np.maximum(np.linalg.norm(normal,axis=1)[:,None],1e-9)
-            supported=True
-            for t in np.linspace(0,1,9):
-                sample=lane+t*direction
-                for side in (-1.75,0.,1.75):
-                    y=raster.height(sample+side*normal)
-                    bad=~np.isfinite(y)|(np.abs(y-sample[:,1])>.6)
-                    if bad.any():
-                        details.append(dict(stage='edge-support',side=side,t=float(t),point=(sample+side*normal)[np.flatnonzero(bad)[0]].tolist()));supported=False;break
-                if not supported:break
-            if supported:
-                curves=curve_samples(lane)
-                for curve in curves:
-                    samples=curve.reshape(-1,3);y=raster.height(samples)
-                    if not np.isfinite(y).all() or (np.abs(y-samples[:,1])>.6).any():supported=False;break
-                smooth=curves[0][:,:-1].reshape(-1,3)
-                if supported and collision_clear(smooth,mesh):
-                    routes.append(lane)
-                    if sign==0:break
-                else:details.append(dict(stage='curve-support-or-collision',point=lane[0].tolist()))
-        # The center continuation is a fallback only when both offset lanes
-        # cannot pass car clearance. Do not overlap it with a valid offset.
-    return routes,dict(candidates=len(cycles)*(1 if boundary else 3),
-                       rejected=len(cycles)*(1 if boundary else 3)-len(routes),
-                       boundary_continuations=boundary,details=details)
-
-
-def route_coverage(routes,core):
-    """Supported pavement reached by a qualified lane, not candidate length.
-
-    Bound the survey to 16K deterministic floor probes. Nine samples per
-    Hermite segment resolve the four-metre decimation without trusting chords.
-    The 3.5m radius covers the lane and its adjacent opposing lane; broad
-    asphalt areas do not force cars onto every square metre of pavement.
-    """
-    ij=np.argwhere(np.isfinite(core.y))
-    ij=ij[::max(1,int(np.ceil(len(ij)/16000)))]
-    probes=np.column_stack((ij[:,0]+core.origin[0],core.y[ij[:,0],ij[:,1]],ij[:,1]+core.origin[1]))
-    if not routes:return dict(probes=len(probes),covered=0)
-    samples=np.concatenate([curve_samples(r)[0][:,:-1].reshape(-1,3) for r in routes])
-    covered=0
-    for i in range(0,len(probes),64):
-        d=probes[i:i+64,None]-samples[None]
-        covered+=int((np.einsum('ijk,ijk->ij',d,d).min(1)<=3.5**2).sum())
-    return dict(probes=len(probes),covered=covered)
+def lane_turn_metrics(lane):
+    points=curve_samples(lane,17)[0][:,:-1].reshape(-1,3)
+    direction=np.roll(points,-1,axis=0)-points
+    heading=np.arctan2(direction[:,0],direction[:,2])
+    change=(np.roll(heading,-1)-heading+np.pi)%(2*np.pi)-np.pi
+    curvature=np.abs(change)/np.maximum(np.linalg.norm(direction[:,[0,2]],axis=1),.01)
+    return float(np.abs(change).sum()),float(np.quantile(curvature,.95)),float(curvature.max())
 
 
 def separate_circuits(routes):
@@ -532,23 +417,35 @@ def separate_circuits(routes):
     return True
 
 
-def driving_routes(areas,mesh,driveable=None,boundary=False):
-    if boundary:return _driving_candidates(areas,mesh,driveable,True)
-    routes,survey=_driving_candidates(areas,mesh,driveable)
-    if driveable is None or not len(driveable):return routes,survey
-    alternatives,alternative_survey=_driving_candidates(areas,mesh,driveable,True)
-    core=StreetRaster(driveable)
-    primary=route_coverage(routes,core);alternative=route_coverage(alternatives,core)
-    # A closed loop somewhere in a connected component must not suppress
-    # supported branches elsewhere. Prefer a complete supported contour when
-    # it adds at least five percent of the surveyed pavement; retain existing
-    # lanes for insignificant differences and reject intersecting alternatives.
-    gain=alternative['covered']-primary['covered']
-    select=bool(alternatives) and (not routes or gain>=max(1,primary['probes']*.05))
-    separated=separate_circuits(alternatives) if select else None
-    if select and separated:routes,survey=alternatives,alternative_survey
-    survey.update(selection='supported-coverage-v5',skeleton_coverage=primary,
-                  boundary_coverage=alternative,boundary_separate=separated)
+def driving_routes(areas,mesh,driveable=None,visible=None):
+    """Two-way, keep-right traffic circuits on the authored street network.
+
+    skate2_dlc_roads reduces the street floor to a road graph and joins one
+    lane per direction with the right-hand face rule (see its docstring).
+    Every circuit must then pass the native qualification: supported 3.5m
+    ribbon on street, upright native normals, slope, visible wall/ceiling
+    clearance and separation from every other circuit. `visible` selects the
+    collision that blocks traffic (see visible_collision): drawn walls and
+    barriers block, undrawn skater-only faces do not.
+    """
+    street=np.concatenate((areas['road'],areas['crosswalk']))
+    if not len(street) or driveable is None or not len(driveable):
+        return [],dict(selection='road-network-v9',roads=0,circuits=0)
+    def pave(floor):return roads.FloorRaster(floor,np.where(floor.mask,floor.y,floor.street.y))
+    def check(points,floor):return lane_support_failures(points,pave(floor),roads.FloorRaster(floor,floor.y))
+    routes,survey,floor,_=roads.plan(street,driveable,mesh,visible,check)
+    solid=mesh if visible is None else mesh[visible]
+    core=roads.FloorRaster(floor,floor.y)
+    for i,lane in enumerate(routes):
+        where=f'traffic circuit {i} near {lane[0,[0,2]].round(1).tolist()}'
+        if lane_support_failures(lane,pave(floor),core).any():raise ValueError(where+': unsupported lane ribbon')
+        if (native_lane_normals(lane)[:,1]<np.cos(np.radians(20))).any():raise ValueError(where+': folded lane')
+        direction=np.roll(lane,-1,axis=0)-lane
+        if (np.abs(direction[:,1])/np.maximum(np.linalg.norm(direction,axis=1),1e-9)>.35).any():raise ValueError(where+': too steep')
+        if not collision_clear(curve_samples(lane,17)[0][:,:-1].reshape(-1,3),solid):raise ValueError(where+': wall or ceiling')
+    if routes and not separate_circuits(routes):raise ValueError('traffic circuits overlap')
+    survey.update(selection='road-network-v9',
+                  turn_degrees=[round(float(np.degrees(lane_turn_metrics(r)[0])),1) for r in routes])
     return routes,survey
 
 
@@ -637,12 +534,12 @@ def road_asset(template,routes,identity):
 def prepare_livingworld(stream,source,ocean_model,helper,scratch):
     name=stream.name
     if name not in STREAMS:raise ValueError('DLC actor preparation outside requested Classic streams')
-    if any((stream/f'LIVINGWORLD_COMPLETE_V{v}').exists() for v in (1,2,3,4,5)):
+    if any((stream/f'LIVINGWORLD_COMPLETE_V{v}').exists() for v in range(1,10)):
         raise ValueError('DLC actors require fresh unpublished stream')
     schema=templates(source)
-    areas=pedestrian_surface_triangles(stream,ocean_model,True);mesh=collision(stream)
+    areas=pedestrian_surface_triangles(stream,ocean_model,True);mesh,tags=collision(stream,True)
     driveable=vehicle_geometry(stream,areas,mesh,helper,scratch)
-    routes,survey=driving_routes(areas,mesh,driveable)
+    routes,survey=driving_routes(areas,mesh,driveable,visible_collision(mesh,tags,rendered_triangles(stream)))
     if not routes:raise ValueError(f'{name}: no supported closed vehicle lanes; inspect street survey')
     cmap_path,toc_path=stream/(name+'_Sim.xsm'),stream/(name+'_Sim.xst')
     cmap,toc=cmap_path.read_bytes(),toc_path.read_bytes()
@@ -669,14 +566,14 @@ def prepare_livingworld(stream,source,ocean_model,helper,scratch):
         struct.pack_into('>I',sf,24,count);struct.pack_into('>3I',row,16,128,len(sf)-128,count)
         path.write_bytes(sf)
     cmap_path.write_bytes(make_catalog(cmap[:32],cells));toc_path.write_bytes(make_catalog(toc[:24],rows))
-    result=dict(version=5,stream=name,census_cells=paint_cells,npc_value=32,vehicle_value=247,
+    result=dict(version=9,stream=name,census_cells=paint_cells,npc_value=32,vehicle_value=247,
                 census_tiles=sum(map(len,paint.values())),census_grid=128,
                 source_census=False,source_traffic=False,street_survey=survey,
                 roads=len(routes),superroads=len(routes),lane_segments=sum(len(r) for r in routes),
                 routes=[r.tolist() for r in routes],traffic_audio='shared original 10 banks',
                 pedestrian_speech='shared original bank4',traffic_distance='cumulative-segment-end',
                 traffic_curves='native-left-up-and-distance-table-v3',
-                traffic_routes='supported-coverage-v5')
+                traffic_routes='road-network-v9')
     (stream/'livingworld.json').write_bytes((json.dumps(result,indent=2)+'\n').encode())
-    (stream/'LIVINGWORLD_COMPLETE_V5').write_bytes(f'NSV_DLC_LIVINGWORLD_V5\n{paint_cells} {len(routes)}\n'.encode())
+    (stream/'LIVINGWORLD_COMPLETE_V9').write_bytes(f'NSV_DLC_LIVINGWORLD_V9\n{paint_cells} {len(routes)}\n'.encode())
     return result

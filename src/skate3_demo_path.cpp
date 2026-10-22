@@ -1,7 +1,9 @@
 #include "skate3_demo_path.h"
+#include "skate3_world_loading.h"
 
 #include "generated/skate3_init.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -45,6 +47,10 @@ REXCVAR_DEFINE_INT32(skate3_demo_path_input_settle_ms, 2500, "Skate 3",
 REXCVAR_DEFINE_INT32(skate3_demo_path_input_delay_ms, 600, "Skate 3",
                      "Demo path: delay between injected gameplay inputs")
     .range(50, 10000);
+REXCVAR_DEFINE_INT32(skate3_startup_mode, 0, "Skate 3",
+                     "Startup: 0 original, 1 automatic logo/title advance. "
+                     "Profile, save and DLC checks remain; restart required. Legacy2 uses Auto")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip, true, "Skate 3",
                     "Skip the frontend intro movie when A or Start is pressed "
                     "(the default keyboard bindings make that Space and Enter)");
@@ -63,6 +69,19 @@ std::atomic<uint32_t> g_automation_stage{0};
 std::atomic<bool> g_skip_intro_movie{false};
 std::atomic<bool> g_logged_intro_movie_skip{false};
 std::atomic<bool> g_f10_poll_was_down{false};
+std::atomic<int32_t> g_startup_mode{0};  // frozen by InstallHooks before guest boot
+std::atomic<bool> g_startup_finished{false};
+std::chrono::steady_clock::time_point g_title_entered;
+
+bool StartupAutomationEnabled() {
+  if (g_startup_mode.load(std::memory_order_relaxed) == 0 ||
+      g_startup_finished.load(std::memory_order_relaxed)) return false;
+  if (rex::kernel::guest_presence::GameplayContextValue() == 1) {
+    if (!g_startup_finished.exchange(true)) rex::kernel::xam::ClearSyntheticInput();
+    return false;
+  }
+  return true;
+}
 
 bool ProbeEnabled() {
   return rex::cvar::Query<bool>("skate3_demo_path") ||
@@ -100,7 +119,7 @@ void LogBootFlowEventChange(std::atomic<uint32_t>& last_event, const char* name,
 }
 
 void QueueLanguageAcceptIfNeeded() {
-  if (!AutomationEnabled()) {
+  if (!AutomationEnabled() && !StartupAutomationEnabled()) {
     return;
   }
 
@@ -114,14 +133,19 @@ void QueueLanguageAcceptIfNeeded() {
 }
 
 void EnableTitleStartAutoTapIfNeeded(const char* reason) {
-  if (!AutomationEnabled()) {
+  if (!AutomationEnabled() && !StartupAutomationEnabled()) {
     return;
   }
 
+  // Auto-start must actually show the title; never inject into the movie.
+  if (!AutomationEnabled() && g_startup_mode.load() == 1 &&
+      std::chrono::steady_clock::now() - g_title_entered < std::chrono::milliseconds(750)) return;
   uint32_t stage = g_automation_stage.load(std::memory_order_relaxed);
   while (stage < 2) {
     if (g_automation_stage.compare_exchange_weak(stage, 2, std::memory_order_relaxed)) {
-      rex::kernel::xam::SetSyntheticAutoTap(rex::input::X_INPUT_GAMEPAD_START, true);
+      const uint16_t buttons = AutomationEnabled() ? rex::input::X_INPUT_GAMEPAD_START
+          : rex::input::X_INPUT_GAMEPAD_START | rex::input::X_INPUT_GAMEPAD_A;
+      rex::kernel::xam::SetSyntheticAutoTap(buttons, true);
       REXLOG_INFO("Skate 3 demo path: enabled press-start auto-tap ({})", reason);
       return;
     }
@@ -181,6 +205,7 @@ extern "C" REX_FUNC(Skate3DemoPath_LanguageSelectStateHook) {
 }
 
 extern "C" REX_FUNC(Skate3DemoPath_ShowPressStartModeHook) {
+  if (ctx.r4.u32 == 0) g_title_entered = std::chrono::steady_clock::now();
   PollF10Marker();
   LogBootFlowEventChange(g_last_press_start_event, "BootFlow ShowPressStartMode", ctx.r4.u32,
                          ctx.r3.u32);
@@ -194,7 +219,7 @@ extern "C" REX_FUNC(Skate3DemoPath_ShowPressStartModeHook) {
 
 extern "C" REX_FUNC(Skate3DemoPath_LanguageSelectUpdateHook) {
   PollF10Marker();
-  if (ProbeEnabled()) {
+  if (ProbeEnabled() || StartupAutomationEnabled()) {
     bool expected = false;
     if (g_seen_language_update.compare_exchange_strong(expected, true,
                                                        std::memory_order_relaxed)) {
@@ -388,7 +413,8 @@ void StartGameplayInputWorkerIfNeeded() {
 }  // namespace
 
 void InstallHooks(rex::runtime::FunctionDispatcher* dispatcher) {
-  if (!dispatcher || !ProbeEnabled()) {
+  g_startup_mode.store(std::clamp(REXCVAR_GET(skate3_startup_mode), 0, 1));
+  if (!dispatcher || (!ProbeEnabled() && g_startup_mode.load() == 0)) {
     return;
   }
 
@@ -408,7 +434,25 @@ void SetUiInputProvider(std::function<rex::input::InputSystem*()> provider) {
   g_ui_input_provider = std::move(provider);
 }
 
+void UpdateStartup() {
+  // Finish both the frozen auto mode and any migrated old Skip preference
+  // at the existing world handoff, even if UI misses gameplay presence.
+  if (g_startup_mode.load() != 0 &&
+      skate3::world_loading::RenderWorldIdentity() != 0) {
+    if (!g_startup_finished.exchange(true)) rex::kernel::xam::ClearSyntheticInput();
+  }
+}
+
 bool ShouldForceIntroMovieComplete() {
+  if (StartupAutomationEnabled()) {
+    // This helper is called by FEMoviePlayer::Update only while the native
+    // player is actually playing (state2). Arm here, not through an outer
+    // BootFlow state callback that may not own the logo currently playing.
+    // Use the same completion path as a fresh user A/Start press below.
+    static const auto first_movie_poll = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - first_movie_poll >=
+        std::chrono::milliseconds(100)) return true;
+  }
   if (AutomationEnabled() && g_skip_intro_movie.load(std::memory_order_relaxed)) {
     bool expected = false;
     if (g_logged_intro_movie_skip.compare_exchange_strong(expected, true,

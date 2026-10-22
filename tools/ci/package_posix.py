@@ -5,11 +5,15 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import nsv_components  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -223,9 +227,10 @@ def package(build, output, platform):
         binaries, resources = app / 'Contents/MacOS', app / 'Contents/Resources'
         binaries.mkdir(parents=True)
         resources.mkdir()
+        version = numeric_build_version(build)
         info = {'CFBundleExecutable': 'skate3', 'CFBundleName': 'Skate 3 Recompiled+',
                 'CFBundleIdentifier': 'org.skate3recomp.plus', 'CFBundlePackageType': 'APPL',
-                'CFBundleShortVersionString': '0.2.0', 'CFBundleVersion': '0.2.0',
+                'CFBundleShortVersionString': version, 'CFBundleVersion': version,
                 'LSMinimumSystemVersion': '12.0', 'NSHighResolutionCapable': True}
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     else:
@@ -262,9 +267,11 @@ def package(build, output, platform):
         'sdk_patch_sha256': hashlib.sha256((ROOT / 'patches/rexglue-skate3-plus.patch').read_bytes()).hexdigest(),
         'imgui': run('git', '-C', ROOT / 'third_party/rexglue-sdk/thirdparty/imgui', 'rev-parse', 'HEAD').strip(),
         'platform': platform, 'checks': checks,
-        'installer_policy': {'navigation': 4, 'dlc_livingworld': 5},
-        'upgrade': 'Existing complete v0.1b Windows installs need program files only; no NSV rebake. '
-                   'Fresh Linux/macOS installs run the shared setup wizard.'}
+        # New San Van data versions this build requires (tools/nsv_components.py); an
+        # existing installation updates only the components whose markers differ.
+        'nsv_components': {c.id: list(c.markers) for c in nsv_components.COMPONENTS},
+        'upgrade': 'Program files update in place (in-game updater or manual extract); New San Van '
+                   'components this build needs are updated at first start.'}
     if platform == 'macos-arm64':
         provenance['macos_minimum_system_version'] = info['LSMinimumSystemVersion']
     (output / 'build-provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
@@ -277,6 +284,17 @@ def package(build, output, platform):
     digest = hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest()
     archive.with_suffix(archive.suffix + '.sha256').write_text(digest + '  ' + archive.name + '\n')
     print(archive)
+
+
+def numeric_build_version(build):
+    # Keep the app metadata aligned with the CMake/Windows version on later
+    # releases; the display name may have an alphabetic development suffix.
+    header = (build / 'include/skate3_version.h').read_text()
+    version = re.search(r'^#define SKATE3_VERSION_NUMERIC "([0-9]+\.[0-9]+\.[0-9]+)"$',
+                        header, re.MULTILINE)
+    if version is None:
+        raise ValueError('Missing numeric build version for macOS app metadata')
+    return version[1]
 
 
 def main():

@@ -1,6 +1,7 @@
 #include "generated/skate3_init.h"
 #include "native/skate3_native_guest_read.h"
 #include "skate3_world_loading.h"
+#include "native/skate3_native_world_policy.h"
 #include "skate3_cheats.h"
 #include "skate3_pedestrian_speech.h"
 #include "skate3_menu_probe.h"
@@ -101,6 +102,8 @@ std::atomic<bool> skate2_ready{false};
 std::atomic<bool> load_requested{false};
 std::atomic<bool> skate2_loading{false};
 std::atomic<bool> bam_gameplay{false};
+std::atomic<uint64_t> render_world_identity{0};
+std::atomic<uint64_t> indoor_world_identity{0};
 // Debug-only snapshots; never retain or dereference a guest resource unguarded.
 std::atomic<uint8_t*> freeze_base{nullptr};
 std::atomic<uint32_t> freeze_gameplay{0}, freeze_stream_manager{0}, freeze_pause_result{~0u};
@@ -215,6 +218,7 @@ constexpr std::array<std::string_view, 5> kAudioRoles = {"sfx", "music", "reverb
 std::unordered_map<std::string, std::array<std::string, 5>> skate2_audio_maps;
 // The stream whose maps the audio world currently loading takes, or -1.
 std::atomic<int> audio_stream{-1};
+uint64_t dlc_ambience_key = 0, dlc_downtown_ambience_key = 0;  // prepared audio metadata
 // Skate 2 WorldPainter translation (worldpainter.txt from
 // tools/build_skate2_audio.py; formats in tools/skate2_worldpainter.py):
 // Skate 2 eLayerID -> Skate 3 layer key, Skate 2 paint value -> Skate 3
@@ -408,6 +412,8 @@ void InstallPaintedAudio(rex::filesystem::VirtualFileSystem* vfs,
     }
     (kind == "layer" ? paint_layers : paint_values)[id] = key;
     paint_names[key] = name;
+    if (name == "aud_wp_ambiences/nsv_old_town") dlc_ambience_key = key;
+    if (name == "aud_wp_ambiences/nsv_dt_main") dlc_downtown_ambience_key = key;
   }
   if (paint_layers.empty() || paint_values.empty()) {
     REXLOG_WARN("skate2-audio: {} has no paint translation; run tools/build_skate2_audio.py",
@@ -722,11 +728,11 @@ void skate3::world_loading::Install(rex::filesystem::VirtualFileSystem* vfs,
           uint32_t cells = 0, polygons = 0, census = 0, roads = 0;
           std::string nav_magic, actor_magic, extra;
           std::ifstream nav(entry.path() / "NAVIGATION_COMPLETE_V4");
-          std::ifstream actors(entry.path() / "LIVINGWORLD_COMPLETE_V5");
+          std::ifstream actors(entry.path() / "LIVINGWORLD_COMPLETE_V9");
           const bool ready = classic && bool(nav >> nav_magic >> cells >> polygons) &&
               nav_magic == "NSV_NAVIGATION_V4" && cells > 0 && cells <= 4096 &&
               polygons > 0 && polygons <= 1000000 && !(nav >> extra) &&
-              bool(actors >> actor_magic >> census >> roads) && actor_magic == "NSV_DLC_LIVINGWORLD_V5" &&
+              bool(actors >> actor_magic >> census >> roads) && actor_magic == "NSV_DLC_LIVINGWORLD_V9" &&
               census > 0 && census <= 4096 && roads > 0 && roads <= 4096 && !(actors >> extra);
           skate2_navigation_ready.push_back(ready);
           skate2_actor_streams.push_back(ready);
@@ -802,6 +808,15 @@ void skate3::world_loading::Install(rex::filesystem::VirtualFileSystem* vfs,
   skate2_ready.store(true);
   REXLOG_INFO("skate2: prepared BAM files ready; press Ctrl+F7 during unpaused gameplay; files={}",
               bam.string());
+}
+
+uint64_t skate3::world_loading::RenderWorldIdentity() {
+  return render_world_identity.load(std::memory_order_acquire);
+}
+
+uint32_t skate3::world_loading::NativeIndoorLightingMap(uint64_t world_identity) {
+  const uint64_t paired = indoor_world_identity.load(std::memory_order_acquire);
+  return (paired >> 3) == world_identity ? uint32_t(paired & 7) : 0;
 }
 
 bool skate3::world_loading::IsSkate2Gameplay() {
@@ -2583,6 +2598,24 @@ extern "C" REX_FUNC(sub_82476608) {
     bam_proxy_target_world.store(0);
     bam_model_target_world.store(0);
   }
+  // Publish after the destination/layout checks, independently of the later
+  // gameplay callback. RenderScene can keep running throughout a map load.
+  const uint64_t serial = (render_world_identity.load(std::memory_order_relaxed) & ~uint64_t(1)) + 2;
+  const bool nsv = skate2_loading.load();
+  const uint64_t identity = serial | uint64_t(nsv);
+  uint32_t indoor_map = 0;
+  const int stream = loaded_stream.load();
+  if (nsv && stream >= 0 && stream < int(skate2_streams.size())) {
+    indoor_map = skate2_streams[stream] == "BAM" ? 1
+               : skate2_streams[stream] == "DLC_Community_Center" ? 2
+               : skate2_streams[stream] == "DLC_Rob_Fantasy_Plaza" ? 3
+               : skate2_streams[stream] == "DLC_School" ? 4
+               : skate2_streams[stream] == "DLC_Parkade" ? 5 : 0;
+  }
+  // Publish the paired selection first: an old identity can only see no
+  // lighting mask while the next map is being configured, never its mask.
+  indoor_world_identity.store((identity << 3) | indoor_map, std::memory_order_release);
+  render_world_identity.store(identity, std::memory_order_release);
   if (!REXCVAR_GET(skate3_world_load_probe)) return;
   REXLOG_INFO("world-load: configure loader={:08X} world={:016X}", loader, world);
   for (uint32_t offset : {108u, 364u, 620u, 1132u, 1388u, 1644u, 1900u}) {
@@ -3497,6 +3530,22 @@ void LogLivingWorldSummary(uint8_t* base, uint32_t broadcaster) {
   REXLOG_INFO("skate2-lw: population_flags={:02X} audio_pool primary={:08X} cap={} used={} peak={} "
               "fallback={:08X} cap={} used={} peak={}",
               PopulationFlags(base), audio[0], audio[1], audio[2], audio[3], audio[4], audio[5], audio[6], audio[7]);
+}
+
+// Missing DLC ambience uses the selected existing city record through the
+// native WorldPainter result. No extra player, loop, archive or guest write.
+extern "C" REX_FUNC(sub_82C0EAC0) {
+  const uint32_t layer = ctx.r4.u32;
+  __imp__sub_82C0EAC0(ctx, base);
+  if (ctx.r3.u64 != 0 || layer != 7 || !skate2_loading.load()) return;
+  const int index = loaded_stream.load();
+  if (index < 0 || index >= int(skate2_streams.size())) return;
+  const uint64_t bed = skate3::native_policy::DlcAmbienceBed(
+      skate2_streams[index], dlc_ambience_key, dlc_downtown_ambience_key);
+  // These verified records were loaded once from the prepared metadata.
+  ctx.r3.u64 = skate3::native_policy::AmbienceFallback(ctx.r3.u64, layer, true,
+      bed != 0 && REXCVAR_GET(skate3_skate2_world_audio) &&
+      REXCVAR_GET(skate3_skate2_painted_audio), skate2_streams[index], bed);
 }
 
 // WorldPainter broadcaster (per frame): each enabled layer's value under the

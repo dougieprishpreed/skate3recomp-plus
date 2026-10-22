@@ -19,7 +19,22 @@
 // capture) their flat tops compared against their own atlas depth; the
 // lit/dark whole-surface flicker on benches, signs and sails as the
 // camera-following cascades drifted frame to frame.
-float SampleCsmShadow(float3 wp, float extra_bias) {
+// Covered places (scene_indoor.hlsli): a caster farther up the cascade's light
+// ray than the receiver's ceiling is above that ceiling (a prop parked on
+// the deck over a Parkade floor, a tree over a sewer pipe, the grate over a
+// shaft) and its shadow never reaches the receiver; the game's shadow passes
+// do not draw the ceiling itself. The limit is that distance in the atlas's
+// depth units: the light ray is the direction along which light-space xy
+// stay fixed (cross of the two rows) and depth grows by |dot(sh_z, ray)|
+// per metre along it. 1e9 = no limit (outdoors, or the switch off).
+float CsmCeilingLimit(float headroom) {
+  if (headroom <= 0.0 || indoor_day.z <= 0.5) {
+    return 1e9;
+  }
+  float3 ray = normalize(cross(sh_x.xyz, sh_y.xyz));
+  return max(headroom - 0.3, 0.05) * abs(dot(sh_z.xyz, ray)) / max(abs(ray.y), 0.1);
+}
+float SampleCsmShadow(float3 wp, float extra_bias, float limit) {
   if (sh_misc.y <= 0.0) {
     return 1.0;
   }
@@ -74,7 +89,10 @@ float SampleCsmShadow(float3 wp, float extra_bias) {
                                 : sh_misc.x + extra_bias;
   float rd = dot(sh_z.xyz, wp) + sh_z.w - bias;
   float2 sm2 = shadow_atlas.Sample(smp_clamp, suv);
-  return saturate((sm2.x >= rd ? 1.0 : 0.0) + (1.0 - sm2.y));
+  return saturate(((sm2.x >= rd || rd - sm2.x > limit) ? 1.0 : 0.0) + (1.0 - sm2.y));
+}
+float SampleCsmShadow(float3 wp, float extra_bias) {
+  return SampleCsmShadow(wp, extra_bias, 1e9);
 }
 // Contact-hardening soft shadows (PCSS) over the same cascade atlas,
 // enabled by sh_pcss.x. A blocker search estimates the average caster
@@ -98,13 +116,13 @@ static const float2 kPcssTaps[12] = {
     float2(0.519456, 0.767022),   float2(0.185461, -0.893124),
     float2(0.507431, 0.064425),   float2(0.896420, 0.412458),
     float2(-0.321940, -0.932615), float2(-0.791559, -0.597705)};
-float CsmSoftTap(float2 suv, float refd, float tile_x0, float tile_x1) {
+float CsmSoftTap(float2 suv, float refd, float tile_x0, float tile_x1, float limit) {
   // Taps clamp half a texel inside the tile so filtering never bleeds the
   // neighboring cascade (same convention as the exact character taps).
   suv.x = clamp(suv.x, tile_x0 + 0.5 / sh_misc.z, tile_x1 - 0.5 / sh_misc.z);
   suv.y = clamp(suv.y, 0.5 / sh_misc.w, 1.0 - 0.5 / sh_misc.w);
   float2 sm = shadow_atlas.Sample(smp_clamp, suv);
-  return saturate((sm.x >= refd ? 1.0 : 0.0) + (1.0 - sm.y));
+  return saturate(((sm.x >= refd || refd - sm.x > limit) ? 1.0 : 0.0) + (1.0 - sm.y));
 }
 // Poisson-rotation angle for the CSM atlas sampler: interleaved gradient
 // noise of the SCREEN pixel: stable per pixel, smooth under motion. A
@@ -119,14 +137,14 @@ float PcssRotation(float2 px) {
          frac(52.9829189 * frac(0.06711056 * px.x + 0.00583715 * px.y));
 }
 float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
-                          float2 px) {
+                          float2 px, float limit) {
   // Showcase: until the shadow layer is revealed, render fully lit.
   int sc_mask = ShowcaseMask(px.x);
   if (sc_mask >= 0 && (sc_mask & 8) == 0) {
     return 1.0;
   }
   if (sh_pcss.x <= 0.5) {
-    return SampleCsmShadow(wp, extra_bias);
+    return SampleCsmShadow(wp, extra_bias, limit);
   }
   if (sh_misc.y <= 0.0) {
     return 1.0;
@@ -185,7 +203,7 @@ float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
     s.x = clamp(s.x, tile_x0 + 0.5 / sh_misc.z, tile_x1 - 0.5 / sh_misc.z);
     s.y = clamp(s.y, 0.5 / sh_misc.w, 1.0 - 0.5 / sh_misc.w);
     float d = shadow_atlas.Sample(smp_clamp, s).x;
-    if (d < refd) { bmax = max(bmax, d); }
+    if (d < refd && refd - d <= limit) { bmax = max(bmax, d); }
   }
   [unroll] for (int k = 0; k < 12; k += 2) {
     float2 o = kPcssTaps[k];
@@ -194,7 +212,7 @@ float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
     s.x = clamp(s.x, tile_x0 + 0.5 / sh_misc.z, tile_x1 - 0.5 / sh_misc.z);
     s.y = clamp(s.y, 0.5 / sh_misc.w, 1.0 - 0.5 / sh_misc.w);
     float d = shadow_atlas.Sample(smp_clamp, s).x;
-    if (d < refd) { bmax = max(bmax, d); }
+    if (d < refd && refd - d <= limit) { bmax = max(bmax, d); }
   }
   if (bmax < 0.0) {
     // No caster inside the search footprint: every filter tap would
@@ -206,13 +224,17 @@ float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
   // Filter radius: the penumbra in atlas units, floored at a fraction of a
   // physical atlas texel so edges always stay filtered.
   float2 rfilt = max(pen_m * uvpm, sh_pcss2.w * 2.0 / sh_misc.w) * luv_to_suv;
-  float acc = CsmSoftTap(suv0, refd, tile_x0, tile_x1);
+  float acc = CsmSoftTap(suv0, refd, tile_x0, tile_x1, limit);
   [unroll] for (int j = 0; j < 12; ++j) {
     float2 o = kPcssTaps[j];
     o = float2(o.x * rot.x - o.y * rot.y, o.x * rot.y + o.y * rot.x);
-    acc += CsmSoftTap(suv0 + o * rfilt, refd, tile_x0, tile_x1);
+    acc += CsmSoftTap(suv0 + o * rfilt, refd, tile_x0, tile_x1, limit);
   }
   return acc / 13.0;
+}
+float SampleCsmShadowSoft(float3 wp, float extra_bias, float3 nrm,
+                          float2 px) {
+  return SampleCsmShadowSoft(wp, extra_bias, nrm, px, 1e9);
 }
 // Native static sun-shadow receive (t10). The game's cascade transforms
 // use a stylized near-vertical projection (fine for its own dynamic
@@ -236,7 +258,20 @@ float NsmTap(float2 suv, float refd, float tile_u0) {
   // and implicit-gradient sampling is not allowed in divergent flow.
   return static_sun.SampleLevel(smp_clamp, suv, 0.0).x;
 }
-float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) {
+// night_sun: at night (night_grade.w >= 2), how much of the day's sun the
+// baked light holds here: all of it outdoors and in semi-open areas, and in an
+// enclosed interior the part the static sun map lets in (interior amount x
+// lit fraction; 0 outside the map). The lightmaps were baked for day, so the
+// caller lowers those surfaces to their shade level: no sun patches or sun
+// shadows at night. night_open: how far wp lies in a semi-open area at night
+// (the caller gives it its lamp level). headroom = the covering zone's roof
+// height over wp (CsmCeilingLimit).
+float SampleStaticSunStrengthNight(float3 wp, float3 nrm, float2 px, float strength,
+                                   out float night_sun, out float night_open,
+                                   out float headroom) {
+  night_sun = 0.0;
+  night_open = 0.0;
+  headroom = 0.0;
   if (strength <= 0.0) {
     return 1.0;
   }
@@ -254,6 +289,16 @@ float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) 
   // the shadow-map analogue of texture mip filtering. Close-ups keep the
   // 2-texel floor untouched.
   float pxfoot = max(fwidth(uc_far.x), fwidth(uc_far.y));
+  // Derivatives stay above the per-surface indoor branch. Outdoor receivers
+  // in the same draw keep the exact existing static-shadow calculation.
+  float3 indoor3 = LocalIndoorAmounts(wp, headroom);
+  float indoor = indoor3.x;
+  strength *= 1.0 - indoor;
+  float night = night_grade.w > 1.5 ? 1.0 : 0.0;
+  float night_indoor = night * indoor3.y;
+  night_open = night * indoor3.z;
+  night_sun = night - night_indoor;  // outdoors at night the sun is gone
+  if (strength <= 0.0 && night_indoor <= 0.0) return 1.0;
   float edge = max(abs(uc_far.x), abs(uc_far.y));
   if (edge >= 0.99) {
     return 1.0;
@@ -301,6 +346,7 @@ float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) 
   float refd = dot(nsm_z.xyz, wp) + nsm_z.w - (nsm_p2.x + nsm_p2.y * slope);
   if (sh_pcss.x <= 0.5) {
     float s0 = NsmTap(suv, refd, tile_u0) >= refd ? 1.0 : 0.0;
+    night_sun += night_indoor * fade * s0;
     return 1.0 - fade * strength * (1.0 - s0);
   }
   // FIXED kernels throughout this sampler: no per-pixel noise. Verified
@@ -323,6 +369,7 @@ float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) 
     if (d < refd) { bmax = max(bmax, d); }
   }
   if (bmax < 0.0) {
+    night_sun += night_indoor * fade;
     return 1.0;
   }
   float dist_m = max(refd - bmax, 0.0) * nsm_p.z;
@@ -354,7 +401,12 @@ float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) 
     acc += saturate((d - refd) / w + 0.5);
   }
   float s = acc / float(n);
+  night_sun += night_indoor * fade * s;
   return 1.0 - fade * strength * (1.0 - s);
+}
+float SampleStaticSunStrength(float3 wp, float3 nrm, float2 px, float strength) {
+  float night_sun, night_open, headroom;
+  return SampleStaticSunStrengthNight(wp, nrm, px, strength, night_sun, night_open, headroom);
 }
 // The scene receive at the frame strength (venue-scaled, see
 // StaticSunVenueFactor).

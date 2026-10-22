@@ -7,6 +7,8 @@
 // declarations. Render thread only.
 
 #include "skate3_native_scene_state.h"
+#include "native/skate3_native_sun_guard.h"
+#include "native/skate3_native_shadow_lifetime.h"
 
 #include <array>
 #include <cmath>
@@ -889,6 +891,8 @@ struct RendererState {
   // packed mono lightmap lights through while its chroma page is missing,
   // instead of reading the atlas' unrelated R/G/B channels as light.
   GuestTexture chroma_neutral;
+  GuestTexture indoor_regions;
+  bool indoor_regions_attempted = false;
   // Water environment CUBE maps (t6): separate cache; same guest object
   // addresses decode differently (6 faces, TextureCube SRV).
   std::unordered_map<uint32_t, GuestTexture> cube_textures;
@@ -1022,6 +1026,8 @@ struct RendererState {
   // the foliage dapple shimmer).
   float nsm_center[3] = {};
   float nsm_sun[3] = {};
+  SunAxisCandidate nsm_sun_candidate;
+  ShadowWorldLifetime shadow_world_lifetime;
   float nsm_built_radius = 0.0f;
   bool nsm_dirty = true;
   uint64_t nsm_rebuild_frame = 0;

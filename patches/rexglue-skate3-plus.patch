@@ -90,6 +90,44 @@ index d2bdcd4..4d1b9ae 100644
   protected:
    virtual ~Device() = default;
  };
+diff --git a/include/rex/graphics/vulkan/native_rhi_vulkan.h b/include/rex/graphics/vulkan/native_rhi_vulkan.h
+index d4c99fd..7d36bc4 100644
+--- a/include/rex/graphics/vulkan/native_rhi_vulkan.h
++++ b/include/rex/graphics/vulkan/native_rhi_vulkan.h
+@@ -29,10 +29,12 @@ void DestroyNativeRhiDevice(nrhi::Device* device);
+ // resets the frame Cmd latches. guest_output_ever_written_previously selects
+ // the wrapper's initial tracked layout (UNDEFINED on the image's first ever
+ // write, the presenter's internal SHADER_READ_ONLY_OPTIMAL otherwise).
++// image_version is the presenter lifetime token (handles may be reused).
+ // guest_output_out receives the wrapped texture.
+ nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, VkImage guest_output_image,
+                                VkImageView guest_output_image_view,
+-                               bool guest_output_ever_written_previously, uint32_t width,
++                               bool guest_output_ever_written_previously, uint64_t guest_output_image_version,
++                               uint32_t width,
+                                uint32_t height, nrhi::Texture** guest_output_out);
+ 
+ // Vulkan-only frame epilogue: ends any render pass still open in the frame
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 529c421..63f5367 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -316,6 +316,15 @@ class D3D12Presenter final : public Presenter {
+   // well as by presenter initialization and shutdown.
+   PaintContext paint_context_;
+ 
++  // Mailbox pacing feedback (Presenter::PublishGuestFrameReady): a fence
++  // signalled after each new guest frame's present, watched by a thread.
++  struct ReadyObserver;
++  struct ReadyObserverDeleter {
++    void operator()(ReadyObserver* observer) const;
++  };
++  std::unique_ptr<ReadyObserver, ReadyObserverDeleter> ready_observer_;
++  UINT64 ready_last_refresher_submission_ = 0;
++
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+   void* temporal_upscaler_context_ = nullptr;
+   uint32_t temporal_upscaler_max_render_width_ = 0;
 diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
 index 5d607c6..292dd0f 100644
 --- a/include/rex/ui/imgui_drawer.h
@@ -104,23 +142,56 @@ index 5d607c6..292dd0f 100644
  
    // SetPresenter may be called from the destructor.
 diff --git a/include/rex/ui/overlay/simple_settings_overlay.h b/include/rex/ui/overlay/simple_settings_overlay.h
-index e4d1c0c..5d70642 100644
+index e4d1c0c..fc311ef 100644
 --- a/include/rex/ui/overlay/simple_settings_overlay.h
 +++ b/include/rex/ui/overlay/simple_settings_overlay.h
-@@ -107,6 +107,9 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+@@ -48,12 +48,15 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+   using CloseGameCallback = std::function<void()>;
+   using RestartGameCallback = std::function<void()>;
+   using PollGamepadCallback = std::function<SimpleSettingsGamepad()>;
++  // Optional game-provided source: original, un-overridden world sun.
++  using LoadSunDirectionCallback = std::function<void(float* direction)>;
+ 
+   SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem::path config_path,
+                        LoadProfilesCallback load_profiles, SaveProfileCallback save_profile,
+                        CloseSettingsCallback close_settings, CloseGameCallback close_game,
+                        RestartGameCallback restart_game,
+-                       PollGamepadCallback poll_gamepad = nullptr);
++                       PollGamepadCallback poll_gamepad = nullptr,
++                       LoadSunDirectionCallback load_sun_direction = nullptr);
+   ~SimpleSettingsDialog();
+ 
+   void Show();
+@@ -91,6 +94,7 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+   CloseGameCallback close_game_;
+   RestartGameCallback restart_game_;
+   PollGamepadCallback poll_gamepad_;
++  LoadSunDirectionCallback load_sun_direction_;
+   SimpleProfileState profiles_;
+   bool visible_ = false;
+ 
+@@ -107,6 +111,10 @@ class SimpleSettingsDialog final : public ImGuiDialog {
    int monitor_index_ = 0;
    int audio_buffer_index_ = 0;
    int language_index_ = 0;
++  int startup_mode_index_ = 0;
 +  // 0 = Skate 2 sky, 1 = Skate 3 sky (skate3_skate2_sky), 2 = night
 +  // (skate3_skate2_night, which takes priority over skate3_skate2_sky).
 +  int nsv_sky_index_ = 0;
    float field_of_view_ = 60.0f;
    bool fullscreen_ = true;
    bool vsync_ = false;
-@@ -126,6 +129,14 @@ class SimpleSettingsDialog final : public ImGuiDialog {
+@@ -126,6 +134,21 @@ class SimpleSettingsDialog final : public ImGuiDialog {
    int stream_probe_index_ = 0;
    bool mode_indicator_ = true;
    bool fps_counter_ = false;
++  bool update_check_ = true;
++  bool indoor_lighting_ = true;
++  // World > Sun position (hot; original game light is the default).
++  float ped_voice_volume_ = 100.0f;
++  bool sun_override_ = false;
++  float sun_azimuth_ = 220.0f;
++  float sun_elevation_ = 35.0f;
 +  // World > Cheats (skate3_cheat_* cvars).
 +  bool cheat_no_air_timer_ = false;
 +  bool cheat_no_fall_damage_ = false;
@@ -310,6 +381,45 @@ index 9d304be..7c9accf 100644
      file.flush();
      if (!file) {
        REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5044c26..0260276 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -158,7 +158,13 @@ class TimerQueue {
+   std::jthread dispatch_thread_;
+ };
+ 
+-rex::thread::TimerQueue timer_queue_;
++// Created on first use, not as a global: a global's constructor runs while
++// this module is loading, and the dispatch thread started there would run the
++// host executable's TLS callbacks before that executable's CRT has started.
++TimerQueue& timer_queue() {
++  static TimerQueue queue;
++  return queue;
++}
+ 
+ void TimerQueueWaitItem::Disarm() {
+   State state;
+@@ -195,15 +201,15 @@ void TimerQueueWaitItem::Disarm() {
+ 
+ std::weak_ptr<WaitItem> QueueTimerOnce(std::move_only_function<void(void*)> callback,
+                                        void* userdata, WaitItem::clock::time_point due) {
+-  return timer_queue_.QueueTimer(std::make_shared<WaitItem>(
+-      std::move(callback), userdata, &timer_queue_, due, WaitItem::clock::duration::zero()));
++  return timer_queue().QueueTimer(std::make_shared<WaitItem>(
++      std::move(callback), userdata, &timer_queue(), due, WaitItem::clock::duration::zero()));
+ }
+ 
+ std::weak_ptr<WaitItem> QueueTimerRecurring(std::move_only_function<void(void*)> callback,
+                                             void* userdata, WaitItem::clock::time_point due,
+                                             WaitItem::clock::duration interval) {
+-  return timer_queue_.QueueTimer(
+-      std::make_shared<WaitItem>(std::move(callback), userdata, &timer_queue_, due, interval));
++  return timer_queue().QueueTimer(
++      std::make_shared<WaitItem>(std::move(callback), userdata, &timer_queue(), due, interval));
+ }
+ 
+ }  // namespace rex::thread
 diff --git a/src/filesystem/virtual_file_system.cpp b/src/filesystem/virtual_file_system.cpp
 index b56664b..2918210 100644
 --- a/src/filesystem/virtual_file_system.cpp
@@ -1361,6 +1471,198 @@ index 28fd5b0..cea6e92 100644
        height, guest_output_out);
  }
  
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index bfd3446..44a8ec6 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -47,6 +47,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
+       uint32_t context_id = memory::load_and_swap<uint32_t>(buffer + 16);
+       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
++      // User startup assistance is independent of the signed-out demo path.
++      // Latch before guest gameplay; changing a preference cannot arm input.
++      static const bool startup_assist = rex::cvar::Query<int32_t>("skate3_startup_mode") > 0;
++      static std::atomic<bool> startup_assist_done{false};
++      if (startup_assist && user_index == 0 && context_id == 0x8001 &&
++          context_value == 1 && !startup_assist_done.exchange(true)) {
++        rex::kernel::xam::ClearSyntheticInput();
++      }
+       auto old_value = kernel_state_->GetUserContext(user_index, context_id);
+       kernel_state_->SetUserContext(user_index, context_id, context_value);
+       rex::kernel::guest_presence::NotifyContext(user_index, context_id, context_value);
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 146c021..59a85d3 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -14,7 +14,11 @@
+ #include <climits>
+ #include <cmath>
+ #include <chrono>
++#include <condition_variable>
++#include <deque>
+ #include <memory>
++#include <mutex>
++#include <thread>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -131,11 +135,115 @@ namespace shaders {
+ #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
+ }  // namespace shaders
+ 
++// Reports when each new guest frame's paint has finished on the GPU, the
++// D3D12 counterpart of VulkanPresenter::ReadyObserver: the guest frame pacer
++// phase-locks mailbox presentation to the display with it.
++struct D3D12Presenter::ReadyObserver {
++  static constexpr size_t kMaxPending = 4;
++
++  explicit ReadyObserver(ID3D12Device* device) {
++    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)))) {
++      return;
++    }
++    event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++    if (!event_) {
++      fence_.Reset();
++      return;
++    }
++    thread_ = std::thread([this] { Run(); });
++  }
++
++  ~ReadyObserver() {
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      stop_ = true;
++    }
++    cv_.notify_all();
++    if (thread_.joinable()) {
++      thread_.join();
++    }
++    // A queued signal must land before its fence goes.
++    if (fence_ && fence_->GetCompletedValue() < last_value_ &&
++        SUCCEEDED(fence_->SetEventOnCompletion(last_value_, event_))) {
++      WaitForSingleObject(event_, 1000);
++    }
++    if (event_) {
++      CloseHandle(event_);
++    }
++  }
++
++  // Painting thread: signals once everything submitted before it (the paint
++  // and the present) has finished. Skipped (the frame goes unobserved) while
++  // kMaxPending signals are outstanding.
++  void Observe(ID3D12CommandQueue* queue) {
++    if (!fence_) {
++      return;
++    }
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      if (pending_.size() >= kMaxPending) {
++        return;
++      }
++    }
++    if (FAILED(queue->Signal(fence_.Get(), last_value_ + 1))) {
++      return;
++    }
++    ++last_value_;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      pending_.push_back(last_value_);
++    }
++    cv_.notify_one();
++  }
++
++ private:
++  void Run() {
++    while (true) {
++      UINT64 value;
++      {
++        std::unique_lock<std::mutex> lock(mutex_);
++        cv_.wait(lock, [this] { return stop_ || !pending_.empty(); });
++        if (stop_) {
++          return;
++        }
++        value = pending_.front();
++      }
++      if (fence_->GetCompletedValue() < value) {
++        if (FAILED(fence_->SetEventOnCompletion(value, event_))) {
++          return;  // device removed: no more feedback
++        }
++        if (WaitForSingleObject(event_, 1000) != WAIT_OBJECT_0) {
++          continue;  // still pending: look again (and at stop_)
++        }
++      }
++      PublishGuestFrameReady(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                 std::chrono::steady_clock::now().time_since_epoch())
++                                 .count());
++      std::lock_guard<std::mutex> lock(mutex_);
++      pending_.pop_front();
++    }
++  }
++
++  Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
++  HANDLE event_ = nullptr;
++  UINT64 last_value_ = 0;  // painting thread only
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::deque<UINT64> pending_;
++  bool stop_ = false;
++  std::thread thread_;
++};
++
++void D3D12Presenter::ReadyObserverDeleter::operator()(ReadyObserver* observer) const {
++  delete observer;
++}
++
+ D3D12Presenter::~D3D12Presenter() {
+   // Await completion of the usage of everything before destroying anything.
+   // From most likely the latest to most likely the earliest to be signaled, so
+   // just one sleep will likely be needed.
+   paint_context_.AwaitSwapChainUsageCompletion();
++  ready_observer_.reset();
+   guest_output_resource_refresher_submission_tracker_.Shutdown();
+   ui_submission_tracker_.Shutdown();
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+@@ -709,6 +817,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
++  UINT64 painted_refresher_submission = 0;
+   {
+     PROFILE_SCOPE_COUNTER(kCpuD3D12PaintConsumeUs);
+     uint32_t guest_output_mailbox_index;
+@@ -716,6 +825,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      painted_refresher_submission = guest_output_resources_[guest_output_mailbox_index].first;
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -1307,6 +1417,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     PROFILE_SCOPE_COUNTER(kCpuD3D12PresentUs);
+     present_result = paint_context_.swap_chain->Present(sync_interval, present_flags);
+   }
++  // Present mode for the guest frame pacer (Presenter::GetHostPresentSync):
++  // flip-model Present(0) without tearing shows the newest frame at the next
++  // blank and drops older ones (mailbox); Present(1) waits (FIFO).
++  const HostPresentSync present_sync =
++      strict_vsync_present ? HostPresentSync::kFifo
++      : paint_context_.swap_chain_allows_tearing ? HostPresentSync::kTearing
++                                                 : HostPresentSync::kMailbox;
++  SetHostPresentSync(present_sync);
++  if (present_sync == HostPresentSync::kMailbox && SUCCEEDED(present_result) &&
++      painted_refresher_submission > ready_last_refresher_submission_) {
++    // A new guest frame went out: report when its paint completes (see
++    // Presenter::LastGuestFrameReady).
++    ready_last_refresher_submission_ = painted_refresher_submission;
++    if (!ready_observer_) {
++      ready_observer_.reset(new ReadyObserver(provider_.GetDevice()));
++    }
++    ready_observer_->Observe(provider_.GetDirectQueue());
++  }
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
 index 50a26d0..b64ed8e 100644
 --- a/src/ui/imgui_drawer.cpp
@@ -1400,7 +1702,7 @@ index 50a26d0..b64ed8e 100644
    if (font_texture_ || !immediate_drawer_) {
      return;
 diff --git a/src/ui/overlay/simple_settings_overlay.cpp b/src/ui/overlay/simple_settings_overlay.cpp
-index c22345f..ffc1ddc 100644
+index c22345f..5069f64 100644
 --- a/src/ui/overlay/simple_settings_overlay.cpp
 +++ b/src/ui/overlay/simple_settings_overlay.cpp
 @@ -54,7 +54,7 @@ constexpr std::array<std::string_view, 7> kCoreSimpleSettingsCvars = {
@@ -1408,11 +1710,23 @@ index c22345f..ffc1ddc 100644
  // cvars like the native-renderer knobs don't exist in every embedder, and
  // backend/platform cvars don't exist in every build).
 -constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
-+constexpr std::array<std::string_view, 33> kOptionalSimpleSettingsCvars = {
++constexpr std::array<std::string_view, 41> kOptionalSimpleSettingsCvars = {
      "skate3_native_render_scene",
      "skate3_native_render_scene_msaa",
      "skate3_native_render_scene_shadows",
-@@ -70,6 +70,15 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+@@ -66,10 +66,27 @@ constexpr std::array<std::string_view, 24> kOptionalSimpleSettingsCvars = {
+     "skate3_native_render_scene_bloom",
+     "skate3_native_render_scene_shafts",
+     "skate3_native_render_scene_haze",
++    "skate3_skate2_local_indoor_lighting",
++    "skate3_skate2_indoor_lighting",
++    "skate3_pedestrian_voice_volume",
++    "skate3_startup_mode",
++    "skate3_update_check",
++    "skate3_native_render_scene_sun_override",
++    "skate3_native_render_scene_sun_azimuth",
++    "skate3_native_render_scene_sun_elevation",
+     "skate3_native_render_mode_indicator",
      "skate3_draw_distance_scale",
      "skate3_lod_distance_scale",
      "skate3_draw_distance_stream_probe",
@@ -1428,7 +1742,7 @@ index c22345f..ffc1ddc 100644
      "show_fps_counter",
      "monitor",
      "mnk_sensitivity",
-@@ -148,8 +157,10 @@ struct CategoryInfo {
+@@ -148,8 +165,10 @@ struct CategoryInfo {
    const char* name;
    const char* desc;
  };
@@ -1440,8 +1754,58 @@ index c22345f..ffc1ddc 100644
      {"Controls", "Controller, mouse and keyboard input settings."},
      {"Audio", "Sound output settings."},
      {"Profile", "Local player profile and sign-in."},
-@@ -630,6 +641,12 @@ bool TearingDefault() {
-   return CvarDefaultBool("vulkan_allow_present_mode_immediate", true);
+@@ -568,6 +587,20 @@ double CvarDefaultDouble(std::string_view name, double fallback) {
+   return std::strtod(value->c_str(), nullptr);
+ }
+ 
++// Convert the captured world direction before enabling Custom. Reject invalid
++// input rather than replacing a user's existing angles with a fabricated sun.
++bool SunAnglesFromDirection(const float* dir, float& azimuth, float& elevation) {
++  if (!std::isfinite(dir[0]) || !std::isfinite(dir[1]) || !std::isfinite(dir[2])) return false;
++  const double length = std::sqrt(double(dir[0]) * dir[0] + double(dir[1]) * dir[1] +
++                                  double(dir[2]) * dir[2]);
++  if (length < 1e-6) return false;
++  constexpr double kRad = 57.29577951308232;
++  azimuth = float(std::fmod(std::atan2(double(dir[0]), double(dir[2])) * kRad + 360.0, 360.0));
++  elevation = float(std::clamp(std::asin(std::clamp(double(dir[1]) / length, -1.0, 1.0)) *
++                               kRad, 2.0, 88.0));
++  return true;
++}
++
+ void CopyToBuffer(char* buffer, size_t buffer_size, const std::string& value) {
+   size_t count = std::min(value.size(), buffer_size - 1);
+   std::copy_n(value.data(), count, buffer);
+@@ -613,23 +646,34 @@ int GraphicsApiIndexFromCvar() {
+   return GetGraphicsDeviceList().cvar_name == "vulkan_device" ? 1 : 0;
+ }
+ 
++// The row reads the backend actually running: on builds with both backends
++// compiled in, the other backend's flag says nothing about the swapchain
++// on screen (a Vulkan session once showed On from the D3D12 flag, and the
++// next Apply turned Vulkan tearing on).
+ bool TearingFromCvar() {
++  if (GetGraphicsDeviceList().cvar_name == "vulkan_device") {
++    return (HasCvar("vulkan_allow_present_mode_immediate") &&
++            rex::cvar::Query<bool>("vulkan_allow_present_mode_immediate")) ||
++           (HasCvar("vulkan_allow_present_mode_fifo_relaxed") &&
++            rex::cvar::Query<bool>("vulkan_allow_present_mode_fifo_relaxed"));
++  }
+   if (HasCvar("d3d12_allow_variable_refresh_rate_and_tearing")) {
+     return rex::cvar::Query<bool>("d3d12_allow_variable_refresh_rate_and_tearing");
+   }
+-  if (HasCvar("vulkan_allow_present_mode_immediate")) {
+-    return rex::cvar::Query<bool>("vulkan_allow_present_mode_immediate");
+-  }
+   return false;
+ }
+ 
++// Shipped default on every backend: no tearing (mailbox on Vulkan).
+ bool TearingDefault() {
+-  if (HasCvar("d3d12_allow_variable_refresh_rate_and_tearing")) {
+-    return CvarDefaultBool("d3d12_allow_variable_refresh_rate_and_tearing", true);
+-  }
+-  return CvarDefaultBool("vulkan_allow_present_mode_immediate", true);
++  return false;
  }
  
 +// Off = never tear: immediate and FIFO-relaxed (which tears on late frames)
@@ -1453,7 +1817,7 @@ index c22345f..ffc1ddc 100644
  void SetTearingCvars(bool value) {
    if (HasCvar("d3d12_allow_variable_refresh_rate_and_tearing")) {
      SetBoolCvar("d3d12_allow_variable_refresh_rate_and_tearing", value);
-@@ -638,7 +655,7 @@ void SetTearingCvars(bool value) {
+@@ -638,7 +682,7 @@ void SetTearingCvars(bool value) {
      SetBoolCvar("vulkan_allow_present_mode_immediate", value);
    }
    if (HasCvar("vulkan_allow_present_mode_mailbox")) {
@@ -1462,7 +1826,27 @@ index c22345f..ffc1ddc 100644
    }
    if (HasCvar("vulkan_allow_present_mode_fifo_relaxed")) {
      SetBoolCvar("vulkan_allow_present_mode_fifo_relaxed", value);
-@@ -1008,6 +1025,14 @@ void SimpleSettingsDialog::Show() {
+@@ -975,7 +1019,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
+                                            CloseSettingsCallback close_settings,
+                                            CloseGameCallback close_game,
+                                            RestartGameCallback restart_game,
+-                                           PollGamepadCallback poll_gamepad)
++                                           PollGamepadCallback poll_gamepad,
++                                           LoadSunDirectionCallback load_sun_direction)
+     : ImGuiDialog(drawer),
+       config_path_(std::move(config_path)),
+       load_profiles_(std::move(load_profiles)),
+@@ -983,7 +1028,8 @@ SimpleSettingsDialog::SimpleSettingsDialog(ImGuiDrawer* drawer, std::filesystem:
+       close_settings_(std::move(close_settings)),
+       close_game_(std::move(close_game)),
+       restart_game_(std::move(restart_game)),
+-      poll_gamepad_(std::move(poll_gamepad)) {
++      poll_gamepad_(std::move(poll_gamepad)),
++      load_sun_direction_(std::move(load_sun_direction)) {
+   ReloadProfiles();
+   LoadSettingsFromCvars();
+   SetDrawActive(false);
+@@ -1008,6 +1054,14 @@ void SimpleSettingsDialog::Show() {
    just_shown_ = true;          // swallow the stale cursor delta too
  }
  
@@ -1477,7 +1861,7 @@ index c22345f..ffc1ddc 100644
  void SimpleSettingsDialog::LoadSettingsFromCvars() {
    device_list_ = GetGraphicsDeviceList();
    graphics_api_index_ = HasGraphicsApiChoice() ? GraphicsApiIndexFromCvar() : 0;
-@@ -1022,6 +1047,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
+@@ -1022,6 +1076,7 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
    monitor_index_ = MonitorIndexFromCvar();
    audio_buffer_index_ = AudioBufferIndexFromCvar();
    language_index_ = LanguageIndexFromCvar();
@@ -1485,10 +1869,13 @@ index c22345f..ffc1ddc 100644
    field_of_view_ = FieldOfViewFromCvar();
    fullscreen_ = rex::cvar::Query<bool>("fullscreen");
    vsync_ = rex::cvar::Query<bool>("vsync");
-@@ -1050,6 +1076,23 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
+@@ -1050,6 +1105,38 @@ void SimpleSettingsDialog::LoadSettingsFromCvars() {
    mode_indicator_ = HasCvar("skate3_native_render_mode_indicator") &&
                      rex::cvar::Query<bool>("skate3_native_render_mode_indicator");
    fps_counter_ = HasCvar("show_fps_counter") && rex::cvar::Query<bool>("show_fps_counter");
++  update_check_ = HasCvar("skate3_update_check") && rex::cvar::Query<bool>("skate3_update_check");
++  indoor_lighting_ = !HasCvar("skate3_skate2_indoor_lighting") ||
++                     rex::cvar::Query<bool>("skate3_skate2_indoor_lighting");
 +  cheat_no_air_timer_ = HasCvar("skate3_cheat_no_air_timer") &&
 +                        rex::cvar::Query<bool>("skate3_cheat_no_air_timer");
 +  cheat_no_fall_damage_ = HasCvar("skate3_cheat_no_fall_damage") &&
@@ -1501,6 +1888,18 @@ index c22345f..ffc1ddc 100644
 +                           rex::cvar::Query<bool>("skate3_cheat_no_black_screen");
 +  cheat_no_camera_shake_ = HasCvar("skate3_cheat_no_camera_shake") &&
 +                           rex::cvar::Query<bool>("skate3_cheat_no_camera_shake");
++  ped_voice_volume_ = HasCvar("skate3_pedestrian_voice_volume")
++      ? float(std::clamp(rex::cvar::Query<double>("skate3_pedestrian_voice_volume"), 0.0, 3.0) * 100.0) : 100.0f;
++  startup_mode_index_ = HasCvar("skate3_startup_mode")
++      ? std::clamp(rex::cvar::Query<int32_t>("skate3_startup_mode"), 0, 1) : 0;
++  sun_override_ = HasCvar("skate3_native_render_scene_sun_override") &&
++                  rex::cvar::Query<bool>("skate3_native_render_scene_sun_override");
++  sun_azimuth_ = HasCvar("skate3_native_render_scene_sun_azimuth")
++      ? float(std::clamp(rex::cvar::Query<double>("skate3_native_render_scene_sun_azimuth"), 0.0, 360.0))
++      : 220.0f;
++  sun_elevation_ = HasCvar("skate3_native_render_scene_sun_elevation")
++      ? float(std::clamp(rex::cvar::Query<double>("skate3_native_render_scene_sun_elevation"), 2.0, 88.0))
++      : 35.0f;
 +  ragdoll_scale_ =
 +      HasCvar("skate3_cheat_ragdoll_drive_scale")
 +          ? float(std::clamp(rex::cvar::Query<double>("skate3_cheat_ragdoll_drive_scale"),
@@ -1509,18 +1908,24 @@ index c22345f..ffc1ddc 100644
    audio_mute_ = HasCvar("audio_mute") && rex::cvar::Query<bool>("audio_mute");
    rumble_ = HasCvar("hid_rumble_enabled") && rex::cvar::Query<bool>("hid_rumble_enabled");
    mnk_sensitivity_ = HasCvar("mnk_sensitivity")
-@@ -1075,6 +1118,7 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
+@@ -1075,6 +1162,9 @@ bool SimpleSettingsDialog::HasSettingsChanges() const {
           (HasCvar("audio_device_sample_frames") &&
            audio_buffer_index_ != AudioBufferIndexFromCvar()) ||
           (HasCvar("user_language") && language_index_ != LanguageIndexFromCvar()) ||
++         (HasCvar("skate3_startup_mode") && startup_mode_index_ !=
++             std::clamp(rex::cvar::Query<int32_t>("skate3_startup_mode"), 0, 1)) ||
 +         (HasCvar("skate3_skate2_sky") && nsv_sky_index_ != NsvSkyIndexFromCvars()) ||
           fullscreen_ != rex::cvar::Query<bool>("fullscreen") ||
           vsync_ != rex::cvar::Query<bool>("vsync") ||
           tearing_ != TearingFromCvar() ||
-@@ -1228,6 +1272,16 @@ void SimpleSettingsDialog::SaveVideo() {
+@@ -1228,8 +1318,26 @@ void SimpleSettingsDialog::SaveVideo() {
          std::clamp(language_index_, 0, static_cast<int>(kLanguageLabels.size()) - 1);
      rex::cvar::SetFlagByName("user_language", std::to_string(language_index_ + 1));
    }
++  if (HasCvar("skate3_startup_mode")) {
++    startup_mode_index_ = std::clamp(startup_mode_index_, 0, 1);
++    rex::cvar::SetFlagByName("skate3_startup_mode", std::to_string(startup_mode_index_));
++  }
 +  if (HasCvar("skate3_skate2_sky")) {
 +    const bool night = HasCvar("skate3_skate2_night");
 +    nsv_sky_index_ = std::clamp(nsv_sky_index_, 0, night ? 2 : 1);
@@ -1532,9 +1937,27 @@ index c22345f..ffc1ddc 100644
 +    }
 +  }
    SetBoolCvar("vsync", vsync_);
-   SetTearingCvars(tearing_);
+-  SetTearingCvars(tearing_);
++  // Only a changed row rewrites the present-mode flags, so applying another
++  // setting keeps a mode chosen elsewhere (e.g. the debug menu's selector).
++  if (tearing_ != TearingFromCvar()) {
++    SetTearingCvars(tearing_);
++  }
    SetBoolCvar("mnk_mode", mnk_mode_);
-@@ -1346,14 +1400,21 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+   SetBoolCvar("mnk_capture_mouse", mnk_capture_mouse_);
+   SaveSimpleSettingsConfig(config_path_);
+@@ -1279,8 +1387,8 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.options = {"DirectX 12", "Vulkan"};
+         row.index = &graphics_api_index_;
+         row.reset = [this] {
+-          // The build default ("auto") prefers DirectX 12 on Windows.
+-          graphics_api_index_ = 0;
++          // The shipped settings select Vulkan, the tested backend.
++          graphics_api_index_ = 1;
+         };
+         rows.push_back(std::move(row));
+       }
+@@ -1346,14 +1454,21 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
          row.kind = RowSpec::kEnum;
          row.label = "Framerate Cap";
          row.desc =
@@ -1562,7 +1985,7 @@ index c22345f..ffc1ddc 100644
            row.options.push_back(
                auto_cap > 0.0f
                    ? "Auto (" + std::to_string(int(auto_cap)) + " FPS)"
-@@ -1439,8 +1500,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+@@ -1439,8 +1554,9 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
          row.kind = RowSpec::kEnum;
          row.label = "VRR / Tearing";
          row.desc =
@@ -1574,15 +1997,105 @@ index c22345f..ffc1ddc 100644
          row.options = {"Off", "On"};
          row.flag = &tearing_;
          row.reset = [this] { tearing_ = TearingDefault(); };
-@@ -1794,7 +1856,123 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+@@ -1483,7 +1599,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.index = &msaa_index_;
+         row.reset = [this] {
+           msaa_index_ =
+-              MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 4.0)));
++              MsaaIndexFromSamples(int32_t(CvarDefaultDouble("skate3_native_render_scene_msaa", 2.0)));
+         };
+         rows.push_back(std::move(row));
+       }
+@@ -1560,7 +1676,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.reset = [this] {
+           static_shadow_res_index_ = StaticShadowResIndexFrom(int32_t(
+               CvarDefaultDouble("skate3_native_render_scene_shadow_static_size",
+-                                4096.0)));
++                                2048.0)));
+         };
+         rows.push_back(std::move(row));
+       }
+@@ -1688,7 +1804,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+         row.reset = [this] {
+           draw_distance_index_ = NearestValueIndex(
+               kDrawDistanceScales,
+-              CvarDefaultDouble("skate3_draw_distance_scale", 2.0));
++              CvarDefaultDouble("skate3_draw_distance_scale", 1.0));
+           const std::string scale =
+               std::to_string(kDrawDistanceScales[draw_distance_index_]);
+           rex::cvar::SetFlagByName("skate3_draw_distance_scale", scale);
+@@ -1794,7 +1910,231 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
        }
        break;
      }
 -    case 1: {  // Controls
 +    case 1: {  // World
++      if (HasCvar("skate3_native_render_scene_sun_override") &&
++          HasCvar("skate3_native_render_scene_sun_azimuth") &&
++          HasCvar("skate3_native_render_scene_sun_elevation")) {
++        header("Sun position");
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = "Sun Position";
++        row.desc = "Original uses the map's light. Custom lets you move native sun shadows "
++                   "and sun shafts with the controls below. Baked lighting and the painted "
++                   "sky stay fixed. Every map; applies immediately.";
++        row.options = {"Original", "Custom"};
++        row.flag = &sun_override_;
++        row.enabled = renderer_native_;
++        row.on_enum_change = [this](int value) {
++          const bool was_custom = rex::cvar::Query<bool>("skate3_native_render_scene_sun_override");
++          if (value != 0 && !was_custom && load_sun_direction_) {
++            float direction[3] = {};
++            load_sun_direction_(direction);
++            if (SunAnglesFromDirection(direction, sun_azimuth_, sun_elevation_)) {
++              rex::cvar::SetFlagByName("skate3_native_render_scene_sun_azimuth", std::to_string(sun_azimuth_));
++              rex::cvar::SetFlagByName("skate3_native_render_scene_sun_elevation", std::to_string(sun_elevation_));
++            }
++          }
++          SetBoolCvar("skate3_native_render_scene_sun_override", value != 0);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        row.reset = [this] {
++          sun_override_ = CvarDefaultBool("skate3_native_render_scene_sun_override", false);
++          SetBoolCvar("skate3_native_render_scene_sun_override", sun_override_);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        rows.push_back(std::move(row));
++        for (int axis = 0; axis < 2; ++axis) {
++          const bool height = axis == 1;
++          const std::string name = height ? "skate3_native_render_scene_sun_elevation"
++                                          : "skate3_native_render_scene_sun_azimuth";
++          float* const value = height ? &sun_elevation_ : &sun_azimuth_;
++          const float lo = height ? 2.0f : 0.0f, hi = height ? 88.0f : 360.0f;
++          RowSpec slider;
++          slider.kind = RowSpec::kSlider;
++          slider.label = height ? "Sun Height" : "Sun Direction";
++          slider.desc = height
++              ? "Sun height above the horizon. Lower gives longer shadows; higher gives "
++                "shorter shadows. Baked lighting and sky colors stay fixed."
++              : "Turn the sun around the map to change which direction native shadows "
++                "fall. Baked lightmaps can still contain the map's original shade.";
++          slider.value = value;
++          slider.min = lo;
++          slider.max = hi;
++          slider.step = 1.0f;
++          slider.fmt = "%.0f deg";
++          slider.enabled = renderer_native_ && sun_override_;
++          slider.on_value_change = [name, value, lo, hi] {
++            *value = std::clamp(*value, lo, hi);
++            rex::cvar::SetFlagByName(name, std::to_string(*value));
++          };
++          slider.reset = [this, name, value, lo, hi] {
++            *value = float(std::clamp(CvarDefaultDouble(name, *value), double(lo), double(hi)));
++            rex::cvar::SetFlagByName(name, std::to_string(*value));
++            SaveSimpleSettingsConfig(config_path_);
++          };
++          rows.push_back(std::move(slider));
++        }
++      }
 +      if (HasCvar("skate3_skate2_sky")) {
 +        // Read once at startup by the world loader: a staged, restart-applied row.
-+        header("New San Vanelona");
 +        RowSpec row;
 +        row.kind = RowSpec::kEnum;
 +        row.label = "New San Vanelona Sky";
@@ -1604,6 +2117,51 @@ index c22345f..ffc1ddc 100644
 +          nsv_sky_index_ = night && CvarDefaultBool("skate3_skate2_night", false) ? 2
 +                           : CvarDefaultBool("skate3_skate2_sky", true)            ? 0
 +                                                                                    : 1;
++        };
++        rows.push_back(std::move(row));
++      }
++      if (HasCvar("skate3_skate2_indoor_lighting")) {
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = "Indoor Lighting";
++        row.desc = "Covered places in New San Vanelona keep their own lights instead of "
++                   "the sun's shade: the Downtown arcades, Oliver Elementary, The Parkade, "
++                   "the sewer pipes, the Library, the Fantasy Factory and the clubhouse. "
++                   "Off leaves only the Community Center subway lit and is lighter on the "
++                   "graphics card. Applies immediately.";
++        row.options = {"Off", "On"};
++        row.flag = &indoor_lighting_;
++        row.on_enum_change = [this](int value) {
++          SetBoolCvar("skate3_skate2_indoor_lighting", value != 0);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        row.reset = [this] {
++          indoor_lighting_ = CvarDefaultBool("skate3_skate2_indoor_lighting", true);
++          SetBoolCvar("skate3_skate2_indoor_lighting", indoor_lighting_);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        rows.push_back(std::move(row));
++      }
++      if (HasCvar("skate3_pedestrian_voice_volume")) {
++        RowSpec row;
++        row.kind = RowSpec::kSlider;
++        row.label = "Ped Voice Volume";
++        row.desc = "Pedestrian voices in every map. 100% keeps the original mix; "
++                   "0% mutes them. Other dialogue, music and traffic stay unchanged. "
++                   "Applied immediately.";
++        row.value = &ped_voice_volume_;
++        row.min = 0.0f;
++        row.max = 300.0f;
++        row.step = 10.0f;
++        row.fmt = "%.0f%%";
++        row.on_value_change = [this] {
++          ped_voice_volume_ = std::clamp(ped_voice_volume_, 0.0f, 300.0f);
++          rex::cvar::SetFlagByName("skate3_pedestrian_voice_volume", std::to_string(ped_voice_volume_ / 100.0f));
++        };
++        row.reset = [this] {
++          ped_voice_volume_ = float(std::clamp(CvarDefaultDouble("skate3_pedestrian_voice_volume", 1.0), 0.0, 3.0) * 100.0);
++          rex::cvar::SetFlagByName("skate3_pedestrian_voice_volume", std::to_string(ped_voice_volume_ / 100.0f));
++          SaveSimpleSettingsConfig(config_path_);
 +        };
 +        rows.push_back(std::move(row));
 +      }
@@ -1699,7 +2257,7 @@ index c22345f..ffc1ddc 100644
        header("Mouse & Keyboard");
        {
          RowSpec row;
-@@ -1918,7 +2096,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+@@ -1918,7 +2258,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
        }
        break;
      }
@@ -1708,7 +2266,7 @@ index c22345f..ffc1ddc 100644
        header("Output");
        if (HasCvar("audio_mute")) {
          RowSpec row;
-@@ -1966,7 +2144,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+@@ -1966,7 +2306,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
        }
        break;
      }
@@ -1717,12 +2275,45 @@ index c22345f..ffc1ddc 100644
        header("Local Profile");
        {
          RowSpec row;
-@@ -2013,7 +2191,7 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
+@@ -2013,7 +2353,40 @@ void SimpleSettingsDialog::BuildRows(std::vector<RowSpec>& rows, int category) {
        }
        break;
      }
 -    case 4: {  // System
 +    case 5: {  // System
++      if (HasCvar("skate3_startup_mode")) {
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = "Startup";
++        row.desc = "Default waits for your input. Auto-start skips the logo promptly "
++                   "and continues through the title automatically. Profile, save and "
++                   "DLC checks still run. Needs Apply & Restart.";
++        row.options = {"Default", "Auto-start"};
++        row.index = &startup_mode_index_;
++        row.reset = [this] {
++          startup_mode_index_ = int(std::clamp(CvarDefaultDouble("skate3_startup_mode", 0.0), 0.0, 1.0));
++        };
++        rows.push_back(std::move(row));
++      }
++      if (HasCvar("skate3_update_check")) {
++        RowSpec row;
++        row.kind = RowSpec::kEnum;
++        row.label = "Check for Updates";
++        row.desc = "When the game starts, look for a newer version of Skate 3 Recompiled+ and "
++                   "offer to install it. Applies immediately.";
++        row.options = {"Off", "On"};
++        row.flag = &update_check_;
++        row.on_enum_change = [this](int value) {
++          SetBoolCvar("skate3_update_check", value != 0);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        row.reset = [this] {
++          update_check_ = CvarDefaultBool("skate3_update_check", true);
++          SetBoolCvar("skate3_update_check", update_check_);
++          SaveSimpleSettingsConfig(config_path_);
++        };
++        rows.push_back(std::move(row));
++      }
        if (HasCvar("user_language")) {
          RowSpec row;
          row.kind = RowSpec::kEnum;
@@ -1803,7 +2394,7 @@ index 72d7c07..7246c29 100644
    surface_height_in_paint_connection_ = 0;
  }
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index b404ec8..627ff2b 100644
+index b404ec8..1266b1e 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -11,12 +11,17 @@
@@ -1824,6 +2415,22 @@ index b404ec8..627ff2b 100644
  #include <utility>
  #include <vector>
  
+@@ -50,13 +55,13 @@
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, false, "UI/Vulkan",
+                     "Allow immediate present mode (no vsync)");
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+                     "Allow mailbox present mode (triple buffering)");
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, false, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_present_timing_log, false, "UI/Vulkan",
 @@ -249,6 +254,117 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
    return true;
  }
@@ -2099,21 +2706,3 @@ index b404ec8..627ff2b 100644
    const auto timing_present_end = std::chrono::steady_clock::now();
    AccumulateAndMaybeLogPresentTiming(
        execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
-diff --git a/include/rex/graphics/vulkan/native_rhi_vulkan.h b/include/rex/graphics/vulkan/native_rhi_vulkan.h
-index d4c99fd..7d36bc4 100644
---- a/include/rex/graphics/vulkan/native_rhi_vulkan.h
-+++ b/include/rex/graphics/vulkan/native_rhi_vulkan.h
-@@ -29,10 +29,12 @@ void DestroyNativeRhiDevice(nrhi::Device* device);
- // resets the frame Cmd latches. guest_output_ever_written_previously selects
- // the wrapper's initial tracked layout (UNDEFINED on the image's first ever
- // write, the presenter's internal SHADER_READ_ONLY_OPTIMAL otherwise).
-+// image_version is the presenter lifetime token (handles may be reused).
- // guest_output_out receives the wrapped texture.
- nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, VkImage guest_output_image,
-                                VkImageView guest_output_image_view,
--                               bool guest_output_ever_written_previously, uint32_t width,
-+                               bool guest_output_ever_written_previously, uint64_t guest_output_image_version,
-+                               uint32_t width,
-                                uint32_t height, nrhi::Texture** guest_output_out);
- 
- // Vulkan-only frame epilogue: ends any render pass still open in the frame

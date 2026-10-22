@@ -21,6 +21,8 @@ struct LocalProfileStore {
 };
 
 void EnsureDiagnosticSettings(const std::filesystem::path& path);
+// One-time corrections for settings.toml files written by older versions.
+void ApplySettingsRevisions(const std::filesystem::path& path);
 std::filesystem::path ProfilesFilePath(const std::filesystem::path& user_data_root);
 LocalProfileStore LoadProfiles(const std::filesystem::path& profiles_path);
 bool SaveProfiles(const std::filesystem::path& profiles_path, const LocalProfileStore& store);

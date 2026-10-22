@@ -2,13 +2,17 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
+#include "skate3_freecam_input.h"
 #include "skate3_freeze_capture.h"
 #include "skate3_iso_installer.h"
+#include "skate3_nsv_components.h"
+#include "skate3_updater.h"
 #include "skate3_nsv_installer.h"
 #include "skate3_install_paths.h"
 #include "skate3_jumbotron.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
+#include "native/skate3_native_actor_history.h"
 #include "skate3_perf_recorder.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
@@ -613,12 +617,24 @@ static void Sub82EBAE4CImpl(PPCContext& ctx, uint8_t* base) {
 }
 #endif
 
-Skate3BaseApp::~Skate3BaseApp() = default;
+// Defined before configuration is read; dynamic bind flags register later.
+// Startup check for newer releases (skate3_updater.cpp).
+REXCVAR_DECLARE(bool, skate3_update_check);
+
+REXCVAR_DEFINE_STRING(skate3_actor_history_capture_key, "Ctrl+Insert", "Skate 3",
+    "Actor history save hotkey; change in settings.toml and restart")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+Skate3BaseApp::~Skate3BaseApp() { skate3::actor_history::Shutdown(); }
 
 void Skate3BaseApp::OnConfigurePaths(rex::PathConfig& paths) {
+  // After an in-game update: let the previous instance exit, then remove the
+  // program files it replaced.
+  skate3::updater::FinishPreviousUpdate();
   ConfigureSkate3UserPaths(paths, user_settings_path_, profiles_path_);
   config_path_ = paths.config_path;
   LoadAndNormalizeSimpleSettings(user_settings_path_, config_path_);
+  skate3::ApplySettingsRevisions(user_settings_path_);
   Skate3InitializeFieldOfViewOverride();
   ApplyUltrawideVideoDefaults();
   skate3::EnsureDiagnosticSettings(user_settings_path_);
@@ -699,10 +715,11 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
   auto runtime_paths = defaults;
   runtime_paths.game_data_root = ResolveRuntimeGameDataRoot(runtime_paths);
   runtime_paths.config_path.clear();
+  const auto nsv = skate3::GetNewSanVanStatus(
+      skate3::ContentInstallRoot(runtime_paths.user_data_root), runtime_paths.user_data_root);
   if (!skate3::IsGameInstalled(runtime_paths.game_data_root) ||
       !skate3::IsTitleUpdateInstalled(runtime_paths.game_data_root) ||
-      !skate3::IsNewSanVanInstalled(skate3::ContentInstallRoot(runtime_paths.user_data_root),
-                                  runtime_paths.user_data_root)) {
+      nsv.state == skate3::NsvInstallState::kMissing) {
 #if defined(_WIN32)
     if (!skate3::RunNewSanVanSetup(app_context(), window(), imgui_drawer(), runtime_paths,
                                    user_settings_path_)) {
@@ -716,6 +733,39 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     return std::nullopt;
 #endif
   }
+  // An existing installation: a newer release first (installing it restarts
+  // into that version), then any New San Van data this build needs.
+  const bool check_updates = REXCVAR_GET(skate3_update_check);
+  if (nsv.state == skate3::NsvInstallState::kUpdateRequired)
+    REXLOG_INFO("New San Van update required: {}", skate3::JoinNsvComponents(nsv.components));
+#if defined(_WIN32)
+  if (check_updates &&
+      !skate3::RunUpdateCheck(app_context(), window(), imgui_drawer(), user_settings_path_)) {
+    app_context().QuitFromUIThread();
+    return std::nullopt;
+  }
+  if (nsv.state == skate3::NsvInstallState::kUpdateRequired &&
+      !skate3::RunNewSanVanUpdate(app_context(), window(), imgui_drawer(), runtime_paths,
+                                  user_settings_path_, nsv)) {
+    app_context().QuitFromUIThread();
+    return std::nullopt;
+  }
+#else
+  if (check_updates || nsv.state == skate3::NsvInstallState::kUpdateRequired) {
+    auto maps = [this, runtime_paths, nsv, resume]() mutable {
+      if (nsv.state == skate3::NsvInstallState::kUpdateRequired)
+        skate3::ShowNewSanVanUpdate(app_context(), imgui_drawer(), std::move(runtime_paths),
+                                    user_settings_path_, nsv, std::move(resume));
+      else
+        resume(std::move(runtime_paths));
+    };
+    if (check_updates)
+      skate3::ShowUpdateCheck(app_context(), imgui_drawer(), user_settings_path_, std::move(maps));
+    else
+      maps();
+    return std::nullopt;
+  }
+#endif
 #if defined(_WIN32)
   // Use the embedded release icon for the window/taskbar. Builds without
   // MAINICON retain the game-data fallback (see skate3_win_icon.h).
@@ -760,6 +810,11 @@ void Skate3BaseApp::OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) {
   rex::ui::RegisterBind("bind_skate3_new_san_van", "Ctrl+F7",
                         "Load New San Van (experimental)", [] {
                           skate3::world_loading::RequestLoad();
+                        });
+  rex::ui::RegisterBind("bind_skate3_capture_actor_history",
+                        rex::cvar::Query<std::string>("skate3_actor_history_capture_key"),
+                        "Save the previous 8 seconds of actor glitch history", [] {
+                          skate3::actor_history::Request();
                         });
   rex::ui::RegisterBind("bind_skate3_save_draw_fingerprints", "F8",
                         "Save draw fingerprint log", [this] {
@@ -822,6 +877,12 @@ void Skate3BaseApp::OnPostSetup() {
   skate3::shader_disasm::RunIfRequested();
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
+  // The drone/free-fly camera reads keyboard/mouse from this window event
+  // mirror on platforms without GetAsyncKeyState (upstream PR #148); it does
+  // not need mnk_mode.
+  if (window()) {
+    skate3::freecam_input::Register(window());
+  }
 
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
     input_system->SetActiveCallback([this]() {
@@ -892,6 +953,9 @@ void Skate3BaseApp::OnPostSetup() {
 }
 
 void Skate3BaseApp::OnShutdown() {
+  if (window()) {
+    skate3::freecam_input::Unregister(window());
+  }
   // Before the presenter is torn down (the recorder samples it).
   skate3::perf_recorder::SetPresenter(nullptr);
   rex::ui::UnregisterBind("bind_skate3_menu");
@@ -1005,7 +1069,9 @@ void Skate3BaseApp::ToggleSimpleSettings() {
       std::make_unique<rex::ui::SimpleSettingsDialog>(
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
           std::move(close_settings), std::move(close_game), std::move(restart_game),
-          std::move(poll_gamepad));
+          std::move(poll_gamepad), [](float* direction) {
+            skate3::native_scene::GetCapturedSunDir(direction);
+          });
   ApplySettingsCursorMode();
   skate3::native_scene::SetSettingsMenuBlur(true);
   simple_settings_dialog_->Show();

@@ -474,6 +474,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--root', default=str(REPO / 'out' / 'build' / 'relwithdebinfo'))
     ap.add_argument('--uninstall', action='store_true')
+    # Where the audio and living-world records are read from (default --root): a
+    # component update reads the installed copy of a component it does not rebuild.
+    ap.add_argument('--audio-root')
+    ap.add_argument('--livingworld-root')
     args = ap.parse_args()
     root = Path(args.root)
     content = root / '0000000000000000' / f'{TITLE_ID:08X}'
@@ -488,7 +492,8 @@ def main():
         return
 
     spawns = load_spawns()
-    extra = audio_records(root) + livingworld_records(root)
+    extra = (audio_records(Path(args.audio_root or root)) +
+             livingworld_records(Path(args.livingworld_root or root)))
     vlt, binf = build_vault(spawns, extra)
     texts = {'ID_NSV_MAP_HELPER': 'The city that made you famous and put you in a cast. Twice.',
              'ID_NSV_LOC_DESC': 'Same city, same security guards, same stairs you slammed on.'}

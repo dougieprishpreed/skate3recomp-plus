@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 import numpy as np
-from skate2_dlc_livingworld import rain_resource,StreetRaster,prepare_livingworld,driving_routes,curve_samples,census_tiles,native_lane_normals,refine_boundary_lane,separate_circuits
+from skate2_dlc_livingworld import rain_resource,StreetRaster,prepare_livingworld,driving_routes,curve_samples,census_tiles,native_lane_normals,separate_circuits,visible_collision
+import skate2_dlc_roads as roads
 from skate2_pedestrian_areas import area_material,rain_footprints
 from skate2_navigation import bake_cell
 from navpower_resource import read_rw_object
@@ -114,31 +115,83 @@ class DlcTests(unittest.TestCase):
         self.assertEqual(routes,[])
         with self.assertRaises(ValueError):prepare_livingworld(Path('DLC_MaloofMoneyCup'),None,None,None,None)
 
-    def test_closed_loop_does_not_suppress_supported_branch(self):
-        # A loop and a long connected dead-end street: previously one valid
-        # loop suppressed all boundary continuations on the branch.
-        street=np.array(floor(-60,-60,60,-40)+floor(-60,40,60,60)+
-                        floor(-60,-40,-40,40)+floor(40,-40,60,40)+
-                        floor(60,-12,200,12),np.float32)
-        # The surveyed car floor has clearance from the authored kerb.
-        raster=StreetRaster(street);mask=np.isfinite(raster.y)
-        for _ in range(3):
-            padded=np.pad(mask,1)
-            mask &= padded[:-2,1:-1]&padded[2:,1:-1]&padded[1:-1,:-2]&padded[1:-1,2:]
-        clear=[]
-        for x,row in enumerate(mask):
-            changes=np.diff(np.r_[False,row,False].astype(int))
-            for a,b in zip(np.flatnonzero(changes==1),np.flatnonzero(changes==-1)):
-                clear.extend(floor(x+raster.origin[0]-.5,a+raster.origin[1]-.5,
-                                   x+raster.origin[0]+.5,b+raster.origin[1]-.5))
-        routes,survey=driving_routes({'road':street,'crosswalk':np.empty((0,3,3))},street,np.array(clear,np.float32))
-        self.assertTrue(survey['boundary_continuations'])
-        self.assertTrue(survey['boundary_separate'])
-        self.assertGreater(survey['boundary_coverage']['covered'],survey['skeleton_coverage']['covered'])
-        self.assertGreater(max(r[:,0].max() for r in routes),190)
-        for r in routes:
-            for samples in curve_samples(r):
-                self.assertTrue(np.isfinite(StreetRaster(street).height(samples.reshape(-1,3))).all())
+    def test_road_network_keeps_right_turns_at_junctions_and_skips_alleys(self):
+        # A 12m-wide ring road round one block, a long dead-end road and a
+        # short side alley. Wall faces stand along the far curbs only.
+        street=np.array(floor(0,0,120,12)+floor(0,108,120,120)+floor(0,12,12,108)+
+                        floor(108,12,120,108)+floor(120,54,260,66)+floor(54,120,66,160),np.float32)
+        areas={'road':street,'crosswalk':np.empty((0,3,3),np.float32)}
+        routes,survey=driving_routes(areas,street,street)
+        self.assertEqual(survey['selection'],'road-network-v9')
+        self.assertEqual((survey['circuits'],survey['dead_ends'],survey['alleys']),(2,1,1))
+        self.assertTrue(separate_circuits(routes))
+        points=np.concatenate(routes)
+        # The alley is never entered; the long road is driven to its end.
+        self.assertFalse(((points[:,2]>125)&(np.abs(points[:,0]-60)<8)).any())
+        self.assertGreater(points[:,0].max(),245)
+        # Keep right like the original RAIN: on the bottom road a lane heading
+        # +x sits 2m right of the centerline (+z) with the opposing lane 4m on
+        # its left (up x forward = -z).
+        for lane in routes:
+            d=np.roll(lane,-1,axis=0)-lane
+            on=(np.abs(lane[:,0]-60)<20)&(lane[:,2]<12)
+            for p,v in zip(lane[on],d[on]):
+                v=v[[0,2]]/np.linalg.norm(v[[0,2]])
+                if v[0]>.99:self.assertAlmostEqual(p[2],8.,delta=.6)
+                if v[0]<-.99:self.assertAlmostEqual(p[2],4.,delta=.6)
+            self.assertTrue((native_lane_normals(lane)[:,1]>.99).all())
+            rain_resource([lane],'ring')
+
+    def test_median_divides_carriageways_instead_of_making_a_loop(self):
+        # The ring's bottom road is 20m wide with a 3m median down its middle.
+        street=np.array(floor(0,0,120,8.5)+floor(0,11.5,120,20)+floor(0,108,120,120)+
+                        floor(0,20,12,108)+floor(108,20,120,108)+floor(0,8.5,12,11.5)+
+                        floor(108,8.5,120,11.5),np.float32)
+        areas={'road':street,'crosswalk':np.empty((0,3,3),np.float32)}
+        routes,survey=driving_routes(areas,street,street)
+        self.assertEqual(survey['circuits'],2)
+        for lane in routes:
+            on=(np.abs(lane[:,0]-60)<30)&(lane[:,2]<20)
+            self.assertTrue(on.any())
+            # Each lane keeps its ribbon clear of the median (z 8.5..11.5).
+            self.assertTrue((np.abs(lane[on,2]-10)>=1.5+1.75-.05).all())
+
+    def test_drawn_barriers_block_and_undrawn_skater_walls_do_not(self):
+        # Two tag-0 walls across a street: a jersey barrier with a drawn mesh
+        # on it, and an undrawn skater-only wall.
+        def wall(x):return np.array([[[x,0,0],[x,1.2,0],[x,0,12]],[[x,1.2,0],[x,1.2,12],[x,0,12]]],np.float32)
+        street=np.array(floor(0,0,100,12),np.float32)
+        mesh=np.concatenate((street,wall(30),wall(70)))
+        tags=np.zeros((len(mesh),2),int);tags[:len(street),1]=7
+        drawn=wall(30)+np.array([0.05,0,0],np.float32)
+        visible=visible_collision(mesh,tags,np.concatenate((street,drawn)))
+        self.assertTrue(visible[:len(street)].all())
+        self.assertEqual(visible[len(street):].tolist(),[True,True,False,False])
+
+    def test_barrier_pinch_closes_a_road(self):
+        # A 12m street with a barrier leaving a 3m gap at x=300: each side is
+        # its own dead-end road, never driven through the gap.
+        street=np.array(floor(0,0,600,12),np.float32)
+        survey=np.array(floor(0,0,299,12)+floor(299,0,301,3)+floor(301,0,600,12),np.float32)
+        barrier=np.array([[[300,0,3],[300,1.2,3],[300,0,12]],[[300,1.2,3],[300,1.2,12],[300,0,12]]],np.float32)
+        mesh=np.concatenate((street,barrier))
+        routes,survey_report=driving_routes({'road':street,'crosswalk':np.empty((0,3,3),np.float32)},mesh,survey)
+        self.assertEqual(survey_report['circuits'],2)
+        for lane in routes:
+            self.assertTrue((lane[:,0]<300).all() or (lane[:,0]>300).all())
+
+    def test_invisible_boundary_walls_do_not_close_a_street(self):
+        street=np.array(floor(0,0,100,12),np.float32)
+        # The clearance survey stops 3m either side of a wall across x=50.
+        survey=np.array(floor(0,0,47,12)+floor(53,0,100,12),np.float32)
+        wall=np.array([[[50,0,0],[50,4,0],[50,0,12]],[[50,4,0],[50,4,12],[50,0,12]]],np.float32)
+        mesh=np.concatenate((street,wall))
+        probe=[50,6]
+        for visible,expect in ((np.r_[np.ones(len(street),bool),False,False],True),
+                               (np.ones(len(mesh),bool),False)):
+            f=roads.Floor(street,survey,mesh,visible)
+            self.assertEqual(bool(f.lookup(f.mask,np.array([probe]))[0]),expect)
+            self.assertTrue(f.lookup(f.mask,np.array([[20.,6.]]))[0])
 
     def test_independent_circuits_reject_crossing_and_overlapping_lanes(self):
         angles=np.linspace(0,2*np.pi,100,endpoint=False)
@@ -147,28 +200,6 @@ class DlcTests(unittest.TestCase):
         self.assertTrue(separate_circuits([loop,loop+[50.,0.,0.]]))
         self.assertFalse(separate_circuits([loop,loop+[10.,0.,0.]]))
         self.assertFalse(separate_circuits([loop,loop[::-1]]))
-
-    def test_turnaround_corner_refinement_retains_supported_ribbon(self):
-        raster=StreetRaster(np.array(floor(-40,-10,40,10),np.float32))
-        a=np.linspace(0,2*np.pi,100,endpoint=False)
-        lane=np.column_stack((30*np.cos(a),np.zeros(len(a)),7*np.sin(a)+2*np.maximum(np.sin(a),0)**8))
-        old=curve_samples(lane)
-        self.assertTrue(any(np.isinf(raster.height(c.reshape(-1,3))).any() for c in old))
-        refined=refine_boundary_lane(lane,raster,raster)
-        self.assertLessEqual(np.linalg.norm((refined-lane)[:,[0,2]],axis=1).max(),1.5)
-        self.assertFalse(np.array_equal(lane,refined))
-        for c in curve_samples(refined):
-            self.assertTrue(np.isfinite(raster.height(c.reshape(-1,3))).all())
-        self.assertTrue((native_lane_normals(refined)[:,1]>.99).all())
-        rain_resource([refined],'turnaround')
-        # Already qualified routes are returned without changing a vertex.
-        np.testing.assert_array_equal(refine_boundary_lane(refined,raster,raster),refined)
-
-    def test_turnaround_refinement_does_not_invent_missing_street(self):
-        raster=StreetRaster(np.array(floor(-40,-1,40,1),np.float32))
-        a=np.linspace(0,2*np.pi,100,endpoint=False)
-        lane=np.column_stack((30*np.cos(a),np.zeros(len(a)),.5*np.sin(a)))
-        np.testing.assert_array_equal(refine_boundary_lane(lane,raster,raster),lane)
 
     def test_stacked_streets_do_not_mix_floor_heights(self):
         raster=StreetRaster(np.array(floor(0,0,10,10,0.)+floor(0,0,10,10,10.),np.float32))

@@ -10,6 +10,7 @@
 #include "skate3_world_loading.h"
 #include "skate3_skate2_water_data.h"
 #include "skate3_texture_565.h"
+#include "native/skate3_native_indoor_data.h"
 
 #include "generated/skate3_init.h"
 
@@ -46,6 +47,7 @@
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
+#include "native/skate3_native_performance.h"
 #include "native/character_fade.h"
 #include "native/mesh_normals.h"
 #include "native/skate3_native_sheet_twins.h"
@@ -111,6 +113,36 @@ REXCVAR_DEFINE_DOUBLE(skate3_skate2_night_brightness, 1.0, "Skate 3",
                       "New San Vanelona at night (skate3_skate2_night): multiplier on the "
                       "Sanitarium-matched night light (0.25-4; 1 = the Sanitarium's levels)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_indoor_open_areas, true, "Skate 3",
+                    "New San Vanelona: also treat the covered open places as interiors (the "
+                    "Downtown arcades, Oliver Elementary's canopies and lamp-lit halls, The "
+                    "Parkade's decks). Off keeps only the enclosed ones: the Community Center "
+                    "subway, the sewer pipes, the Library, the Fantasy Factory and the Monster "
+                    "clubhouse")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skate2_night_open_area_light, 1.0, "Skate 3",
+                      "New San Vanelona at night: lamp level of the covered open places (the "
+                      "Downtown arcades, Oliver Elementary, The Parkade) as a multiple of the "
+                      "shade level (0.5-9.5; their baked light is capped there, so no day "
+                      "sunlight shows)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_indoor_lighting, true, "Skate 3",
+                    "New San Vanelona: the covered places keep their own lights instead of the "
+                    "sun's shade (the Downtown arcades, Oliver Elementary, The Parkade, the "
+                    "sewer pipes, the Library, the Fantasy Factory, the clubhouse). Off leaves "
+                    "only the Community Center subway lit (the ESC menu's World > Indoor "
+                    "Lighting)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_indoor_ceiling_shadows, true, "Skate 3",
+                    "New San Vanelona: live shadows of things above a covered place's ceiling "
+                    "(props parked on the deck above, trees over a sewer pipe, the grate over "
+                    "a shaft) stop at that ceiling instead of falling through it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_night_sunlight, false, "Skate 3",
+                    "New San Vanelona at night: keep the day's baked sunlight and sun shadows, "
+                    "dimmed (off: the sun is gone at night; sunlit surfaces outdoors, and "
+                    "inside covered places where the sun reaches, fall to their shade level)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_skate2_ocean_glare, 0.25, "Skate 3",
                       "New San Vanelona's sea and lakes: how much of the extra sky reflection "
                       "the water shows at a low angle, as across the bay (0-1; 1 = Skate 2's "
@@ -122,6 +154,7 @@ REXCVAR_DECLARE(bool, skate3_skate2_jumbotron);  // skate3_jumbotron.cpp
 REXCVAR_DECLARE(bool, skate3_skate2_transparent_parity);
 REXCVAR_DECLARE(bool, skate3_skate2_env_specular);
 REXCVAR_DECLARE(bool, skate3_skate2_stadium_crowd_shade);
+REXCVAR_DECLARE(bool, skate3_skate2_local_indoor_lighting);
 REXCVAR_DECLARE(bool, skate3_skate2_native_occlusion);
 REXCVAR_DECLARE(bool, async_shader_compilation);
 REXCVAR_DECLARE(bool, native_render_suppress_emulated_draws);
@@ -131,6 +164,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_backface_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_bloom);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_boot_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_cas_yield);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_sun_override);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_char_shadow_exact);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_decals);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
@@ -1008,6 +1042,7 @@ struct StagedTexResult {
 // view never makes the texture valid or exposes an unfinished upload.
 void PrepareStagedTextureView(nrhi::Device* device, StagedTexResult& tr) {
   if (tr.valid && !tr.ui && skate3::world_loading::IsSkate2Gameplay() &&
+      PerformanceOptimizationsEnabled(true) &&
       device->backend() == nrhi::Backend::kVulkan) {
     tr.gt.srv = device->CreateTextureViewAsync(tr.gt.texture,
                                               StagedTextureViewDesc(tr.commit));
@@ -1185,6 +1220,7 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   }
   const bool static_upload = skate3::world_loading::IsSkate2Gameplay() &&
       device->backend() == nrhi::Backend::kVulkan &&
+      PerformanceOptimizationsEnabled(true) &&
       REXCVAR_GET(skate3_skate2_vulkan_static_mesh_upload) &&
       !item.skinned && !item.ropa && !item.cloth_quads &&
       item.char_family == 0 && item.dynobj == 0;
@@ -1228,6 +1264,7 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
   float* cpu_vertices = nullptr;
   uint16_t* cpu_indices = nullptr;
   const bool cached_output = device->backend() == nrhi::Backend::kVulkan &&
+      PerformanceOptimizationsEnabled(skate3::world_loading::IsSkate2Gameplay()) &&
       REXCVAR_GET(skate3_native_vulkan_cached_mesh_decode) &&
       (!skate3::world_loading::IsSkate2Gameplay() ||
        REXCVAR_GET(skate3_skate2_vulkan_cached_mesh_decode)) &&
@@ -1729,7 +1766,7 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     }
     if (tris.size() >= 2) {
       size_t twins = 0;
-      if (skate3::world_loading::IsSkate2Gameplay()) {
+      if (skate3::world_loading::IsSkate2Gameplay() && PerformanceOptimizationsEnabled(true)) {
         static const bool announced = [] {
           REXLOG_INFO("native-scene: NSV sheet search enabled (bounded scratch, original pair order and thresholds)");
           return true;
@@ -3370,7 +3407,7 @@ bool EnsureRootSignature(const NativeGuestOutputRenderContext& context) {
     // existing table costs no root-signature DWORDs. Bound together via
     // SetTextures (a pair-only bind would drop t10 to the backend
     // fallback).
-    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 4,
+    ld.params[8] = {nrhi::BindingParamKind::kTextureTable, 8, 5,
                     nrhi::Visibility::kPixel};
     // Character lighting block (b2): the canonical per-draw rows captured
     // from the guest PS bank (CaptureCharLighting), sliced out of the bone
@@ -4671,6 +4708,44 @@ bool EnsureBlurOutlineTargets(const NativeGuestOutputRenderContext& context) {
   return true;
 }
 
+// One immutable, bounded upload. No guest pointers, map-boundary rebuild,
+// per-frame allocation or extra worker ownership. Disabled on upload failure.
+void EnsureIndoorRegions(const NativeGuestOutputRenderContext& context) {
+  if (g_r.indoor_regions_attempted) return;
+  g_r.indoor_regions_attempted = true;
+  auto& t = g_r.indoor_regions;
+  auto* device = context.device;
+  nrhi::TextureDesc desc;
+  desc.width = indoor::kWidth;
+  desc.height = indoor::kHeight;
+  desc.format = nrhi::Format::kR32G32B32A32_FLOAT;
+  desc.initial_state = nrhi::ResourceState::kCopyDest;
+  t.texture = device->CreateTexture(desc);
+  if (t.texture) t.upload = CreateUploadBuffer(device, sizeof(indoor::kData), nrhi::BufferBindClass::kCopySrc);
+  void* bytes = t.upload ? device->Map(t.upload) : nullptr;
+  if (bytes) {
+    std::memcpy(bytes, indoor::kData, sizeof(indoor::kData));
+    device->Unmap(t.upload);
+    context.cmd->CopyBufferToTexture(t.texture, 0, 0, t.upload, 0,
+        indoor::kWidth * 4 * sizeof(float), indoor::kWidth, indoor::kHeight, 1);
+    context.cmd->Barrier(t.texture, nrhi::ResourceState::kCopyDest, nrhi::ResourceState::kPixelShaderResource);
+    device->DestroyDeferred(t.upload);
+    t.upload = nullptr;
+    nrhi::TextureViewDesc view;
+    view.mip_levels = 1;
+    t.srv = device->CreateTextureView(t.texture, view);
+    t.valid = t.srv != nullptr;
+  }
+  if (!t.valid) {
+    device->DestroyDeferred(t.upload); t.upload = nullptr;
+    device->DestroyDeferred(t.texture); t.texture = nullptr;
+    REXLOG_WARN("native-scene: local indoor lighting lookup unavailable; original shadow path retained");
+  } else {
+    REXLOG_INFO("native-scene: local indoor lighting atlas ready ({}x{}, {} bytes)",
+                indoor::kWidth, indoor::kHeight, sizeof(indoor::kData));
+  }
+}
+
 // 1x1 white diffuse fallback + 1x1x6 mid-gray environment-cube fallback.
 bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
   nrhi::Device* device = context.device;
@@ -4789,6 +4864,7 @@ bool EnsureFallbackTextures(const NativeGuestOutputRenderContext& context) {
     }
     g_r.white_cube.valid = true;
   }
+  EnsureIndoorRegions(context);
   return true;
 }
 
@@ -4947,6 +5023,7 @@ bool EnsureOutputSizedTargets(const NativeGuestOutputRenderContext& context) {
 
 bool EnsureOutputSampleView(const NativeGuestOutputRenderContext& context) {
   if (context.backend == NativeGuestOutputBackend::kVulkan &&
+      PerformanceOptimizationsEnabled(skate3::world_loading::IsSkate2Gameplay()) &&
       REXCVAR_GET(skate3_native_vulkan_output_view_reuse) &&
       (!skate3::world_loading::IsSkate2Gameplay() ||
        REXCVAR_GET(skate3_skate2_vulkan_output_view_reuse))) {
@@ -5142,6 +5219,11 @@ void WarmItemResources(const NativeGuestOutputRenderContext& context, uint8_t* b
       ++wc.decodes;
       MeshBuffers buffers;
       if (DecodeMesh(g_r.device, base, item, buffers)) {
+        // Record a static upload's copy now, before this frame's passes, as
+        // PrewarmCommit does; left to the first bind, it would end the open
+        // render pass mid-frame. No-op for every other buffer.
+        context.cmd->PrepareBufferUpload(buffers.vb);
+        context.cmd->PrepareBufferUpload(buffers.ib);
         buffers.fingerprint = item.fingerprint;
         buffers.last_used_frame = frame_number;
         buffers.sticky = carried_sticky;
@@ -5408,6 +5490,7 @@ void ProcessPrewarmEntry(uint8_t* base, const PrewarmEntry& e,
       // frame can retry it (the payload may finish streaming in).
       std::lock_guard<std::mutex> lock(g_prewarm_mutex);
       if (e.miss || !skate3::world_loading::IsSkate2Gameplay() ||
+          !PerformanceOptimizationsEnabled(true) ||
           !REXCVAR_GET(skate3_skate2_coalesce_mesh_requests))
         g_miss_inflight_mesh.erase(e.mesh);
     }
@@ -5741,6 +5824,7 @@ void EnsurePrewarmWorkers() {
 void PrewarmCommit(const NativeGuestOutputRenderContext& context,
                    uint64_t frame_number, bool loading = false) {
   const bool coalesce = skate3::world_loading::IsSkate2Gameplay() &&
+                        PerformanceOptimizationsEnabled(true) &&
                         REXCVAR_GET(skate3_skate2_coalesce_mesh_requests);
   {
     std::scoped_lock lock(g_prewarm_out_mutex, g_prewarm_mutex);
@@ -6079,6 +6163,7 @@ bool g_loading_hold = false;
 // Drops every static sun-map caster record with its bounds, index, pending
 // additions and any rebuild in progress (indices would dangle).
 void ClearStaticCasterCache() {
+  g_r.nsm_sun_candidate = {};
   g_r.static_casters.clear();
   g_r.static_caster_bounds.clear();
   g_r.static_caster_index.clear();
@@ -7498,15 +7583,13 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
                            sun[2] * g_r.nsm_sun[2];
     if (held_dot < 0.999995f) {
       // The captured axis disagrees with the built one: require it to
-      // persist two consecutive build frames before it can drive a
+      // persist across two distinct fresh guest captures before it can drive a
       // rebuild; until then keep working along the held axis.
-      static float s_cand[3] = {};
-      static uint64_t s_cand_frame = 0;
-      const float cand_dot =
-          sun[0] * s_cand[0] + sun[1] * s_cand[1] + sun[2] * s_cand[2];
-      const bool confirmed = s_cand_frame + 1 == frame_number && cand_dot > 0.9999f;
-      std::memcpy(s_cand, sun, sizeof(s_cand));
-      s_cand_frame = frame_number;
+      // A stale row bank rendered twice is still only ONE capture. Pause
+      // previews must not teach the persistent world map a different light.
+      const bool confirmed = REXCVAR_GET(skate3_native_render_scene_sun_override) ||
+          g_r.nsm_sun_candidate.Confirm(sun, scene.shadow_capture_frame,
+              !g_in_menus_frame.load(std::memory_order_relaxed) && scene.shadow_age <= 1);
       if (!confirmed) {
         static std::atomic<uint32_t> s_jump_logs{0};
         const uint32_t n = s_jump_logs.fetch_add(1, std::memory_order_relaxed);
@@ -7518,6 +7601,8 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
         g_r.nsm_frame_note |= kLightAxisHold;
         std::memcpy(sun, g_r.nsm_sun, sizeof(sun));
       }
+    } else {
+      g_r.nsm_sun_candidate = {};
     }
   }
   const float zl[3] = {-sun[0], -sun[1], -sun[2]};
@@ -7550,7 +7635,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
   // served map (and to a rebuild in progress) as it arrives; a record
   // changed in place also marks the map dirty, since its old shape stays
   // in the map until a rebuild.
-  const bool nsv_static = skate3::world_loading::IsSkate2Gameplay();
+  const bool nsv_static = (scene.world_identity & 1u) != 0;
   for (const DrawItem& item : scene.items) {
     // Skate 2 additive effects (glare sprites, godray cones, neon overlays)
     // are light, not occluders.
@@ -7558,7 +7643,7 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
         item.water_ocean != 0 || item.skinned || item.ropa ||
         item.char_family != 0 || item.dynobj != 0 || item.s2_blend != 0 ||
         item.indicator ||
-        (nsv_static && item.env_family == 11)) {
+        !PersistentStaticProxyAllowed(scene.world_identity, item.env_family)) {
       // NSV proxyworld is view-dependent distant scenery. Persisting its
       // simplified solid silhouette beside the detailed world leaves ghost
       // shadows after a round trip/marker return. Keep the proxy's visible
@@ -7727,12 +7812,14 @@ static void RenderStaticSunMap(const NativeGuestOutputRenderContext& context,
     const float dcz = cam[2] - build.center[2];
     const float du = xl[0] * dcx + xl[1] * dcy + xl[2] * dcz;
     const float dv = yl[0] * dcx + yl[1] * dcy + yl[2] * dcz;
-    if (std::fabs(radius - build.radius) > 0.5f ||
+    const bool sun_changed = SunAxisDot(sun, build.sun) < 0.999995f;
+    if (sun_changed ||
+        std::fabs(radius - build.radius) > 0.5f ||
         std::max(std::fabs(du), std::fabs(dv)) > radius * 0.25f) {
       build.active = false;
       build.late.clear();
       if (reason == 0) {
-        reason = 4;
+        reason = sun_changed ? 5 : 4;
       }
     }
   }
@@ -9672,9 +9759,8 @@ void MaybeDumpLightHistory(uint32_t marker) {
 
 // Manual NSV inventory: distinguish receiver/map changes from cached caster
 // history after a marker return. No GPU readback, guest reads or idle scans.
-static void DumpNsvShadowState(const FrameScene& scene, uint32_t marker,
+static void DumpShadowState(const FrameScene& scene, uint32_t marker,
                                uint64_t frame_number) {
-  if (!skate3::world_loading::IsSkate2Gameplay()) return;
   char path[160];
   std::snprintf(path, sizeof(path), "logs/shadow_state_%u_%lld_%llu.csv", marker,
                 static_cast<long long>(std::time(nullptr)),
@@ -9685,7 +9771,8 @@ static void DumpNsvShadowState(const FrameScene& scene, uint32_t marker,
   out << "marker,frame,cam,nsm_valid,nsm_active,nsm_radius,nsm_center,nsm_sun,nsm_rows,"
          "receiver_valid,receiver_fresh,receiver_rows,build_active,pending,"
          "key,mesh,fingerprint,gpu_fingerprint,resident,last_seen,queued,family,"
-         "diffuse_guid,world,bbox_min,bbox_max,in_far_tile,cached_ranges,current_ranges\n";
+         "diffuse_guid,world,bbox_min,bbox_max,in_far_tile,cached_ranges,current_ranges,"
+         "world_identity,shadow_capture_frame,shadow_age,sky_sun_valid,sky_sun\n";
   std::unordered_multimap<uint32_t, const DrawItem*> current;
   current.reserve(scene.items.size());
   for (const auto& item : scene.items) current.emplace(item.mesh, &item);
@@ -9722,7 +9809,10 @@ static void DumpNsvShadowState(const FrameScene& scene, uint32_t marker,
         << std::hex << rec.diffuse_guid << std::dec << ',';
     floats(rec.world, 16); out << ','; floats(rec.bbox_min, 3);
     out << ','; floats(rec.bbox_max, 3);
-    out << ',' << in_far << ",\"" << DescribeDrawRanges(rec.draws) << "\",\"" << ranges << "\"\n";
+    out << ',' << in_far << ",\"" << DescribeDrawRanges(rec.draws) << "\",\"" << ranges << "\","
+        << scene.world_identity << ',' << scene.shadow_capture_frame << ',' << scene.shadow_age
+        << ',' << scene.sky_sun_valid << ',';
+    floats(scene.sky_sun, 3); out << '\n';
     ++written;
   }
   out.flush();
@@ -9737,6 +9827,14 @@ static void DumpNsvShadowState(const FrameScene& scene, uint32_t marker,
 // (CSM height window + cascade, the props' world-shadow map). For prop feet
 // that change shade as the camera moves.
 static void LogShadowProbe(const FrameScene& scene) {
+  REXLOG_WARN("shadow-probe: indoor-map={} local_indoor={} atlas={}", scene.indoor_lighting_map,
+              REXCVAR_GET(skate3_skate2_local_indoor_lighting), g_r.indoor_regions.valid);
+  const size_t proxies = std::count_if(g_r.static_casters.begin(), g_r.static_casters.end(),
+      [](const auto& caster) { return caster.env_family == 11; });
+  REXLOG_WARN("shadow-probe: world_identity={} nsv={} cached={} proxies={} sun=({:.6f},{:.6f},{:.6f}) capture={} age={}",
+              scene.world_identity, (scene.world_identity & 1u) != 0,
+              g_r.static_casters.size(), proxies, g_r.nsm_sun[0], g_r.nsm_sun[1], g_r.nsm_sun[2],
+              scene.shadow_capture_frame, scene.shadow_age);
   const float* sh = scene.shadow_rows;
   const float* cam = scene.cam_pos;
   const float zy = std::fabs(sh[17]);
@@ -9927,6 +10025,26 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     ArmGuestReadRecoveryForThread(base);
     UpdatePhotoGrabWindow(base);
   }
+  const uint64_t world_identity = skate3::world_loading::RenderWorldIdentity();
+  const bool gameplay = rex::kernel::guest_presence::GameplayContextValue() != 0;
+  if (g_r.shadow_world_lifetime.Update(world_identity, gameplay)) {
+    // Presence can remain live through a transition, or the loading screen
+    // can submit scenery before gameplay resumes. Neither may bridge maps.
+    ClearStaticCasterCache();
+    g_r.static_sun_valid = false;
+    g_r.nsm_built_radius = 0.0f;
+    g_r.nsm_dirty = true;
+    g_r.nsm_capture_seen = false;
+    g_r.nsm_live_frame = 0;
+    g_r.nsm_active = false;
+    g_r.nsm_casters_drawn = 0;
+    g_r.nsm_casters_skipped = 0;
+    g_r.world_shadow_primed = false;
+    g_r.world_shadow_drawn.clear();
+    // Logical invalidation only: retain texture/SRV state and GPU retirement.
+    REXLOG_INFO("native-scene: shadow world reset identity={} nsv={} gameplay={}",
+                world_identity, (world_identity & 1u) != 0, gameplay);
+  }
   if (YieldForMenus(context)) {
     return light_yield(kLightYieldMenus);
   }
@@ -10013,6 +10131,15 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
     scene_ptr = g_scene;
   }
+  if (!loading_native && scene_ptr->world_identity != world_identity) {
+    // A queued published frame may still belong to the outgoing map. Use
+    // the existing native loading UI until a destination scene is published.
+    static const auto empty_scene = std::make_shared<const FrameScene>();
+    scene_ptr = empty_scene;
+    loading_native = true;
+    g_loading_hold = true;
+    light.f.gate |= kLightLoading;
+  }
   const FrameScene& scene = *scene_ptr;
 
   g_r.output_view_borrows = g_r.output_view_reuses = 0;
@@ -10087,6 +10214,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     }
   } table_lookup_scope(cmd, &perf_rec.r,
       context.backend == NativeGuestOutputBackend::kVulkan &&
+      PerformanceOptimizationsEnabled(skate3::world_loading::IsSkate2Gameplay()) &&
       REXCVAR_GET(skate3_native_vulkan_table_lookup_cache) &&
       (!skate3::world_loading::IsSkate2Gameplay() ||
        REXCVAR_GET(skate3_skate2_vulkan_table_lookup_cache)));
@@ -10285,7 +10413,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
   }
   if (light.marker != 0) {
     LogShadowProbe(scene);
-    DumpNsvShadowState(scene, light.marker, frame_number);
+    DumpShadowState(scene, light.marker, frame_number);
   }
   g_pw_shadow.Add(perf_ns_since(shadow_t0));
   cmd->ProfileRegion(nrhi::ProfileStage::kMain);
@@ -10420,10 +10548,41 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     cb[223] = float(std::clamp(REXCVAR_GET(skate3_skate2_ocean_glare), 0.0, 1.0));
     // night_grade (cb[224..227]): New San Vanelona at night scales the world's
     // baked light (lightmapped and pre-lit families, after the shadow clamp)
-    // by kNightGrade; w = 1 enables. Zero (the memset) = off.
+    // by kNightGrade; w = 1 enables, w = 2 also takes the day's baked sunlight
+    // out (scene_shadows.hlsli, SampleStaticSunStrengthNight). Zero (the memset) = off.
     static_assert(RendererState::kShadowCbSlice >= 228 * sizeof(float));
     if (NightGrade(cb + 224)) {
-      cb[227] = 1.0f;
+      // w = 2 + lamp/10 takes the day's sunlight out and gives the covered open
+      // places their lamp level (scene.hlsl); w = 1 keeps the dimmed day look.
+      const float lamp =
+          float(std::clamp(REXCVAR_GET(skate3_skate2_night_open_area_light), 0.5, 9.5));
+      cb[227] = REXCVAR_GET(skate3_skate2_night_sunlight) ? 1.0f : 2.0f + lamp / 10.0f;
+    }
+    static_assert(RendererState::kShadowCbSlice >= 236 * sizeof(float));
+    if ((scene.world_identity & 1u) && g_r.indoor_regions.valid &&
+        REXCVAR_GET(skate3_skate2_local_indoor_lighting)) {
+      const indoor::Map* map = scene.indoor_lighting_map == 1 ? &indoor::kBAM
+                            : scene.indoor_lighting_map == 2 ? &indoor::kCommunity
+                            : scene.indoor_lighting_map == 3 ? &indoor::kFantasy
+                            : scene.indoor_lighting_map == 4 ? &indoor::kSchool
+                            : scene.indoor_lighting_map == 5 ? &indoor::kParkade : nullptr;
+      // World > Indoor Lighting off: only the Community Center subway keeps its
+      // lights; the other zones (and their lookup) are gone until it is on again.
+      if (map && map != &indoor::kCommunity && !REXCVAR_GET(skate3_skate2_indoor_lighting)) {
+        map = nullptr;
+      }
+      if (map) {
+        std::memcpy(cb + 228, map->grid, sizeof(map->grid));
+        std::memcpy(cb + 232, map->info, sizeof(map->info));
+        // info.z (the vertical feather) carries the open-areas switch in its sign.
+        if (!REXCVAR_GET(skate3_skate2_indoor_open_areas)) cb[234] = -cb[234];
+        // info.w = lattice texels per metre (from the map); the static venue
+        // strength no longer applies under a zone (the roof's shadow is lifted whole).
+        // indoor_day.z (cb[238]): live shadows stop at a zone's roof
+        // (scene_frame_cb.hlsli, CsmCeilingLimit).
+        static_assert(RendererState::kShadowCbSlice >= 240 * sizeof(float));
+        cb[238] = REXCVAR_GET(skate3_skate2_indoor_ceiling_shadows) ? 1.0f : 0.0f;
+      }
     }
     if (shadow_ready) {
       std::memcpy(cb + 0, sh + 0, 4 * sizeof(float));    // sh_x   = PS c0
@@ -10623,10 +10782,11 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // v2 material table default (t8/t9 white) + the static sun-shadow map
     // at its third entry (t10); every lit branch samples it, so the table
     // must be bound for all draws, not only the v2/ocean re-binds.
-    nrhi::TextureView* t8_default[4] = {
+    nrhi::TextureView* t8_default[5] = {
         g_r.white.srv, g_r.white.srv,
-        g_r.nsm_active ? g_r.static_sun_srv : g_r.white.srv, g_r.white.srv};
-    cmd->SetTextures(8, t8_default, 4);
+        g_r.nsm_active ? g_r.static_sun_srv : g_r.white.srv, g_r.white.srv,
+        g_r.indoor_regions.valid ? g_r.indoor_regions.srv : g_r.white.srv};
+    cmd->SetTextures(8, t8_default, 5);
   }
   nrhi::TextureView* const nsm_view =
       g_r.nsm_active ? g_r.static_sun_srv : g_r.white.srv;
@@ -12773,17 +12933,17 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     { // Bind every draw so packed-lightmap chromaticity cannot leak.
       // Three-entry bind: re-pairing only t8/t9 would reset the t10 static
       // sun-shadow map to the backend fallback.
-      nrhi::TextureView* t8_views[4] = {
+      nrhi::TextureView* t8_views[5] = {
           (v2_detail != nullptr ? v2_detail : &g_r.white)->srv,
           (v2_spec2 != nullptr ? v2_spec2 : &g_r.white)->srv, nsm_view,
           (chromaticity && chromaticity != &g_r.white
                ? chromaticity
                : item.packed_lightmap ? &g_r.chroma_neutral : &g_r.white)
-              ->srv};
+              ->srv, g_r.indoor_regions.valid ? g_r.indoor_regions.srv : g_r.white.srv};
       if (item.packed_lightmap && lightmap && (!chromaticity || chromaticity == &g_r.white)) {
         g_chroma_neutral_draws.fetch_add(1, std::memory_order_relaxed);
       }
-      cmd->SetTextures(8, t8_views, 4);
+      cmd->SetTextures(8, t8_views, 5);
     }
     // ROPA garments draw the play-clock shape blend (RopaDrawVb; the CSM
     // caster pass binds the same memoized blend).

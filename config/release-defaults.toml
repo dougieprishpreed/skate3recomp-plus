@@ -3,7 +3,7 @@ advanced_settings_overlay_enabled = false
 audio_device_sample_frames = 0
 audio_mute = false
 d3d12_adapter = -1
-d3d12_allow_variable_refresh_rate_and_tearing = true
+d3d12_allow_variable_refresh_rate_and_tearing = false
 d3d12_debug = false
 d3d12_present_frame_limiter = false
 d3d12_present_frame_limiter_fps = 60.0
@@ -121,7 +121,7 @@ skate3_native_render_scene_hdr = true
 skate3_native_render_scene_hdr_debug = 0
 skate3_native_render_scene_hdr_packed = true
 skate3_native_render_scene_indicator_xray = false
-skate3_native_render_scene_lightmap_smooth = true
+skate3_native_render_scene_lightmap_smooth = false
 skate3_native_render_scene_lightmaps = true
 skate3_native_render_scene_lm_dump = false
 skate3_native_render_scene_loading_native = true
@@ -259,6 +259,8 @@ skate3_skate2_material_depth_bias = true
 skate3_skate2_native_occlusion = false
 skate3_skate2_night = false
 skate3_skate2_night_brightness = 1.0
+skate3_skate2_night_open_area_light = 1.0
+skate3_skate2_night_sunlight = false
 skate3_skate2_ocean_glare = 0.25
 skate3_skate2_original_pedestrians = true
 skate3_skate2_original_proxy = true
@@ -322,3 +324,25 @@ skate3_native_vulkan_cached_mesh_decode = true
 skate3_native_vulkan_output_view_reuse = true
 skate3_native_vulkan_table_lookup_cache = true
 skate3_native_scene_item_reserve_growth = true
+
+# Performance comparison groups: restart after changing either setting.
+skate3_native_performance_skate3 = true
+skate3_native_performance_nsv = true
+# Independent pose-history comparison; character capture fixes stay enabled.
+skate3_native_render_scene_smooth_entities = true
+skate3_skate2_indoor_open_areas = true
+skate3_skate2_indoor_ceiling_shadows = true
+skate3_skate2_indoor_lighting = true
+skate3_skate2_local_indoor_lighting = true
+skate3_startup_mode = 0
+skate3_pedestrian_voice_volume = 1.0
+# One-time settings corrections already applied (managed by the game).
+skate3_settings_revision = 1
+# Look for a newer release at startup (Settings > System > Check for Updates).
+skate3_update_check = true
+# Map-load crash mitigation (upstream PR #131): hold teardown frees this long.
+skate3_instance_free_defer_ms = 1000
+
+# Optional eight-second actor/camera look-back; save with Ctrl+Insert.
+skate3_actor_history_capture = false
+skate3_actor_history_capture_key = 'Ctrl+Insert'

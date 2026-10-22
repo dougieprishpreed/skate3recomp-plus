@@ -17,6 +17,13 @@ bool ArmMenuSpawn(uint8_t* base, const std::string& label, const std::string& st
 // Before the retail location teleport: leaving New San Van must reload.
 void BeforeRetailTeleport(uint8_t* base, uint64_t world);
 bool IsSkate2Gameplay();
+// Native shadow lifetime: changes for EVERY configured map, including a
+// reload of the same district. Bit 0 identifies the loaded Skate 2 world
+// before the gameplay flag is enabled; upper bits are a monotonic serial.
+uint64_t RenderWorldIdentity();
+// Lighting lookup paired with that exact map identity: 0 none, 1 BAM,
+// 2 Community Center, 3 Fantasy Factory, 4 Oliver. Returns0 during handoff.
+uint32_t NativeIndoorLightingMap(uint64_t world_identity);
 // Rare debug capture: guarded read-only state/streaming snapshots, no guest calls.
 void LogFreezeSnapshot();
 bool OriginalPedestriansActive();

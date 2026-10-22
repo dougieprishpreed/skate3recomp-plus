@@ -318,6 +318,7 @@ inline bool g_shadow_frame_done = false;
 // outdoor state there; consumers that must not act on stale sun state key
 // off this freshness stamp (see FrameScene::shadow_fresh).
 inline uint64_t g_shadow_rows_frame = 0;
+inline uint64_t g_shadow_world_identity = 0;
 // Frame-global rows of the tree / proxyworld shader families (see
 // FrameScene::family_rows), captured from their PS banks when a draw with
 // the matching debug path runs. Guest render thread only.

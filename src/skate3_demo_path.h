@@ -20,5 +20,7 @@ void SetUiInputProvider(std::function<rex::input::InputSystem*()> provider);
 // host features that poll the merged UI pad state.
 rex::input::InputSystem* GetUiInputSystem();
 bool ShouldForceIntroMovieComplete();
+// End one-boot assistance at world handoff; never re-arms after pause/load.
+void UpdateStartup();
 
 }  // namespace skate3::demo_path

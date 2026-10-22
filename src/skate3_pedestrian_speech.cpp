@@ -18,6 +18,11 @@
 #include <unordered_set>
 #include <vector>
 
+REXCVAR_DEFINE_DOUBLE(skate3_pedestrian_voice_volume, 1.0, "Skate 3",
+                      "Pedestrian voice gain in every map (1 = original mix, 0 mute); "
+                      "preserves native distance attenuation and line tuning")
+    .range(0.0, 3.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_skate2_pedestrian_speech, true, "Skate 3",
     "Enable prepared original New San Van pedestrian voices; restart required");
 REXCVAR_DEFINE_BOOL(skate3_skate2_speech_log, false, "Skate 3",
@@ -1007,3 +1012,17 @@ extern "C" REX_FUNC(sub_82EBFB40) {
   __imp__sub_82EBFB40(ctx,base);
 }
 
+
+float skate3::pedestrian_speech::ScaleVoiceGain(uint8_t* base, uint32_t voice_instance,
+                                               uint32_t channel, float gain) {
+  if (channel >= 2) return gain;
+  // 82C5DC80 copies request+0x10 into (266+channel)*4 on every
+  // accepted start. 82C5CEF0 holds the original audio lock at this call.
+  const uint32_t bank = Read(base, voice_instance + 0x428 + channel * 4);
+  const bool pedestrian = bank == 1 || (bank == 4 &&
+      voice_instance == instance.load() && channel == kSpeechChannel);
+  if (!pedestrian) return gain;
+  const double volume = REXCVAR_GET(skate3_pedestrian_voice_volume);
+  if (!std::isfinite(volume)) return gain;
+  return gain * float(std::clamp(volume, 0.0, 3.0));
+}

@@ -4,6 +4,7 @@
 #include "skate3_perf_recorder.h"
 
 #include <rex/cvar.h>
+#include "native/skate3_native_performance.h"
 
 REXCVAR_DEFINE_BOOL(skate3_skate2_context_resource_search, true, "Skate 3",
                     "Use native descriptor search in New San Van material context creation");
@@ -11,7 +12,8 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_context_resource_search, true, "Skate 3",
 namespace skate3::world_loading {
 
 ContextResourceSearch TryFastContextResourceSearch(PPCContext& ctx, uint8_t* base) {
-  if (!IsSkate2Gameplay() || !REXCVAR_GET(skate3_skate2_context_resource_search)) {
+  if (!IsSkate2Gameplay() || !skate3::native_scene::PerformanceOptimizationsEnabled(true) ||
+      !REXCVAR_GET(skate3_skate2_context_resource_search)) {
     return ContextResourceSearch::kFallback;
   }
   // Work in locals, avoiding the aliasing between PPCContext stores and guest
