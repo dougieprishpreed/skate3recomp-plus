@@ -62,6 +62,7 @@ skate3_draw_distance_debug = false
 skate3_draw_distance_scale = 1.0
 skate3_draw_distance_stream_probe = 0.0
 skate3_field_of_view = 60.0
+skate3_frontend_movie_min_play_ms = 1500
 skate3_guest_fps_cap = 0.0
 skate3_guest_fps_cap_auto = true
 skate3_guest_present_margin_ms = 4.0

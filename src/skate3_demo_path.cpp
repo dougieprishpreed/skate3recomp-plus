@@ -54,6 +54,13 @@ REXCVAR_DEFINE_INT32(skate3_startup_mode, 0, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_intro_movie_skip, true, "Skate 3",
                     "Skip the frontend intro movie when A or Start is pressed "
                     "(the default keyboard bindings make that Space and Enter)");
+REXCVAR_DEFINE_INT32(skate3_frontend_movie_min_play_ms, 1500, "Skate 3",
+                     "A frontend movie (menus, not the boot logos) is only skipped or "
+                     "auto-completed after it has played this long; an earlier skip waits. "
+                     "Completing the new-career clip after the difficulty choice on its first "
+                     "frames left the next screen waiting forever")
+    .range(0, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::demo_path {
 namespace {
@@ -444,24 +451,50 @@ void UpdateStartup() {
 }
 
 bool ShouldForceIntroMovieComplete() {
+  // FEMoviePlayer::Update calls this every tick while a movie plays (guest
+  // thread only); a gap between calls means a new movie started.
+  const auto now = std::chrono::steady_clock::now();
+  static std::chrono::steady_clock::time_point s_last_poll{};
+  static std::chrono::steady_clock::time_point s_movie_start{};
+  static bool s_skip_pending = false;
+  if (now - s_last_poll > std::chrono::milliseconds(250)) {
+    s_movie_start = now;
+    s_skip_pending = false;
+  }
+  s_last_poll = now;
+  // Completing a frontend movie on its first frames left the next screen
+  // waiting forever: the new-career clip after the difficulty choice, then FE
+  // screen 10 never advanced (upstream skate3recomp#184; auto-start hit it on
+  // every new game). Frontend movies (presence context 0) complete only after
+  // skate3_frontend_movie_min_play_ms of play; an earlier skip waits. Boot
+  // logos play before the frontend context is set and stay instant.
+  const bool too_early =
+      rex::kernel::guest_presence::GameplayContextValue() == 0 &&
+      now - s_movie_start <
+          std::chrono::milliseconds(REXCVAR_GET(skate3_frontend_movie_min_play_ms));
+  bool complete = false;
   if (StartupAutomationEnabled()) {
     // This helper is called by FEMoviePlayer::Update only while the native
     // player is actually playing (state2). Arm here, not through an outer
     // BootFlow state callback that may not own the logo currently playing.
     // Use the same completion path as a fresh user A/Start press below.
-    static const auto first_movie_poll = std::chrono::steady_clock::now();
-    if (std::chrono::steady_clock::now() - first_movie_poll >=
-        std::chrono::milliseconds(100)) return true;
+    static const auto first_movie_poll = now;
+    complete = now - first_movie_poll >= std::chrono::milliseconds(100);
   }
-  if (AutomationEnabled() && g_skip_intro_movie.load(std::memory_order_relaxed)) {
+  if (!complete && AutomationEnabled() && g_skip_intro_movie.load(std::memory_order_relaxed)) {
     bool expected = false;
     if (g_logged_intro_movie_skip.compare_exchange_strong(expected, true,
                                                           std::memory_order_relaxed)) {
       REXLOG_INFO("Skate 3 demo path: forcing frontend intro movie complete");
     }
-    return true;
+    complete = true;
   }
-  return UserRequestedMovieSkip();
+  if (!complete) {
+    // Rising-edge press: keep it until the movie may complete.
+    complete = UserRequestedMovieSkip() || s_skip_pending;
+    s_skip_pending = complete && too_early;
+  }
+  return complete && !too_early;
 }
 
 }  // namespace skate3::demo_path

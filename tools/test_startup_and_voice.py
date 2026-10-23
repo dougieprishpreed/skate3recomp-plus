@@ -32,6 +32,7 @@ STARTUP_STUB = r'''
 #include <limits>
 #include <thread>
 int32_t skate3_startup_mode=0;
+int32_t skate3_frontend_movie_min_play_ms=200;
 bool demo=false,probe=false; uint32_t gameplay=0;uint64_t world=0;
 int cleared=0,queued=0;uint16_t tapping=0;
 int movie_calls=0,title_calls=0,language_calls=0,enter_calls=0;uint32_t transition=0;
@@ -104,6 +105,17 @@ int main(int argc,char** argv){
  skate3_startup_mode=assist?0:1; // preference frozen until next process
  PPCContext c;
  // Arm from actual native-playing polls, with NO BootFlow callback at all.
+ // Boot logos play before the frontend presence context (7 = boot).
+ gameplay=7;
+ assert(!ShouldForceIntroMovieComplete());
+ std::this_thread::sleep_for(std::chrono::milliseconds(120));
+ assert(ShouldForceIntroMovieComplete()==assist);
+ // A frontend movie (presence 0, new after a polling gap) completes only
+ // after the minimum play time (upstream skate3recomp#184).
+ gameplay=0;
+ std::this_thread::sleep_for(std::chrono::milliseconds(300));
+ assert(!ShouldForceIntroMovieComplete());
+ std::this_thread::sleep_for(std::chrono::milliseconds(120));
  assert(!ShouldForceIntroMovieComplete());
  std::this_thread::sleep_for(std::chrono::milliseconds(120));
  assert(ShouldForceIntroMovieComplete()==assist);
@@ -119,7 +131,7 @@ int main(int argc,char** argv){
  gameplay=1;assert(!StartupAutomationEnabled());gameplay=0;
  Skate3DemoPath_ShowPressStartModeHook(c,nullptr);assert(tapping==0);
  assert(!ShouldForceIntroMovieComplete()); // later movies/pause/load unaffected
- std::puts("PASS production startup: Default/Auto, legacy Skip migration, actual-playing movie polls,100ms completion,750ms title delay, no later rearm");
+ std::puts("PASS production startup: Default/Auto, legacy Skip migration, actual-playing movie polls,100ms completion,frontend movie minimum,750ms title delay, no later rearm");
 }
 '''
         for mode in range(3):
