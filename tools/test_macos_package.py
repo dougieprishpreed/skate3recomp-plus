@@ -1,5 +1,5 @@
 """Check package diagnostics and native signing with synthetic code, never the game."""
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -23,6 +23,62 @@ class CommandDiagnostics(unittest.TestCase):
         self.assertEqual(error.exception.returncode, 7)
         self.assertIn('tool-stdout', diagnostics.getvalue())
         self.assertIn('tool-stderr', diagnostics.getvalue())
+
+
+def can_link():
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            (Path(tmp) / 'link').symlink_to('target')
+            return True
+        except OSError:
+            return False
+
+
+@unittest.skipUnless(can_link(), 'Creating symbolic links needs Developer Mode on Windows')
+class ReleaseLinks(unittest.TestCase):
+    def test_release_folder_keeps_runnable_interpreter_without_links(self):
+        with tempfile.TemporaryDirectory(prefix="NSV links user's ") as tmp:
+            output = Path(tmp) / 'package'
+            python = output / 'installer/python'
+            for folder in ('bin', 'lib', 'share/terminfo/a', 'share/terminfo/x'):
+                (python / folder).mkdir(parents=True)
+            interpreter = b'\x7fELF' + b'\0' * package.LINK_COPY_LIMIT
+            (python / 'bin/python3.13').write_bytes(interpreter)
+            (python / 'bin/python3.13').chmod(0o755)
+            (python / 'bin/idle3.13').write_text('#!/bin/sh\n')
+            (python / 'lib/libpython3.13.so.1.0').write_bytes(b'\0' * (package.LINK_COPY_LIMIT + 1))
+            (python / 'share/terminfo/x/xterm').write_bytes(b'terminfo')
+            for link, target in (('bin/python3', 'python3.13'), ('bin/python', 'python3.13'),
+                                 ('bin/idle3', 'idle3.13'), ('lib/libpython3.13.so', 'libpython3.13.so.1.0'),
+                                 ('share/terminfo/a/ansi', '../x/xterm')):
+                (python / link).symlink_to(target)
+            with redirect_stdout(io.StringIO()):
+                package.remove_links(output, python / 'bin/python3')
+            self.assertFalse([p for p in output.rglob('*') if p.is_symlink()])
+            # The interpreter the installer runs is the real, executable binary, stored once.
+            self.assertEqual((python / 'bin/python3').read_bytes(), interpreter)
+            if os.name != 'nt':
+                self.assertTrue((python / 'bin/python3').stat().st_mode & 0o111)
+            self.assertFalse((python / 'bin/python3.13').exists())
+            self.assertFalse((python / 'bin/python').exists())
+            self.assertFalse((python / 'lib/libpython3.13.so').exists())
+            self.assertTrue((python / 'lib/libpython3.13.so.1.0').is_file())
+            self.assertEqual((python / 'bin/idle3').read_text(), '#!/bin/sh\n')
+            self.assertEqual((python / 'share/terminfo/a/ansi').read_bytes(), b'terminfo')
+
+    def test_links_outside_the_package_or_to_folders_are_refused(self):
+        with tempfile.TemporaryDirectory(prefix="NSV links user's ") as tmp:
+            root = Path(tmp)
+            output = root / 'package'
+            (output / 'folder').mkdir(parents=True)
+            (root / 'outside.txt').write_text('outside')
+            (output / 'outside').symlink_to(root / 'outside.txt')
+            with self.assertRaisesRegex(ValueError, 'outside the package'):
+                package.remove_links(output, output / 'python3')
+            (output / 'outside').unlink()
+            (output / 'linked-folder').symlink_to('folder', target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'links a directory'):
+                package.remove_links(output, output / 'python3')
 
 
 class MacManifest(unittest.TestCase):

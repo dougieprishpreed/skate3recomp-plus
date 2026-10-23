@@ -20,6 +20,9 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from platform_settings import settings_for
 from test_media_runtime import verify_media
 
+# A release link to a file up to this size is replaced by a copy (terminfo, man, scripts).
+LINK_COPY_LIMIT = 1 << 20
+
 
 def run(*args, **kwargs):
     try:
@@ -161,27 +164,61 @@ def mac_sign_app(app, info):
     run('codesign', '--verify', '--deep', '--strict', app)
 
 
+def remove_links(output, interpreter):
+    """Leave no symbolic links in a release folder.
+
+    Extractors that do not restore ZIP links (Windows tools, exFAT/NTFS drives, some
+    file managers) write each link as a small text file holding its target. Running
+    that file fails with "Exec format error" (v0.2c on a Steam Deck: the installer's
+    python3, a link to python3.13).
+    """
+    links = sorted(p for p in output.rglob('*') if p.is_symlink())
+    for link in links:
+        target = link.resolve()
+        if not target.is_relative_to(output.resolve()):
+            raise ValueError('Release link points outside the package: ' + str(link))
+        if target.is_dir():
+            raise ValueError('Release folder links a directory: ' + str(link))
+    # The interpreter the installer runs takes its target's place, so the binary is
+    # stored once (bin/python3 -> python3.13 becomes the real bin/python3).
+    if interpreter.is_symlink():
+        real = interpreter.resolve()
+        interpreter.unlink()
+        real.rename(interpreter)
+    copied, dropped = 0, []
+    for link in links:
+        if not link.is_symlink():
+            continue
+        target = link.resolve()
+        link.unlink()
+        if target.is_file() and target.stat().st_size <= LINK_COPY_LIMIT:
+            shutil.copy2(target, link)
+            copied += 1
+        else:
+            # Aliases of large binaries the installer never runs (bin/python,
+            # the libpython development link) would double the download.
+            dropped.append(link.relative_to(output).as_posix())
+    print(f'Release links: {copied} replaced by copies, dropped {dropped}', flush=True)
+
+
 def archive_package(output, platform):
     archive = output.with_suffix('.zip')
     if archive.exists():
         raise FileExistsError(archive)
+    if any(p.is_symlink() for p in output.rglob('*')):
+        raise ValueError('Release folders must not contain links (see remove_links)')
     if platform == 'macos-arm64':
-        # Preserve app-bundle metadata, executable modes and interpreter links.
+        # Preserve app-bundle metadata and executable modes.
         run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', output, archive)
     else:
         with zipfile.ZipFile(archive, 'x', zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
             for p in [output, *sorted(output.rglob('*'))]:
-                name = p.relative_to(output.parent).as_posix()
-                if p.is_symlink():
-                    info = zipfile.ZipInfo(name)
-                    info.create_system = 3
-                    info.external_attr = p.lstat().st_mode << 16
-                    z.writestr(info, os.fsencode(p.readlink()), compress_type=zipfile.ZIP_DEFLATED)
-                else:
-                    z.write(p, name)
+                z.write(p, p.relative_to(output.parent).as_posix())
     with zipfile.ZipFile(archive) as z:
         if z.testzip() is not None:
             raise ValueError('Package ZIP CRC verification failed')
+        if any(stat.S_ISLNK(i.external_attr >> 16) for i in z.infolist()):
+            raise ValueError('Package ZIP contains a link entry')
     # Test the download after a normal native extraction to a new location.
     # Never run the game; execute only its installer interpreter/media tools.
     check_root = ROOT / 'out/package-check' / output.name
@@ -193,11 +230,7 @@ def archive_package(output, platform):
     restored = check_root / output.name
     for p in output.rglob('*'):
         q = restored / p.relative_to(output)
-        if p.is_symlink():
-            if (not q.is_symlink() or not q.exists() or q.readlink() != p.readlink()
-                    or not q.resolve().is_relative_to(restored)):
-                raise ValueError('Package ZIP did not preserve a relocatable link: ' + str(p))
-        elif p.is_file():
+        if p.is_file():
             expected = stat.S_IMODE(p.stat().st_mode) & 0o111
             if not q.is_file() or stat.S_IMODE(q.stat().st_mode) & 0o111 != expected:
                 raise ValueError('Package ZIP did not preserve executable modes: ' + str(p))
@@ -212,7 +245,7 @@ def archive_package(output, platform):
             raise ValueError('Extracted Linux runtime is not self-contained:\n' + dependencies)
         resources = restored
     verify_installer(resources, platform)
-    print('ZIP CRC, extracted links/modes and relocated installer checks passed.', flush=True)
+    print('ZIP CRC, no links, extracted modes and relocated installer checks passed.', flush=True)
     return archive
 
 
@@ -253,6 +286,7 @@ def package(build, output, platform):
         launcher.write_bytes((ROOT / 'packaging/steam-skate3.sh').read_bytes().replace(b'\r\n', b'\n'))
         launcher.chmod(0o755)
     notices(resources / 'licenses')
+    remove_links(output, resources / 'installer/python/bin/python3')
     if platform == 'macos-arm64':
         for name in ('libvulkan.1.dylib', 'libMoltenVK.dylib', 'MoltenVK_icd.json'):
             if not (build / name).is_file():
