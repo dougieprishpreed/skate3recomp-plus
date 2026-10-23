@@ -20,4 +20,7 @@ class GameplayUpdate {
 void Poll(bool native_recent, bool menu_paused);
 void Request();
 void Shutdown();
+// Window paint stalls on any screen (skate3_paint_stall_capture): its own
+// 10 Hz watcher thread, idle while the switch is off. Started from OnPostSetup.
+void StartPaintStallWatch();
 }  // namespace skate3::freeze_capture

@@ -673,7 +673,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cas_yield, false, "Skate 3",
                     "detected via FE push-state id 15 + the _nis shader heartbeat).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
-    skate3_native_render_scene_menu_rtt_passes, true, "Skate 3",
+    skate3_native_render_scene_menu_rtt_passes, false, "Skate 3",
+    "Menu skater portraits (off by default since v0.2b: with it on, Edit "
+    "Skater froze on its loading screen and then closed the game for a "
+    "skater whose portrait had to be generated; with it off the portrait "
+    "boxes stay empty). "
     "While a menu/pause/loading context (presence context 0) renders "
     "natively, drop native_render_suppress_mode to 0 (suppress "
     "framebuffer-sized passes ONLY) so the game's sub-framebuffer "
@@ -705,6 +709,21 @@ REXCVAR_DEFINE_INT32(
     "gameplay-proven mode-2 suppression (lightmap pages + <= 512 "
     "composites still execute).")
     .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_native_render_scene_portrait_suppress_mode, 3, "Skate 3",
+    "native_render_suppress_mode used inside the menu portrait window (see "
+    "menu_rtt_passes / menu_rtt_scope): 3 = portrait-class RTTs execute, the "
+    "1152-wide scene + postfx band stays suppressed; 0 = everything but "
+    "framebuffer-sized passes executes; 2 = the gameplay suppression. Read "
+    "when the window opens.")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(
+    skate3_native_render_scene_menu_sync_shaders, true, "Skate 3",
+    "Inside the menu portrait window, compile shaders synchronously so one-shot "
+    "skater portraits can't skip still-compiling pieces. Off = keep the "
+    "configured async_shader_compilation.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(
     skate3_native_render_scene_menu_unsuppress, false, "Skate 3",
@@ -974,6 +993,14 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cac_cloth_dirt, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_cac_stamp_overlay, true, "Skate 3",
                     "CAC skin second stamp overlay (cacstamp_skin i_decal2 x i_params.z; "
                     "shows bruises and scrapes after a Hall of Meat bone break).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_ropa_exact_sim_flag, true, "Skate 3",
+                    "ROPA garments (the skater's shirt): only an exact 1.0 in the cloth "
+                    "flag row means the cloth sim is off. While the sim runs that register "
+                    "holds a rotation row, positive for about half the facing directions, "
+                    "and those frames took the sim-off path and were refused (the shirt "
+                    "vanished or trailed on last frame's drape). Off = any positive value "
+                    "means sim off (the pre-v0.2b test). Upstream skate3recomp#166.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene_world_items, true, "Skate 3",
                     "Publish world sort-list items (static geometry)")
@@ -5324,7 +5351,17 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
           LoadGuestF32(base, bank + ((m + 2) * 4 + 2) * 4),
           LoadGuestF32(base, bank + ((m + 2) * 4 + 3) * 4));
     }
-    if (flag_x > 0.0f) {
+    // Sim-inactive is signalled by an EXACT 1.0 in the flag row's x. While
+    // the sim is ACTIVE this register holds a rotation row of the garment's
+    // rigid world, whose x is positive for about half the facing directions;
+    // a plain `> 0` test sent those frames down this branch, which refused
+    // them (the torso garment vanished or fell back to last frame's drape).
+    // They now take the rigid branch below, with its own structural tail-row
+    // proof, score and entity-world fallback (upstream skate3recomp#166).
+    const bool sim_inactive = REXCVAR_GET(skate3_native_render_scene_ropa_exact_sim_flag)
+                                  ? std::fabs(flag_x - 1.0f) <= 1e-6f
+                                  : flag_x > 0.0f;
+    if (sim_inactive) {
       // Sim inactive: the palette sits one register late (c5/c8). The LAYOUT
       // is exact, but the BANK can still be foreign, the same stale-bank
       // hazard the rigid branch below scores against (the flag itself was
@@ -5339,8 +5376,8 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
       // ropa state rescue). The game writes exactly 1.0 into the flag row's
       // x for sim-inactive (observed on every live capture, incl. the
       // (1,junk,junk,junk) NPC variant); a bit-exact 1.0 is the structural
-      // proof that unlocks the relaxed near-camera acceptance; any other
-      // positive x (a bone row of some other layout) keeps the strict gate.
+      // proof that unlocks the relaxed near-camera acceptance. With the
+      // exact-flag test off, any other positive x keeps the strict gate.
       palette_base = RefinePaletteBase(base, bank, main_pass ? 8u : 5u, item,
                                        /*structural_guess=*/flag_x == 1.0f);
       if (palette_base == 0) {

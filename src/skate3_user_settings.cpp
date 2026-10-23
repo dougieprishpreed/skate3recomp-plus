@@ -14,7 +14,8 @@
 
 REXCVAR_DEFINE_INT32(skate3_settings_revision, 0, "Skate 3",
                      "One-time settings corrections already applied to this settings.toml "
-                     "(managed by the game; 1 = v0.2a present-mode reset)")
+                     "(managed by the game; 1 = v0.2a present-mode reset, 2 = v0.2b menu "
+                     "skater portraits off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace skate3 {
@@ -100,12 +101,9 @@ void EnsureDiagnosticSettings(const std::filesystem::path& path) {
 }
 
 void ApplySettingsRevisions(const std::filesystem::path& path) {
-  // 1 (v0.2a): before v0.2a the settings menu's VRR / Tearing row read the
-  // D3D12 flag (shipped on) while Vulkan ran, and applying any Display setting
-  // then allowed Vulkan immediate / FIFO-relaxed presentation. Reset the
-  // present modes once to the shipped no-tearing setup (mailbox); a choice
-  // made afterwards is kept.
-  if (REXCVAR_GET(skate3_settings_revision) >= 1) {
+  constexpr int32_t kCurrentRevision = 2;
+  const int32_t revision = REXCVAR_GET(skate3_settings_revision);
+  if (revision >= kCurrentRevision) {
     return;
   }
   std::vector<std::string_view> names;
@@ -115,11 +113,23 @@ void ApplySettingsRevisions(const std::filesystem::path& path) {
       names.push_back(name);
     }
   };
-  set("vulkan_allow_present_mode_immediate", "false");
-  set("vulkan_allow_present_mode_fifo_relaxed", "false");
-  set("vulkan_allow_present_mode_mailbox", "true");
-  set("d3d12_allow_variable_refresh_rate_and_tearing", "false");
-  REXCVAR_SET(skate3_settings_revision, 1);
+  // 1 (v0.2a): before v0.2a the settings menu's VRR / Tearing row read the
+  // D3D12 flag (shipped on) while Vulkan ran, and applying any Display setting
+  // then allowed Vulkan immediate / FIFO-relaxed presentation. Reset the
+  // present modes once to the shipped no-tearing setup (mailbox); a choice
+  // made afterwards is kept.
+  if (revision < 1) {
+    set("vulkan_allow_present_mode_immediate", "false");
+    set("vulkan_allow_present_mode_fifo_relaxed", "false");
+    set("vulkan_allow_present_mode_mailbox", "true");
+    set("d3d12_allow_variable_refresh_rate_and_tearing", "false");
+  }
+  // 2 (v0.2b): menu skater portraits off (see
+  // skate3_native_render_scene_menu_rtt_passes): Edit Skater froze, then
+  // closed, for a skater whose portrait had to be generated. Earlier
+  // releases saved the setting on; a choice made afterwards is kept.
+  set("skate3_native_render_scene_menu_rtt_passes", "false");
+  REXCVAR_SET(skate3_settings_revision, kCurrentRevision);
   names.push_back("skate3_settings_revision");
   rex::cvar::SaveConfigValues(path, names);
 }

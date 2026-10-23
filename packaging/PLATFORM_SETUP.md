@@ -4,13 +4,19 @@ Linux x64 targets Ubuntu 24.04 or newer (glibc 2.39), with a working Vulkan driv
 Install the desktop runtime dependencies before starting:
 
 ```sh
-sudo apt install libgtk-3-0t64 libx11-xcb1 libvulkan1 libasound2t64 libpulse0 libpipewire-0.3-0
+sudo apt install libgtk-3-0t64 libx11-xcb1 libvulkan1 libasound2t64 libpulse0 libpipewire-0.3-0 libudev1 libusb-1.0-0
 ```
 
 Extract the ZIP with a tool that preserves Unix permissions and symbolic links
 (for example, `unzip`), then run `./skate3`.
 The default writable data location is `$XDG_DATA_HOME/skate3` or
 `~/.local/share/skate3`. Explicit user data overrides are respected.
+
+Steam and Steam Deck: run `./skate3` once in Desktop Mode and complete setup.
+Then choose Add a Non-Steam Game in Steam and add `steam-skate3.sh` from the same
+folder, and launch the game from Steam in either mode. The launcher uses the
+system libraries instead of Steam's runtime, blocks idle sleep while the game
+runs, and closes a copy of the game that was left running before it starts.
 
 macOS targets Apple Silicon. Extract the ZIP with Archive Utility and open
 `Skate 3 Recompiled+.app`.

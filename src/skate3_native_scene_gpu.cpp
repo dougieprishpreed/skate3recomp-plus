@@ -76,6 +76,11 @@
 
 // Cvars defined in skate3_native_scene.cpp (and SDK cvars re-declared there).
 // Generic Vulkan controls; legacy Skate2 switches remain NSV overrides.
+REXCVAR_DEFINE_BOOL(skate3_native_render_scene_uv_float3, true, "Skate 3",
+                    "Decode three-float texcoords (k_32_32_32_FLOAT, xy) instead of leaving "
+                    "them at (0,0), which drew the surface as one flat colour. Applies to "
+                    "meshes decoded after the change. Upstream skate3recomp#130")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_vulkan_cached_mesh_decode, true, "Skate 3",
                     "Decode Vulkan meshes in cached CPU memory before write-only upload copies")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -180,6 +185,8 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_lm_dump);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_loading_native);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_macro);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_rtt_passes);
+REXCVAR_DECLARE(int32_t, skate3_native_render_scene_portrait_suppress_mode);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_sync_shaders);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_menu_unsuppress);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_mesh_revalidate);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_pause_native);
@@ -1279,6 +1286,7 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
     (void)announced;
   }
   dst = cached_output ? cpu_vertices : upload_vb;
+  const bool uv_float3 = REXCVAR_GET(skate3_native_render_scene_uv_float3);
   for (uint32_t v = 0; v < num_verts; ++v) {
     const uint8_t* p = src_vb + size_t(v) * item.stride + item.pos_offset;
     float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -1328,6 +1336,14 @@ bool DecodeMesh(nrhi::Device* device, uint8_t* base, const DrawItem& item,
           u = HalfToFloat(SwapU16(*reinterpret_cast<const uint16_t*>(q)));
           w = HalfToFloat(SwapU16(*reinterpret_cast<const uint16_t*>(q + 2)));
           break;
+        case 57:  // k_32_32_32_FLOAT (use xy). Custom maps (ArenaBuilder
+                  // worlds) declare texcoords this way; without the case the
+                  // UV stayed (0,0) and the surface rendered as one flat
+                  // colour (upstream skate3recomp#130).
+          if (!uv_float3) {
+            break;
+          }
+          [[fallthrough]];
         case 37:  // k_32_32_FLOAT (hair strand-alpha UV; xenos enum 37)
         case 38:  // k_32_32_32_32_FLOAT (use xy)
           u = std::bit_cast<float>(SwapU32(*reinterpret_cast<const uint32_t*>(q)));
@@ -6278,6 +6294,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
   {
     static bool s_mode_forced = false;
     static int32_t s_mode_saved = 0;
+    static int32_t s_mode_applied = 3;
     // menu_rtt_scope 1: only hold mode 0 inside the portrait window
     // (screen-transition grace / not-known-steady screens / CAS); outside
     // it, menus keep the gameplay-proven mode-2 suppression instead of
@@ -6289,23 +6306,23 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
          PortraitRttWindowActive());
     if (want && !s_mode_forced) {
       s_mode_saved = REXCVAR_GET(native_render_suppress_mode);
-      // Mode 3, not 0: the portrait-class RTTs (census 560-1200 during the
-      // window) execute, but the 1152-wide main scene + postfx band stays
-      // suppressed; mode 0 ran the game's whole pipeline at scaled
+      // Mode 3 by default, not 0: the portrait-class RTTs (census 560-1200
+      // during the window) execute, but the 1152-wide main scene + postfx
+      // band stays suppressed; mode 0 ran the game's whole pipeline at scaled
       // resolution for the window's duration, dropping the pause menu to
       // ~60 fps whenever a screen push (or its 3 s transition grace)
       // opened the window.
-      if (s_mode_saved != 3) {
-        REXCVAR_SET(native_render_suppress_mode, 3);
+      s_mode_applied = REXCVAR_GET(skate3_native_render_scene_portrait_suppress_mode);
+      if (s_mode_saved != s_mode_applied) {
+        REXCVAR_SET(native_render_suppress_mode, s_mode_applied);
         REXLOG_INFO(
-            "native-scene: portrait window - suppress mode {} -> 3 (portrait "
-            "RTT passes execute, scene/postfx band stays suppressed; "
-            "restored when the window closes)",
-            s_mode_saved);
+            "native-scene: portrait window - suppress mode {} -> {} (portrait "
+            "RTT passes execute; restored when the window closes)",
+            s_mode_saved, s_mode_applied);
       }
       s_mode_forced = true;
     } else if (!want && s_mode_forced) {
-      if (s_mode_saved != 3) {
+      if (s_mode_saved != s_mode_applied) {
         REXCVAR_SET(native_render_suppress_mode, s_mode_saved);
         REXLOG_INFO(
             "native-scene: portrait window closed - suppress mode {} restored",
@@ -6324,7 +6341,8 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
     // compile stalls invisibly.
     static bool s_async_forced = false;
     static bool s_async_saved = false;
-    if (want && !s_async_forced) {
+    const bool want_sync = want && REXCVAR_GET(skate3_native_render_scene_menu_sync_shaders);
+    if (want_sync && !s_async_forced) {
       s_async_saved = REXCVAR_GET(async_shader_compilation);
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, false);
@@ -6333,7 +6351,7 @@ bool YieldForMenus(const NativeGuestOutputRenderContext& context) {
             "(one-shot portrait renders can't skip still-compiling pieces)");
       }
       s_async_forced = true;
-    } else if (!want && s_async_forced) {
+    } else if (!want_sync && s_async_forced) {
       if (s_async_saved) {
         REXCVAR_SET(async_shader_compilation, true);
       }

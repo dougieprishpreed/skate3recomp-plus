@@ -22,13 +22,24 @@
 #include <string>
 #include <vector>
 
+#include <mutex>
+#include <thread>
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/ui/presenter.h>
 
 REXCVAR_DEFINE_BOOL(skate3_sim_freeze_capture, false, "Skate 3",
     "New San Van freeze diagnostics: capture thread stacks after ten seconds "
     "without a completed gameplay update, or on Delete. Writes small logs/nsv_freeze_* "
     "text files; leaves guest execution and spawning unchanged. Windows only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(skate3_paint_stall_capture, false, "Skate 3",
+    "Window paint stall diagnostics, on any screen (menus included): when the window has "
+    "not painted a requested frame for one second, capture all thread stacks three times, "
+    "500 ms apart, to logs/paint_stall_* text files (at most four per session). Needs "
+    "presenter_paint_request_reissue_ms > 0. Windows only.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::freeze_capture {
@@ -75,10 +86,11 @@ std::string ThreadName(HANDLE thread) {
 
 class Capture {
  public:
-  Capture(unsigned number, const char* reason, int64_t now) {
+  Capture(unsigned number, const char* reason, int64_t now,
+          const char* prefix = "nsv_freeze_") {
     std::error_code error;
     std::filesystem::create_directories("logs", error);
-    path_ = "logs/nsv_freeze_" + std::to_string(std::time(nullptr)) + "_" +
+    path_ = std::string("logs/") + prefix + std::to_string(std::time(nullptr)) + "_" +
             std::to_string(number) + ".txt";
     file_.open(path_);
     if (!file_) {
@@ -231,6 +243,40 @@ void Request() {
   }
 }
 void Shutdown() { shutting_down.store(true); }
+
+void StartPaintStallWatch() {
+#if defined(_WIN32)
+  static std::once_flag once;
+  std::call_once(once, [] {
+    std::thread([] {
+      SetThreadDescription(GetCurrentThread(), L"Paint stall watch");
+      std::unique_ptr<Capture> capture;
+      unsigned captures = 0;
+      bool latched = false;
+      while (!shutting_down.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const int64_t now = NowUs();
+        if (capture) {
+          if (capture->Poll(now)) capture.reset();
+          continue;
+        }
+        const uint64_t stall_ms = REXCVAR_GET(skate3_paint_stall_capture)
+                                      ? rex::ui::Presenter::UIPaintStallMs() : 0;
+        if (stall_ms < 1000) {
+          latched = false;
+          continue;
+        }
+        if (latched || captures >= 4) continue;
+        latched = true;
+        REXLOG_WARN("paint-stall: the window has not painted for {} ms; capturing thread stacks",
+                    stall_ms);
+        capture = std::make_unique<Capture>(++captures, "window-paint-stalled", now,
+                                            "paint_stall_");
+      }
+    }).detach();
+  });
+#endif
+}
 
 void Poll(bool native_recent, bool menu_paused) {
 #if defined(_WIN32)

@@ -883,6 +883,7 @@ void Skate3BaseApp::OnPostSetup() {
   if (window()) {
     skate3::freecam_input::Register(window());
   }
+  skate3::freeze_capture::StartPaintStallWatch();
 
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
     input_system->SetActiveCallback([this]() {

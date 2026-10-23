@@ -64,7 +64,8 @@ jobs:
           echo 'deb [signed-by=/usr/share/keyrings/llvm-20.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-20 main' | sudo tee /etc/apt/sources.list.d/llvm-20.list
           sudo apt-get update
           sudo apt-get install -y clang-20 lld-20 cmake ninja-build build-essential pkg-config unzip \
-            libgtk-3-dev libx11-xcb-dev libvulkan-dev libasound2-dev libpulse-dev libpipewire-0.3-dev
+            libgtk-3-dev libx11-xcb-dev libvulkan-dev libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libudev-dev libusb-1.0-0-dev
           echo 'CC=clang-20' >> "$GITHUB_ENV"
           echo 'CXX=clang++-20' >> "$GITHUB_ENV"
       - name: Install macOS LLVM and Vulkan/MoltenVK

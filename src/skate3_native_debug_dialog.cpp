@@ -46,6 +46,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_quadlists);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_items);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_dynamic_items);
+REXCVAR_DECLARE(bool, skate3_native_render_scene_ropa_exact_sim_flag);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_fade);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_identity);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_lw_gap_fill);
@@ -911,6 +912,13 @@ void DrawSceneContentSection() {
                            REXCVAR_GET(skate3_native_render_scene_dynamic_items),
                            "Characters, movable props, cloth (RenderMesh/world-path "
                            "captures)"));
+  REXCVAR_SET(skate3_native_render_scene_ropa_exact_sim_flag,
+              CvarCheckbox("Shirt cloth: exact sim-off flag",
+                           REXCVAR_GET(skate3_native_render_scene_ropa_exact_sim_flag),
+                           "Only an exact 1.0 in the shirt's cloth flag means the cloth "
+                           "sim is off. Off = any positive value does (the old test, which "
+                           "dropped or lagged the shirt for about half the facing "
+                           "directions while the sim ran)"));
   REXCVAR_SET(
       skate3_native_render_scene_lw_fade,
       CvarCheckbox("LW entity fade (store)",

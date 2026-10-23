@@ -22,6 +22,7 @@
 #include <mutex>
 
 #include <rex/exception_handler.h>
+#include <rex/memory/utils.h>
 #endif
 
 namespace skate3::native_scene {
@@ -215,7 +216,11 @@ bool GuestReadFaultHandler(rex::arch::Exception* ex, void* /*data*/) {
     tl_read_recovery_streak = 0;
   }
   tl_read_recovery_last_ns = now_ns;
-  if (mprotect(reinterpret_cast<void*>(page), g_host_page_size, PROT_READ) != 0) {
+  // Through the runtime so its protection record stays exact (the MMIO
+  // handler consults it on every guest-memory fault). Async-signal-safe: an
+  // mprotect plus atomic stores into the record (upstream skate3recomp#191).
+  if (!rex::memory::Protect(reinterpret_cast<void*>(page), g_host_page_size,
+                            rex::memory::PageAccess::kReadOnly, nullptr)) {
     return false;
   }
   g_read_recoveries.fetch_add(1, std::memory_order_relaxed);

@@ -247,6 +247,11 @@ def package(build, output, platform):
     (resources / 'settings.toml').write_bytes(settings_for('Darwin' if platform == 'macos-arm64' else 'Linux'))
     shutil.copy2(ROOT / 'packaging/README.txt', output / 'README.txt')
     shutil.copy2(ROOT / 'packaging/PLATFORM_SETUP.md', output / 'PLATFORM_SETUP.md')
+    if platform != 'macos-arm64':
+        # Steam / Steam Deck launcher (mchughalex/skate3recomp#191).
+        launcher = output / 'steam-skate3.sh'
+        launcher.write_bytes((ROOT / 'packaging/steam-skate3.sh').read_bytes().replace(b'\r\n', b'\n'))
+        launcher.chmod(0o755)
     notices(resources / 'licenses')
     if platform == 'macos-arm64':
         for name in ('libvulkan.1.dylib', 'libMoltenVK.dylib', 'MoltenVK_icd.json'):

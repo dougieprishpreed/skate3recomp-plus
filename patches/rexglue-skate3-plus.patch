@@ -1,3 +1,45 @@
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index 67064f8..009f0ee 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -11,11 +11,13 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <mutex>
+ #include <queue>
+ #include <stack>
++#include <thread>
+ 
+ #include <rex/audio/audio_driver.h>
+ #include <rex/thread.h>
+@@ -46,6 +48,23 @@ class SDLAudioDriver : public AudioDriver {
+   // number of credits actually released to the guest.
+   uint64_t ReleasePacedCredits(uint32_t new_credits);
+ 
++  // Steady credit release (cvar audio_steady_credit_release). Frames the
++  // device consumed are owed back to the guest as credits; instead of handing
++  // them over in one burst per device callback, a pacer thread releases one
++  // per guest frame period (256 samples = 5.33 ms), the cadence of the real
++  // hardware's audio interrupt.
++  void SteadyPacerThreadMain();
++  void StartSteadyPacer();
++  void StopSteadyPacer();
++  uint64_t TakeSteadyCredits(uint64_t max_credits);
++
++  std::atomic<uint64_t> steady_pending_{0};
++  std::atomic<uint32_t> stats_steady_emergency_{0};
++  std::thread steady_thread_;
++  std::mutex steady_mutex_;
++  std::condition_variable steady_cv_;
++  bool steady_running_ = false;
++
+   rex::thread::Semaphore* semaphore_ = nullptr;
+ 
+   SDL_AudioStream* sdl_stream_ = nullptr;
 diff --git a/include/rex/graphics/native_rhi.h b/include/rex/graphics/native_rhi.h
 index d2bdcd4..4d1b9ae 100644
 --- a/include/rex/graphics/native_rhi.h
@@ -108,6 +150,71 @@ index d4c99fd..7d36bc4 100644
                                 uint32_t height, nrhi::Texture** guest_output_out);
  
  // Vulkan-only frame epilogue: ends any render pass still open in the frame
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index 5e4571d..acf486f 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -82,6 +82,16 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+   void OnControllerDeviceAxisMotionLocked(const SDL_Event& event);
+   void OnControllerDeviceButtonChangedLocked(const SDL_Event& event);
+ 
++  // Adopt every gamepad SDL already knows about, so controllers present before
++  // the gamepad subsystem came up are registered even if SDL never emitted
++  // SDL_EVENT_GAMEPAD_ADDED for them.
++  void AdoptPresentControllers();
++  // Throttled AdoptPresentControllers for the periodic update path.
++  void MaybeAdoptPresentControllers();
++  // Log how many gamepads and joysticks SDL can actually see, so a silent
++  // "no controller" report has a diagnostic in the log.
++  void LogDeviceInventory() const;
++
+   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
+   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
+   ControllerState* GetControllerState(uint32_t user_index);
+@@ -99,6 +109,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+   std::mutex event_queue_mutex_;
+   std::vector<SDL_Event> pending_events_;
+   std::array<KeystrokeState, HID_SDL_USER_COUNT> keystroke_states_;
++  // Host uptime (ms) of the last periodic controller re-adoption sweep.
++  uint64_t last_adopt_ms_ = 0;
+ };
+ 
+ }  // namespace rex::input::sdl
+diff --git a/include/rex/kernel/guest_presence.h b/include/rex/kernel/guest_presence.h
+index ebe104c..5925c5c 100644
+--- a/include/rex/kernel/guest_presence.h
++++ b/include/rex/kernel/guest_presence.h
+@@ -13,7 +13,9 @@ namespace rex::kernel::guest_presence {
+ void NotifyContext(uint32_t user_index, uint32_t context_id, uint32_t value);
+ 
+ // Live value of the Skate 3 presence context 0x8001 (1 = in gameplay,
+-// 0 = frontend / pause menu / loading).
++// 0 = frontend / pause menu / loading, 7 = boot, set once by the title at
++// startup). 0xFFFFFFFF until the title sets it, which compares like the boot
++// value (neither 0 nor 1).
+ uint32_t GameplayContextValue();
+ 
+ }  // namespace rex::kernel::guest_presence
+diff --git a/include/rex/memory/utils.h b/include/rex/memory/utils.h
+index 1c9fc65..87c1a1c 100644
+--- a/include/rex/memory/utils.h
++++ b/include/rex/memory/utils.h
+@@ -101,6 +101,15 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+ bool Protect(void* base_address, size_t length, PageAccess access,
+              PageAccess* out_old_access = nullptr);
+ 
++// Linux: keep an in-process record of the host page protection of
++// [base, base + length), seeded once from /proc/self/maps and updated by every
++// Protect/AllocFixed/DeallocFixed/MapFileView/UnmapFileView call in that range,
++// so QueryProtect answers from memory instead of re-parsing /proc/self/maps.
++// Intended for the guest mapping (the MMIO/watch fault path queries it on
++// every guest-memory fault). A new registration replaces the previous one.
++// No-op on other platforms.
++void RegisterProtectionShadow(void* base, size_t length);
++
+ // Queries a region of pages to get the access rights. This will modify the
+ // length parameter to the length of pages with the same consecutive access
+ // rights. The length will start from the first byte of the first page of
 diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
 index 529c421..63f5367 100644
 --- a/include/rex/ui/d3d12/d3d12_presenter.h
@@ -204,10 +311,10 @@ index e4d1c0c..fc311ef 100644
    bool rumble_ = true;
    float mnk_sensitivity_ = 1.0f;
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index cc6e25b..3a9f5fe 100644
+index cc6e25b..96ea166 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
-@@ -370,6 +370,25 @@ class Presenter {
+@@ -370,6 +370,29 @@ class Presenter {
      uint64_t frame_count = 0;
    };
    GuestFrameStats GetGuestFrameStats() const;
@@ -230,10 +337,14 @@ index cc6e25b..3a9f5fe 100644
 +  // on the GPU - the earliest moment the image could be scanned out - and a
 +  // sequence number advancing once per such frame (0 = no samples yet).
 +  static uint64_t LastGuestFrameReady(int64_t* ready_ns);
++  // Window paint stall diagnostics (any thread): milliseconds since the oldest
++  // unpainted window paint request of a stall that paint request re-issuing
++  // (presenter_paint_request_reissue_ms) has seen, 0 while window paints keep up.
++  static uint64_t UIPaintStallMs();
    bool GuestFrameStatsEnabled() const {
      return guest_frame_stats_enabled_.load(std::memory_order_relaxed);
    }
-@@ -418,6 +437,12 @@ class Presenter {
+@@ -418,6 +441,12 @@ class Presenter {
    void RequestUIPaintFromUIThread();
  
   protected:
@@ -246,6 +357,20 @@ index cc6e25b..3a9f5fe 100644
    enum class PaintResult {
      kPresented,
      kPresentedSuboptimal,
+@@ -1004,6 +1033,13 @@ class Presenter {
+   // connection as the next successful reconnection should be followed by a
+   // repaint request anyway.
+   std::atomic<bool> ui_thread_paint_requested_{false};
++  // Steady clock milliseconds (never 0 once set) when the pending window paint
++  // request was issued, for re-issuing requests that the window system has
++  // dropped (otherwise ui_thread_paint_requested_ would stay set forever and
++  // swallow every later request, freezing the picture).
++  std::atomic<uint64_t> ui_thread_paint_request_time_ms_{0};
++  // Re-issues during the current stall, for logging.
++  std::atomic<uint32_t> ui_thread_paint_request_reissues_{0};
+ 
+   std::mutex guest_output_paint_config_mutex_;
+   // UI thread: writable, guest output thread: read-only.
 diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
 index 4194c8c..ff89b83 100644
 --- a/include/rex/ui/vulkan/presenter.h
@@ -290,6 +415,256 @@ index 4194c8c..ff89b83 100644
    // Accessible only by painting and by surface connection lifetime management
    // (ConnectOrReconnectPaintingToSurfaceFromUIThread,
    // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
+diff --git a/include/rex/ui/window_gtk.h b/include/rex/ui/window_gtk.h
+index 2d9d4ba..438cf82 100644
+--- a/include/rex/ui/window_gtk.h
++++ b/include/rex/ui/window_gtk.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
+ 
+@@ -77,6 +78,24 @@ class GTKWindow : public Window {
+                                                gpointer user_data);
+   static gboolean DrawHandler(GtkWidget* widget, cairo_t* cr, gpointer data);
+ 
++  // Paint requests arrive from any thread: the presenter asks for a paint from
++  // the guest output thread for every guest frame whenever presentation goes
++  // through the UI thread (always the case with a FIFO swapchain). GTK is not
++  // thread-safe, and a gtk_widget_queue_draw-driven "draw" depends on the GDK
++  // frame clock, which can stay frozen when the compositor doesn't acknowledge
++  // a frame. Either way a request could be lost, and the presenter then never
++  // asks again, freezing the picture while the game keeps running. So
++  // requests are marshalled to the main loop with g_idle_add (thread-safe) and
++  // painted directly, without the frame clock.
++  struct PaintRequestState {
++    std::atomic<bool> pending{false};
++    // UI thread only. Null once the window has been destroyed.
++    GTKWindow* window = nullptr;
++  };
++  static gboolean PaintRequestIdleCallback(gpointer user_data);
++  static void PaintRequestIdleDestroy(gpointer user_data);
++  std::shared_ptr<PaintRequestState> paint_request_state_;
++
+   // Non-owning (initially floating) references to the widgets.
+   GtkWidget* window_ = nullptr;
+   GtkWidget* box_ = nullptr;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 0e7cfce..7be6273 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -24,6 +24,13 @@
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
+ #include <SDL3/SDL.h>
++#include <rex/platform.h>
++
++#include <algorithm>
++#include <chrono>
++#if REX_PLATFORM_LINUX
++#include <pthread.h>
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
+@@ -42,6 +49,16 @@ REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
+                     "crackling audio reports.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(audio_steady_credit_release, true, "Audio",
++                    "Hand frames back to the guest's audio engine at a steady one-per-5.33ms "
++                    "cadence, like the console's audio hardware, instead of in one burst per "
++                    "device callback. With a large device buffer (PipeWire quantum 1024+, "
++                    "Bluetooth, HDMI) the burst made the game mix several frames back to back, "
++                    "and its streamed music could not refill in time: the music skipped and "
++                    "drifted off-tempo whenever sound effects played. Falls back to a burst "
++                    "only when the device asks for more than is queued.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
+                      "Requested audio device buffer size in sample frames (0 = backend default). "
+                      "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
+@@ -64,6 +81,7 @@ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* s
+     : AudioDriver(memory), semaphore_(semaphore) {}
+ 
+ SDLAudioDriver::~SDLAudioDriver() {
++  StopSteadyPacer();
+   assert_true(frames_queued_.empty());
+   assert_true(frames_unused_.empty());
+ }
+@@ -132,6 +150,8 @@ bool SDLAudioDriver::Initialize() {
+     }
+   }
+ 
++  StartSteadyPacer();
++
+   if (!SDL_ResumeAudioDevice(sdl_device)) {
+     REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
+     return false;
+@@ -185,6 +205,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
++  StopSteadyPacer();
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;
+@@ -251,13 +272,30 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   int64_t wait_budget_ns =
+       std::min<int64_t>(15000000, request_chunks * int64_t(channel_samples_) * 1000000000ll /
+                                       int64_t(frame_frequency_) / 2);
++  const bool steady = REXCVAR_GET(audio_steady_credit_release);
+   // Grant credits deferred by the real-time pacer once enough time has passed.
+-  uint64_t credits_released = driver->ReleasePacedCredits(0);
++  // In steady mode the pacer thread owns the release; nothing happens here
++  // unless the queue runs dry (see below).
++  uint64_t credits_released = steady ? 0 : driver->ReleasePacedCredits(0);
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     float* buffer = nullptr;
+     {
+       std::unique_lock<std::mutex> guard(driver->frames_mutex_);
++      if (driver->frames_queued_.empty() && steady) {
++        // The device wants more than is queued: its buffer is larger than
++        // the guest's credit pool, or the guest stalled. Hand over everything
++        // still owed at once and wait for it, as the burst path always did.
++        const uint64_t owed = driver->TakeSteadyCredits(UINT64_MAX);
++        if (owed) {
++          if (driver->semaphore_->Release(int(owed), nullptr)) {
++            credits_released += owed;
++            driver->stats_steady_emergency_.fetch_add(1, std::memory_order_relaxed);
++          } else {
++            driver->steady_pending_.fetch_add(owed, std::memory_order_relaxed);
++          }
++        }
++      }
+       if (driver->frames_queued_.empty() && credits_released && wait_budget_ns > 0) {
+         const auto wait_start = std::chrono::steady_clock::now();
+         driver->frames_available_cv_.wait_for(guard, std::chrono::nanoseconds(wait_budget_ns),
+@@ -313,7 +351,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         break;
+       }
+ 
+-      credits_released += driver->ReleasePacedCredits(1);
++      if (steady) {
++        driver->steady_pending_.fetch_add(1, std::memory_order_relaxed);
++      } else {
++        credits_released += driver->ReleasePacedCredits(1);
++      }
+       if (stats_enabled) {
+         driver->stats_frames_++;
+       }
+@@ -329,13 +371,15 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       REXAPU_INFO(
+           "Audio stats ({:.1f}s): callbacks={} frames={} ({:.1f}/s, real-time={:.1f}/s) "
+           "silence_chunks={} queue_depth={}..{} deferred_credits={} allowance={:.1f} "
+-          "max_callback_gap={}ms",
++          "max_callback_gap={}ms steady={} steady_pending={} steady_bursts={}",
+           window_s, driver->stats_callbacks_, driver->stats_frames_,
+           double(driver->stats_frames_) / window_s,
+           double(frame_frequency_) / double(channel_samples_), driver->stats_silence_chunks_,
+           driver->stats_queue_min_ == SIZE_MAX ? 0 : driver->stats_queue_min_,
+-          driver->stats_queue_max_, driver->pace_deferred_credits_,
+-          driver->pace_allowance_frames_, driver->stats_max_callback_gap_ns_ / 1000000ull);
++          driver->stats_queue_max_, driver->pace_deferred_credits_, driver->pace_allowance_frames_,
++          driver->stats_max_callback_gap_ns_ / 1000000ull, steady,
++          driver->steady_pending_.load(std::memory_order_relaxed),
++          driver->stats_steady_emergency_.exchange(0, std::memory_order_relaxed));
+       driver->stats_window_start_ns_ = now_ns;
+       driver->stats_callbacks_ = 0;
+       driver->stats_frames_ = 0;
+@@ -397,4 +441,88 @@ uint64_t SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
+   return releasable;
+ }
+ 
++uint64_t SDLAudioDriver::TakeSteadyCredits(uint64_t max_credits) {
++  uint64_t cur = steady_pending_.load(std::memory_order_relaxed);
++  uint64_t take = 0;
++  do {
++    take = std::min(cur, max_credits);
++    if (!take) {
++      return 0;
++    }
++  } while (!steady_pending_.compare_exchange_weak(cur, cur - take, std::memory_order_acq_rel,
++                                                  std::memory_order_relaxed));
++  return take;
++}
++
++void SDLAudioDriver::StartSteadyPacer() {
++  std::lock_guard<std::mutex> lock(steady_mutex_);
++  if (steady_running_) {
++    return;
++  }
++  steady_running_ = true;
++  steady_thread_ = std::thread([this] { SteadyPacerThreadMain(); });
++}
++
++void SDLAudioDriver::StopSteadyPacer() {
++  {
++    std::lock_guard<std::mutex> lock(steady_mutex_);
++    steady_running_ = false;
++  }
++  steady_cv_.notify_all();
++  if (steady_thread_.joinable()) {
++    steady_thread_.join();
++  }
++}
++
++void SDLAudioDriver::SteadyPacerThreadMain() {
++#if REX_PLATFORM_LINUX
++  pthread_setname_np(pthread_self(), "Audio Pacer");
++#endif
++  using clock = std::chrono::steady_clock;
++  // One guest frame period, 0.5% short: the pacer can never release more than
++  // the device consumed (it only hands back owed credits), so running a hair
++  // fast only guarantees it cannot fall behind a device clock that runs fast.
++  const auto period = std::chrono::nanoseconds(
++      int64_t(1e9 * double(channel_samples_) / double(frame_frequency_) * 0.995));
++  // Bounds the catch-up after this thread was delayed, so a late wake-up
++  // cannot turn back into the burst this pacer exists to remove.
++  constexpr int64_t kMaxCreditsPerWake = 4;
++  constexpr int64_t kResyncAfterPeriods = 20;
++
++  auto next = clock::now() + period;
++  std::unique_lock<std::mutex> lock(steady_mutex_);
++  while (steady_running_) {
++    steady_cv_.wait_until(lock, next, [this] { return !steady_running_; });
++    if (!steady_running_) {
++      break;
++    }
++    const auto now = clock::now();
++    if (!REXCVAR_GET(audio_steady_credit_release)) {
++      // Switched off at runtime: return anything still owed so the guest is
++      // not left short, then idle.
++      if (const uint64_t owed = TakeSteadyCredits(UINT64_MAX)) {
++        if (!semaphore_->Release(int(owed), nullptr)) {
++          steady_pending_.fetch_add(owed, std::memory_order_relaxed);
++        }
++      }
++      next = now + period;
++      continue;
++    }
++    int64_t due = 1;
++    if (now > next) {
++      due += (now - next) / period;
++    }
++    if (due > kResyncAfterPeriods) {
++      next = now;
++      due = 1;
++    }
++    if (const uint64_t take = TakeSteadyCredits(uint64_t(std::min(due, kMaxCreditsPerWake)))) {
++      if (!semaphore_->Release(int(take), nullptr)) {
++        steady_pending_.fetch_add(take, std::memory_order_relaxed);
++      }
++    }
++    next += period * due;
++  }
++}
++
+ }  // namespace rex::audio::sdl
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
 index 9d304be..7c9accf 100644
 --- a/src/core/cvar.cpp
@@ -381,6 +756,472 @@ index 9d304be..7c9accf 100644
      file.flush();
      if (!file) {
        REXLOG_ERROR("SaveConfig: failed to write {}", temp_path.string());
+diff --git a/src/core/guest_presence.cpp b/src/core/guest_presence.cpp
+index 644a6e5..bd5e84f 100644
+--- a/src/core/guest_presence.cpp
++++ b/src/core/guest_presence.cpp
+@@ -5,7 +5,17 @@
+ namespace rex::kernel::guest_presence {
+ namespace {
+ 
+-std::atomic<uint32_t> g_gameplay_context_value{0};
++// Not 0 before the title has set the context: 0 means "frontend/loading" to
++// the consumers, and the native renderer evaluates it from its first frame.
++// When that frame came before the title's boot-time XUserSetContext(0x8001, 7)
++// (an intermittent startup race), the renderer entered its native loading
++// screen state at 0 and then flipped to native gameplay rendering at 7, in the
++// middle of the intro movie, with nothing to draw: the boot stalled with no
++// frames presented (seen in the stock build too). An unset value compares like
++// the boot value 7 (!= 0 and != 1), so every boot now takes the path the
++// winning side of the race always took.
++constexpr uint32_t kContextUnset = 0xFFFFFFFFu;
++std::atomic<uint32_t> g_gameplay_context_value{kContextUnset};
+ 
+ }  // namespace
+ 
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index e5c89f6..d9c37b1 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -77,12 +77,16 @@ LogConfig g_config;
+ 
+ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
+                                             std::string_view app_name) {
+-  std::filesystem::create_directories(logs_dir);
++  // Unwritable logs dir (read-only volume, macOS app translocation): return
++  // an empty path and the caller skips the file sink instead of aborting.
++  std::error_code ec;
++  std::filesystem::create_directories(logs_dir, ec);
++  if (ec)
++    return {};
+ 
+   int max_seq = 0;
+   std::string prefix = std::string(app_name) + "_";
+   std::vector<std::pair<int, std::filesystem::path>> session_files;
+-  std::error_code ec;
+   for (const auto& entry : std::filesystem::directory_iterator(logs_dir, ec)) {
+     if (!entry.is_regular_file())
+       continue;
+@@ -249,12 +253,16 @@ void InitLogging(const LogConfig& config) {
+     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+   }
+   if (!resolved_path.empty()) {
+-    auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+-        static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
+-    sink->set_level(spdlog::level::trace);
+-    sink->set_pattern(config.file_pattern);
+-    g_file_sink = sink;
++    try {
++      auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
++          resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
++          static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
++      sink->set_level(spdlog::level::trace);
++      sink->set_pattern(config.file_pattern);
++      g_file_sink = sink;
++    } catch (const spdlog::spdlog_ex&) {
++      // Log file failed to open; keep the remaining sinks, never abort startup.
++    }
+   }
+ 
+   g_extra_sinks = config.extra_sinks;
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 34a51a9..bb780a7 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,11 +9,14 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
++#include <memory>
+ #include <string>
+ 
+ #include <fcntl.h>
+@@ -219,6 +222,118 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
+   return w ? PageAccess::kReadWrite : PageAccess::kReadOnly;
+ }
+ 
++// ---------------------------------------------------------------------------
++// Protection shadow (see RegisterProtectionShadow in the header).
++//
++// One byte per host page of the registered range: the effective host access
++// (0 none, 1 read, 2 read/write - execute requests are served without
++// PROT_EXEC, see ToPosixProtectFlags) or kShadowUnknown, which makes
++// QueryProtect fall back to /proc/self/maps for that page.
++//
++// Ordering: a page that gains access is recorded BEFORE the syscall, a page
++// that loses access AFTER it. A racing reader (the MMIO handler re-checking
++// whether a watch it hit has already been cleared) can therefore only see a
++// page as accessible slightly early, in which case it retries the access and
++// faults again until the change lands; it never sees a page as protected
++// after access has been granted. A failed syscall marks the pages unknown.
++constexpr uint8_t kShadowUnknown = 0xFF;
++
++struct ShadowTable {
++  uintptr_t begin = 0;  // page-aligned
++  uintptr_t end = 0;    // page-aligned, exclusive
++  std::unique_ptr<std::atomic<uint8_t>[]> codes;
++};
++// Published whole, so readers never see a pointer and a range that disagree.
++// A replaced table is intentionally leaked: a concurrent reader may still hold it.
++std::atomic<ShadowTable*> g_shadow{nullptr};
++
++uint8_t ShadowCode(PageAccess access) {
++  const uint32_t prot = ToPosixProtectFlags(access);
++  if (prot & PROT_WRITE) {
++    return 2;
++  }
++  return (prot & PROT_READ) ? 1 : 0;
++}
++
++PageAccess ShadowAccess(uint8_t code) {
++  return code == 2 ? PageAccess::kReadWrite
++                   : (code == 1 ? PageAccess::kReadOnly : PageAccess::kNoAccess);
++}
++
++// Host page indices [first, last) of the shadow touched by [address, +length).
++ShadowTable* ShadowPages(const void* address, size_t length, size_t& first, size_t& last) {
++  ShadowTable* shadow = g_shadow.load(std::memory_order_acquire);
++  if (!shadow || !length) {
++    return nullptr;
++  }
++  const uintptr_t page_mask = uintptr_t(page_size() - 1);
++  uintptr_t begin = reinterpret_cast<uintptr_t>(address) & ~page_mask;
++  uintptr_t end = reinterpret_cast<uintptr_t>(address) + length;
++  if (end < begin) {
++    end = UINTPTR_MAX;
++  }
++  begin = std::max(begin, shadow->begin);
++  end = std::min(end, shadow->end);
++  if (begin >= end) {
++    return nullptr;
++  }
++  const size_t page_bytes = page_size();
++  first = (begin - shadow->begin) / page_bytes;
++  last = (end - shadow->begin + page_bytes - 1) / page_bytes;
++  return shadow;
++}
++
++void ShadowStore(const void* address, size_t length, uint8_t code) {
++  size_t first, last;
++  if (ShadowTable* shadow = ShadowPages(address, length, first, last)) {
++    for (size_t i = first; i < last; ++i) {
++      shadow->codes[i].store(code, std::memory_order_release);
++    }
++  }
++}
++
++// Before a protection change: record pages that are about to become more
++// accessible (unknown pages stay unknown).
++void ShadowBeginChange(const void* address, size_t length, uint8_t code) {
++  size_t first, last;
++  if (ShadowTable* shadow = ShadowPages(address, length, first, last)) {
++    for (size_t i = first; i < last; ++i) {
++      const uint8_t old = shadow->codes[i].load(std::memory_order_relaxed);
++      if (old != kShadowUnknown && code > old) {
++        shadow->codes[i].store(code, std::memory_order_release);
++      }
++    }
++  }
++}
++
++// After a protection change: record the final state, or unknown on failure.
++void ShadowEndChange(const void* address, size_t length, uint8_t code, bool succeeded) {
++  ShadowStore(address, length, succeeded ? code : kShadowUnknown);
++}
++
++bool ShadowQuery(const void* address, PageAccess& access_out, size_t& length_out) {
++  size_t first, last;
++  ShadowTable* shadow = ShadowPages(address, 1, first, last);
++  if (!shadow) {
++    return false;
++  }
++  const uint8_t code = shadow->codes[first].load(std::memory_order_acquire);
++  if (code == kShadowUnknown) {
++    return false;
++  }
++  // Length of the run of identically protected pages, like the extent of a
++  // /proc/self/maps entry (bounded so the query stays O(1)-ish).
++  const size_t total = (shadow->end - shadow->begin) / page_size();
++  size_t run_end = first + 1;
++  while (run_end < total && run_end - first < 4096 &&
++         shadow->codes[run_end].load(std::memory_order_relaxed) == code) {
++    ++run_end;
++  }
++  length_out = run_end * page_size() + shadow->begin - reinterpret_cast<uintptr_t>(address);
++  access_out = ShadowAccess(code);
++  return true;
++}
++
+ }  // namespace
+ #endif  // REX_PLATFORM_LINUX
+ 
+@@ -268,7 +383,19 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   }
+ #endif
+ 
++#if REX_PLATFORM_LINUX
++  const uint8_t initial_code = prot_initial == PROT_NONE ? 0 : ShadowCode(access);
++  if (base_address) {
++    ShadowBeginChange(base_address, length, initial_code);
++  }
++#endif
+   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
++#if REX_PLATFORM_LINUX
++  if (base_address) {
++    // EEXIST leaves the existing mapping as it was, so it is not a known state.
++    ShadowEndChange(base_address, length, initial_code, result != MAP_FAILED);
++  }
++#endif
+   if (result != MAP_FAILED) {
+     return result;
+   }
+@@ -280,7 +407,11 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+        allocation_type == AllocationType::kReserveCommit)) {
+     // Verify the entire range is mapped before using mprotect
+     if (IsRangeFullyMapped(base_address, length)) {
+-      if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
++      const uint8_t code = ShadowCode(access);
++      ShadowBeginChange(base_address, length, code);
++      const bool ok = mprotect(base_address, length, static_cast<int>(prot_requested)) == 0;
++      ShadowEndChange(base_address, length, code, ok);
++      if (ok) {
+         return base_address;
+       }
+     }
+@@ -298,15 +429,25 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+       AlignHostPageRange(base_address, length);
+ #endif
+       if (mprotect(base_address, length, PROT_NONE) != 0) {
++#if REX_PLATFORM_LINUX
++        ShadowStore(base_address, length, kShadowUnknown);
++#endif
+         return false;
+       }
++#if REX_PLATFORM_LINUX
++      ShadowStore(base_address, length, 0);
++#endif
+ #if defined(MADV_DONTNEED)
+       (void)madvise(base_address, length, MADV_DONTNEED);
+ #endif
+       return true;
+     }
+     case DeallocationType::kRelease: {
+-      return munmap(base_address, length) == 0;
++      const bool ok = munmap(base_address, length) == 0;
++#if REX_PLATFORM_LINUX
++      ShadowStore(base_address, length, ok ? 0 : kShadowUnknown);
++#endif
++      return ok;
+     }
+     default:
+       // how we get here? :(
+@@ -327,9 +468,12 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+   //             atomic in a mutli-threaded process either, but it's something to be aware of.
+   // Query old access before changing, if the caller needs it
+   if (out_old_access) {
+-    LinuxMapEntry e;
+-    if (FindEntryForAddress(base_address, e)) {
+-      *out_old_access = PermsToPageAccess(e.perms);
++    size_t unused_length = 0;
++    if (!ShadowQuery(base_address, *out_old_access, unused_length)) {
++      LinuxMapEntry e;
++      if (FindEntryForAddress(base_address, e)) {
++        *out_old_access = PermsToPageAccess(e.perms);
++      }
+     }
+   }
+ #endif
+@@ -338,7 +482,53 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+ #if REX_PLATFORM_MAC
+   AlignHostPageRange(base_address, length);
+ #endif
++#if REX_PLATFORM_LINUX
++  const uint8_t code = ShadowCode(access);
++  ShadowBeginChange(base_address, length, code);
++  const bool ok = mprotect(base_address, length, prot) == 0;
++  ShadowEndChange(base_address, length, code, ok);
++  return ok;
++#else
+   return mprotect(base_address, length, prot) == 0;
++#endif
++}
++
++void RegisterProtectionShadow(void* base, size_t length) {
++#if REX_PLATFORM_LINUX
++  if (!base || !length) {
++    return;
++  }
++  const size_t page_bytes = page_size();
++  const uintptr_t begin = reinterpret_cast<uintptr_t>(base) & ~uintptr_t(page_bytes - 1);
++  const uintptr_t end = reinterpret_cast<uintptr_t>(base) + length;
++  const size_t pages = (end - begin + page_bytes - 1) / page_bytes;
++  auto* shadow = new ShadowTable;
++  shadow->begin = begin;
++  shadow->end = begin + pages * page_bytes;
++  shadow->codes = std::make_unique<std::atomic<uint8_t>[]>(pages);
++  // Unmapped holes read as no access, exactly like a failed maps lookup.
++  for (size_t i = 0; i < pages; ++i) {
++    shadow->codes[i].store(0, std::memory_order_relaxed);
++  }
++  std::ifstream maps("/proc/self/maps");
++  std::string line;
++  while (std::getline(maps, line)) {
++    LinuxMapEntry e;
++    if (!ParseProcMapsLine(line, e) || e.end <= begin || e.start >= end) {
++      continue;
++    }
++    const uintptr_t s = std::max<uintptr_t>(e.start, begin);
++    const uintptr_t t = std::min<uintptr_t>(e.end, end);
++    const uint8_t code = ShadowCode(PermsToPageAccess(e.perms));
++    for (uintptr_t a = s; a < t; a += page_bytes) {
++      shadow->codes[(a - begin) / page_bytes].store(code, std::memory_order_relaxed);
++    }
++  }
++  g_shadow.store(shadow, std::memory_order_release);
++#else
++  static_cast<void>(base);
++  static_cast<void>(length);
++#endif
+ }
+ 
+ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+@@ -350,6 +540,10 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   access_out = PageAccess::kNoAccess;
+   length = 0;
+ 
++  if (ShadowQuery(base_address, access_out, length)) {
++    return true;
++  }
++
+   LinuxMapEntry e;
+   if (!FindEntryForAddress(base_address, e)) {
+     return false;
+@@ -417,6 +611,15 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Unlink the name straight away. The descriptor and the views mapped from
++  // it keep the backing object alive, and the kernel frees it when the last
++  // reference goes, whatever way the process ends. Leaving the name in place
++  // until CloseFileMappingHandle meant a crash or SIGKILL left a
++  // /dev/shm/xenia_memory_* file behind (hundreds of MB each, 4.5 GB sparse)
++  // that kept counting against the shm tmpfs limit. A handful of leaked runs
++  // filled it, after which every process that faulted in a fresh tmpfs page,
++  // Steam's overlay and client included, died with SIGBUS.
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
+@@ -424,6 +627,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+   close(static_cast<int>(handle));
+ #if !REX_PLATFORM_ANDROID
++  // The name was already unlinked in CreateFileMappingHandle; this is kept for
++  // objects created by older code and is a harmless ENOENT otherwise.
+   auto full_path = MakeShmName(path);
+   shm_unlink(full_path.c_str());
+ #endif
+@@ -447,8 +652,19 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+   }
+ 
+   uint32_t prot = ToPosixProtectFlags(access);
++#if REX_PLATFORM_LINUX
++  const uint8_t code = ShadowCode(access);
++  if (base_address) {
++    ShadowBeginChange(base_address, length, code);
++  }
++#endif
+   void* result = mmap64(base_address, length, prot, flags, static_cast<int>(handle),
+                         static_cast<off_t>(file_offset));
++#if REX_PLATFORM_LINUX
++  if (base_address) {
++    ShadowEndChange(base_address, length, code, result == base_address);
++  }
++#endif
+   if (result == MAP_FAILED) {
+     return nullptr;
+   }
+@@ -463,7 +679,11 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+ }
+ 
+ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
+-  return munmap(base_address, length) == 0;
++  const bool ok = munmap(base_address, length) == 0;
++#if REX_PLATFORM_LINUX
++  ShadowStore(base_address, length, ok ? 0 : kShadowUnknown);
++#endif
++  return ok;
+ }
+ 
+ }  // namespace memory
+diff --git a/src/core/memory_win.cpp b/src/core/memory_win.cpp
+index 206bd5e..1495a1f 100644
+--- a/src/core/memory_win.cpp
++++ b/src/core/memory_win.cpp
+@@ -148,6 +148,12 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+   return true;
+ }
+ 
++void RegisterProtectionShadow(void* base, size_t length) {
++  // The protection record is Linux-only (VirtualQuery needs no help).
++  static_cast<void>(base);
++  static_cast<void>(length);
++}
++
+ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   access_out = PageAccess::kNoAccess;
+ 
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 2f528e6..650534a 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -393,9 +393,14 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
++        // Sleep for the actual remaining time. Truncating it to whole
++        // milliseconds made it 0 for any wait shorter than 2 ms, so the 1 ms
++        // poll slices of alertable waits spun for their entire length and the
++        // waiting thread (the audio worker, guest threads in alertable
++        // multi-object waits) used a full CPU core while idle.
++        const std::chrono::steady_clock::duration remaining = end_time - now;
++        std::this_thread::sleep_for(
++            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1)));
+       }
+     }
+   }
+@@ -1372,12 +1377,19 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
++    // Publish the suspend count together with the state, in the same critical
++    // section. Resume() only waits for the state to leave kUninitialized, so if
++    // the count were set in a separate critical section, a Resume() landing in
++    // between would see a count of 0, do nothing, and the thread would then
++    // wait for a resume that has already happened - forever.
++    if (create_suspended) {
++      thread->handle_.suspend_count_ = 1;
++    }
+     thread->handle_.state_signal_.notify_all();
+   }
+ 
+   if (create_suspended) {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+-    thread->handle_.suspend_count_ = 1;
+     thread->handle_.state_signal_.wait(lock,
+                                        [thread] { return thread->handle_.suspend_count_ == 0; });
+   }
 diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
 index 5044c26..0260276 100644
 --- a/src/core/timer_queue.cpp
@@ -1471,6 +2312,181 @@ index 28fd5b0..cea6e92 100644
        height, guest_output_out);
  }
  
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index 99caf39..4169989 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <filesystem>
+ 
+ #include <rex/assert.h>
+@@ -24,6 +25,11 @@
+ 
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
++REXCVAR_DEFINE_BOOL(hid_sdl_adopt_present_controllers, true, "Input",
++                    "Adopt gamepads SDL already lists at startup, and once a second while a "
++                    "player slot is free, even without a connect event (needed by Linux builds "
++                    "whose SDL never announces them). Off = connect events only")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(hid_sdl_rumble_duration_ms, 100, "Input",
+                       "SDL rumble pulse duration for nonzero XInput vibration");
+ 
+@@ -92,7 +98,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+ 
+       // Initialize game controller subsystem
+       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+-        REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());
++        REXLOG_ERROR(
++            "SDL: Failed to init gamepad subsystem: {}. Controller input will be "
++            "unavailable for this session (keyboard/mouse may still work).",
++            SDL_GetError());
+         return;
+       }
+       SDL_Gamepad_initialized_ = true;
+@@ -119,6 +128,13 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+           }
+         }
+       }
++      // Adopt whatever is already attached. SDL surfaces devices through
++      // SDL_EVENT_GAMEPAD_ADDED only, so a controller that was present before
++      // this subsystem came up, or a backend that never emits that event, would
++      // otherwise stay invisible for the whole session.
++      LogDeviceInventory();
++      AdoptPresentControllers();
++
+       REXLOG_INFO("SDL input driver initialized successfully");
+     });
+   }
+@@ -474,6 +490,19 @@ void SDLInputDriver::StopRumbleLocked(ControllerState& state) {
+ }
+ 
+ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
++  // The same physical device can be announced twice: the startup enumeration
++  // sweep adopts whatever SDL already reports, and SDL's queued
++  // SDL_EVENT_GAMEPAD_ADDED for that same instance is drained afterwards.
++  // Without this guard the one pad ends up occupying two player slots, which
++  // reads to the game as a second controller being connected. Skip devices we
++  // already track, and do it before opening a handle so nothing is leaked.
++  if (auto existing = GetControllerIndexFromInstanceID(event.cdevice.which)) {
++    REXLOG_INFO(
++        "SDL OnControllerDeviceAdded: instance {} is already tracked at player index "
++        "{}, ignoring duplicate announcement.",
++        static_cast<int>(event.cdevice.which), *existing);
++    return;
++  }
+   // Open the controller.
+   const auto controller = SDL_OpenGamepad(event.cdevice.which);
+   if (!controller) {
+@@ -710,6 +739,11 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+ }
+ 
+ void SDLInputDriver::QueueControllerUpdate() {
++  // A controller connected after startup, or an SDL_EVENT_GAMEPAD_ADDED that
++  // never arrived, would otherwise leave every slot empty for the whole
++  // session. Sweep at most once per second, and only while a slot is free.
++  MaybeAdoptPresentControllers();
++
+   // Pump SDL events to ensure controller state is up to date.
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+@@ -721,6 +755,92 @@ void SDLInputDriver::QueueControllerUpdate() {
+   }
+ }
+ 
++void SDLInputDriver::AdoptPresentControllers() {
++  if (!SDL_Gamepad_initialized_ || !REXCVAR_GET(hid_sdl_adopt_present_controllers)) {
++    return;
++  }
++  int gamepad_count = 0;
++  SDL_JoystickID* gamepads = SDL_GetGamepads(&gamepad_count);
++  std::vector<SDL_JoystickID> present;
++  if (gamepads) {
++    present.reserve(static_cast<size_t>(gamepad_count));
++    for (int i = 0; i < gamepad_count; i++) {
++      present.push_back(gamepads[i]);
++    }
++    SDL_free(gamepads);
++  }
++  if (present.empty()) {
++    return;
++  }
++  for (SDL_JoystickID instance_id : present) {
++    std::lock_guard<std::mutex> guard(controllers_mutex_);
++    if (GetControllerIndexFromInstanceID(instance_id)) {
++      continue;  // Already tracked.
++    }
++    // Route through the added-device path so slot picking, player index and
++    // capability reporting stay identical to the event-driven path.
++    SDL_Event synthetic{};
++    synthetic.type = SDL_EVENT_GAMEPAD_ADDED;
++    synthetic.cdevice.which = instance_id;
++    OnControllerDeviceAddedLocked(synthetic);
++  }
++}
++
++void SDLInputDriver::MaybeAdoptPresentControllers() {
++  if (!SDL_Gamepad_initialized_ || !REXCVAR_GET(hid_sdl_adopt_present_controllers)) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> guard(controllers_mutex_);
++    bool has_free_slot = false;
++    for (const auto& controller : controllers_) {
++      if (!controller.sdl) {
++        has_free_slot = true;
++        break;
++      }
++    }
++    if (!has_free_slot) {
++      return;
++    }
++  }
++  const uint64_t now_ms =
++      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                std::chrono::steady_clock::now().time_since_epoch())
++                                .count());
++  if (last_adopt_ms_ != 0 && now_ms - last_adopt_ms_ < 1000) {
++    return;
++  }
++  last_adopt_ms_ = now_ms;
++  AdoptPresentControllers();
++}
++
++void SDLInputDriver::LogDeviceInventory() const {
++  int gamepad_count = 0;
++  int joystick_count = 0;
++  SDL_JoystickID* gamepads = SDL_GetGamepads(&gamepad_count);
++  if (gamepads) {
++    SDL_free(gamepads);
++  }
++  SDL_JoystickID* joysticks = SDL_GetJoysticks(&joystick_count);
++  if (joysticks) {
++    SDL_free(joysticks);
++  }
++  REXLOG_INFO("SDL HID inventory: {} gamepad(s) and {} joystick(s) visible to SDL.", gamepad_count,
++              joystick_count);
++  if (gamepad_count == 0 && joystick_count > 0) {
++    REXLOG_WARN(
++        "SDL HID: {} joystick(s) are visible but none is recognized as a gamepad, "
++        "so controller input cannot be delivered. Supply mappings through the "
++        "hid_mappings_file cvar (gamecontrollerdb.txt).",
++        joystick_count);
++  } else if (gamepad_count == 0) {
++    REXLOG_WARN(
++        "SDL HID: no gamepad and no joystick is visible to SDL. On Linux this "
++        "usually means the SDL build in use cannot enumerate the device (no udev "
++        "backend), or this user cannot read the input device nodes.");
++  }
++}
++
+ // Check if the analog inputs exceed their thresholds to become a button press
+ // and build the bitfield.
+ inline uint64_t SDLInputDriver::AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const {
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
 index bfd3446..44a8ec6 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
@@ -1490,6 +2506,46 @@ index bfd3446..44a8ec6 100644
        auto old_value = kernel_state_->GetUserContext(user_index, context_id);
        kernel_state_->SetUserContext(user_index, context_id, context_value);
        rex::kernel::guest_presence::NotifyContext(user_index, context_id, context_value);
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 0c542aa..ef4437f 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -154,6 +154,12 @@ Memory::~Memory() {
+   physical_membase_ = nullptr;
+ }
+ 
++namespace {
++
++constexpr size_t kGuestMappingLength = 0x120000000ull;
++
++}  // namespace
++
+ bool Memory::Initialize() {
+   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+ 
+@@ -193,6 +199,9 @@ bool Memory::Initialize() {
+     return false;
+   }
+   virtual_membase_ = mapping_base_;
++  // Every guest-memory fault re-checks host page protection (MMIO handler);
++  // keep that an in-memory lookup instead of a /proc/self/maps parse.
++  rex::memory::RegisterProtectionShadow(mapping_base_, kGuestMappingLength);
+   physical_membase_ = mapping_base_ + 0x100000000ull;
+   // Prepare virtual heaps.
+   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
+@@ -342,12 +351,6 @@ static const struct {
+     },
+ };
+ 
+-namespace {
+-
+-constexpr size_t kGuestMappingLength = 0x120000000ull;
+-
+-}  // namespace
+-
+ int Memory::MapViews(uint8_t* mapping_base) {
+   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+ 
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
 index 146c021..59a85d3 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
@@ -2318,10 +3374,24 @@ index c22345f..5069f64 100644
          RowSpec row;
          row.kind = RowSpec::kEnum;
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 72d7c07..7246c29 100644
+index 72d7c07..3156e41 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
-@@ -296,11 +296,48 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+@@ -35,6 +35,13 @@
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
++REXCVAR_DEFINE_UINT32(presenter_paint_request_reissue_ms, 250, "UI/Presenter",
++                      "Re-issue a window paint request that has been pending for this many "
++                      "milliseconds without the window painting (0 = never). Recovers from "
++                      "paint requests dropped by the window system, which otherwise freeze "
++                      "the picture while the game keeps running")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(presenter_strict_guest_output_backpressure, false, "UI/Presenter",
+                     "Block guest output when it would replace an unpresented frame in the "
+                     "presenter mailbox")
+@@ -296,11 +303,65 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
    return config;
  }
  
@@ -2333,6 +3403,11 @@ index 72d7c07..7246c29 100644
 +// write in progress), one writer (the readiness observer).
 +std::atomic<uint64_t> g_guest_frame_ready_seq{0};
 +std::atomic<int64_t> g_guest_frame_ready_ns{0};
++// See Presenter::UIPaintStallMs: steady-clock milliseconds (+1, never 0) of the
++// unpainted window paint request that the first re-issue of a stall found, 0
++// while window paints keep up. Set by the re-issuing thread, cleared by the
++// UI thread when painting resumes.
++std::atomic<uint64_t> g_ui_paint_stall_since_ms{0};
 +
  }  // namespace
  
@@ -2355,6 +3430,18 @@ index 72d7c07..7246c29 100644
 +  g_guest_frame_ready_seq.store(seq + 2, std::memory_order_release);
 +}
 +
++uint64_t Presenter::UIPaintStallMs() {
++  const uint64_t since = g_ui_paint_stall_since_ms.load(std::memory_order_relaxed);
++  if (!since) {
++    return 0;
++  }
++  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count()) +
++                          1;
++  return now_ms > since ? now_ms - since : 0;
++}
++
 +uint64_t Presenter::LastGuestFrameReady(int64_t* ready_ns) {
 +  while (true) {
 +    const uint64_t seq = g_guest_frame_ready_seq.load(std::memory_order_acquire);
@@ -2370,7 +3457,24 @@ index 72d7c07..7246c29 100644
  void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                                [[maybe_unused]] bool statically_from_ui_thread) {
    rex::FatalError("Graphics device lost (probably due to an internal error)");
-@@ -646,7 +683,13 @@ bool Presenter::RefreshGuestOutput(
+@@ -474,6 +535,16 @@ void Presenter::PaintFromUIThread(bool force_paint) {
+   // for example.
+   if (ui_thread_paint_requested_.exchange(false, std::memory_order_relaxed)) {
+     do_paint = true;
++    uint32_t reissues = ui_thread_paint_request_reissues_.exchange(0, std::memory_order_relaxed);
++    if (reissues) {
++      // Warning level, like the re-issue messages, so a stall's end shows in
++      // the default log too.
++      const uint64_t stall_ms = UIPaintStallMs();
++      g_ui_paint_stall_since_ms.store(0, std::memory_order_relaxed);
++      REXLOG_WARN("Presenter: window painting resumed after {} paint request re-issue(s), {} ms "
++                  "without a paint",
++                  reissues, stall_ms);
++    }
+   }
+   PaintResult paint_result = PaintResult::kNotPresented;
+   bool request_repaint_at_tick = false;
+@@ -646,7 +717,13 @@ bool Presenter::RefreshGuestOutput(
      guest_output_active_last_refresh_ = false;
    }
  
@@ -2385,7 +3489,7 @@ index 72d7c07..7246c29 100644
      const int32_t timeout_ms =
          REXCVAR_GET(presenter_strict_guest_output_backpressure_timeout_ms);
      std::unique_lock<std::mutex> producer_wait_lock(
-@@ -1537,6 +1580,7 @@ void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnection
+@@ -1537,6 +1614,7 @@ void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnection
    }
    surface_paint_connection_state_ = new_state;
    surface_paint_connection_has_implicit_vsync_ = false;
@@ -2393,6 +3497,113 @@ index 72d7c07..7246c29 100644
    surface_width_in_paint_connection_ = 0;
    surface_height_in_paint_connection_ = 0;
  }
+@@ -1619,10 +1697,45 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
+   if (force_ui_thread_paint_tick) {
+     ForceUIThreadPaintTick();
+   }
++  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count()) +
++                          1;
+   if (ui_thread_paint_requested_.exchange(true, std::memory_order_relaxed)) {
+-    // Invalidation pending already, no need to do it twice.
+-    return false;
++    // Invalidation pending already, no need to do it twice - unless it has
++    // been pending for so long that the window system has evidently dropped
++    // it. Nothing else would ever clear ui_thread_paint_requested_ then, and
++    // the picture would freeze for good while the guest keeps rendering.
++    const uint32_t reissue_ms = REXCVAR_GET(presenter_paint_request_reissue_ms);
++    if (!reissue_ms) {
++      return false;
++    }
++    uint64_t requested_ms = ui_thread_paint_request_time_ms_.load(std::memory_order_relaxed);
++    if (!requested_ms || now_ms - requested_ms < reissue_ms) {
++      return false;
++    }
++    // Only one caller re-issues per interval.
++    if (!ui_thread_paint_request_time_ms_.compare_exchange_strong(requested_ms, now_ms,
++                                                                  std::memory_order_relaxed)) {
++      return false;
++    }
++    // The first re-issue of a stall still holds the original request time.
++    uint64_t no_stall = 0;
++    g_ui_paint_stall_since_ms.compare_exchange_strong(no_stall, requested_ms,
++                                                      std::memory_order_relaxed);
++    const uint32_t reissue =
++        ui_thread_paint_request_reissues_.fetch_add(1, std::memory_order_relaxed) + 1;
++    // 1, 2, 4, 8... so a long stall (such as a minimized window) doesn't spam.
++    if (!(reissue & (reissue - 1))) {
++      REXLOG_WARN(
++          "Presenter: window paint request pending for {} ms without a paint, re-issuing "
++          "(re-issue {} of this stall)",
++          now_ms - requested_ms, reissue);
++    }
++    window_->RequestPaint();
++    return true;
+   }
++  ui_thread_paint_request_time_ms_.store(now_ms, std::memory_order_relaxed);
+   window_->RequestPaint();
+   return true;
+ }
+diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
+index ce81e1b..e860589 100644
+--- a/src/ui/renderdoc_api.cpp
++++ b/src/ui/renderdoc_api.cpp
+@@ -10,8 +10,13 @@
+  */
+ 
+ #include <rex/logging.h>
++#include <rex/platform.h>
+ #include <rex/ui/renderdoc_api.h>
+ 
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#include <dlfcn.h>
++#endif
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -20,6 +25,19 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+ 
+   pRENDERDOC_GetAPI get_api = nullptr;
+ 
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++  // "Connected" means RenderDoc injected its library before we started. Only
++  // accept a library that is already mapped: a plain dlopen would also load a
++  // system-wide librenderdoc.so (SteamOS ships one in /usr/lib), which then
++  // hooks the Vulkan entry points of every run, turns on GPU debug markers
++  // and sits in the present path for no benefit.
++  if (void* already = dlopen(platform::lib_names::kRenderDoc, RTLD_LAZY | RTLD_NOLOAD)) {
++    dlclose(already);
++  } else {
++    return nullptr;
++  }
++#endif
++
+   // Try to load the RenderDoc library. If RenderDoc is attached, the library
+   // should already be loaded into the process and this will increment the
+   // reference count. If not attached, the load will fail and we return nullptr.
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 30ac56f..3f3d731 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -417,7 +417,15 @@ bool ReXApp::SetupEnvironment() {
+                                         log_level_str, category_levels);
+   if (log_file_cvar.empty()) {
+     log_config.app_name = std::string(GetName());
+-    log_config.log_dir = (exe_dir / "logs").string();
++    // Prefer logs beside the app; if that folder is read-only (macOS app
++    // translocation, DMG), fall back to the user data root.
++    auto logs_dir = exe_dir / "logs";
++    std::error_code logs_ec;
++    std::filesystem::create_directories(logs_dir, logs_ec);
++    if (logs_ec && !user_data_root_.empty()) {
++      logs_dir = user_data_root_ / "logs";
++    }
++    log_config.log_dir = logs_dir.string();
+   }
+ 
+   rex::InitLogging(log_config);
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
 index b404ec8..1266b1e 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
@@ -2706,3 +3917,81 @@ index b404ec8..1266b1e 100644
    const auto timing_present_end = std::chrono::steady_clock::now();
    AccumulateAndMaybeLogPresentTiming(
        execute_ui_drawers, ElapsedUs(timing_acquire_start, timing_acquire_end),
+diff --git a/src/ui/window_gtk.cpp b/src/ui/window_gtk.cpp
+index 6cb9254..d2743a7 100644
+--- a/src/ui/window_gtk.cpp
++++ b/src/ui/window_gtk.cpp
+@@ -355,12 +355,16 @@ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+ 
+ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view title,
+                      uint32_t desired_logical_width, uint32_t desired_logical_height)
+-    : Window(app_context, title, desired_logical_width, desired_logical_height) {
++    : Window(app_context, title, desired_logical_width, desired_logical_height),
++      paint_request_state_(std::make_shared<PaintRequestState>()) {
++  paint_request_state_->window = this;
+   dpi_ = QueryWidgetDpi(nullptr);
+ }
+ 
+ GTKWindow::~GTKWindow() {
+   EnterDestructor();
++  // A paint idle callback may still be queued, make it a no-op.
++  paint_request_state_->window = nullptr;
+   if (cursor_auto_hide_timer_) {
+     g_source_remove(cursor_auto_hide_timer_);
+     cursor_auto_hide_timer_ = 0;
+@@ -684,7 +688,54 @@ std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed
+ }
+ 
+ void GTKWindow::RequestPaintImpl() {
+-  gtk_widget_queue_draw(drawing_area_);
++  // May be called from any thread - see PaintRequestState in the header.
++  PaintRequestState& state = *paint_request_state_;
++  bool expected = false;
++  if (!state.pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
++                                             std::memory_order_acquire)) {
++    // Already queued, the queued paint will pick up the latest guest output.
++    return;
++  }
++  // Default idle priority (the same as WindowedAppContext's deferred UI thread
++  // functions), so continuous painting can't starve those, and input events
++  // (default priority) are still handled first.
++  g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, PaintRequestIdleCallback,
++                  new std::shared_ptr<PaintRequestState>(paint_request_state_),
++                  PaintRequestIdleDestroy);
++}
++
++gboolean GTKWindow::PaintRequestIdleCallback(gpointer user_data) {
++  PaintRequestState& state = **static_cast<std::shared_ptr<PaintRequestState>*>(user_data);
++  // Clear before painting, so a request made during the paint queues another
++  // one rather than being dropped.
++  state.pending.store(false, std::memory_order_release);
++  GTKWindow* window = state.window;
++  if (!window || !window->drawing_area_) {
++    return G_SOURCE_REMOVE;
++  }
++  // Don't paint into a window that isn't shown (unmapped or minimized). GTK
++  // emits "draw" (DrawHandler) when it's shown again, and the presenter also
++  // re-issues requests that stay pending for too long.
++  if (!gtk_widget_is_drawable(window->drawing_area_)) {
++    return G_SOURCE_REMOVE;
++  }
++  if (window->window_) {
++    GdkWindow* gdk_window = gtk_widget_get_window(window->window_);
++    if (gdk_window && (gdk_window_get_state(gdk_window) &
++                       (GDK_WINDOW_STATE_ICONIFIED | GDK_WINDOW_STATE_WITHDRAWN))) {
++      return G_SOURCE_REMOVE;
++    }
++  }
++  if (window->batched_size_update_depth_) {
++    window->batched_size_update_contained_draw_ = true;
++  } else {
++    window->OnPaint();
++  }
++  return G_SOURCE_REMOVE;
++}
++
++void GTKWindow::PaintRequestIdleDestroy(gpointer user_data) {
++  delete static_cast<std::shared_ptr<PaintRequestState>*>(user_data);
+ }
+ 
+ void GTKWindow::HandleSizeUpdate(WindowDestructionReceiver& destruction_receiver) {
