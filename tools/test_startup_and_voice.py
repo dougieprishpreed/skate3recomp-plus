@@ -111,14 +111,23 @@ int main(int argc,char** argv){
  std::this_thread::sleep_for(std::chrono::milliseconds(120));
  assert(ShouldForceIntroMovieComplete()==assist);
  // A frontend movie (presence 0, new after a polling gap) completes only
- // after the minimum play time (upstream skate3recomp#184).
+ // after the minimum play time (upstream skate3recomp#184). Poll every few
+ // ms like FEMoviePlayer::Update, so a slow CI sleep can't read as a new movie.
  gameplay=0;
  std::this_thread::sleep_for(std::chrono::milliseconds(300));
- assert(!ShouldForceIntroMovieComplete());
- std::this_thread::sleep_for(std::chrono::milliseconds(120));
- assert(!ShouldForceIntroMovieComplete());
- std::this_thread::sleep_for(std::chrono::milliseconds(120));
- assert(ShouldForceIntroMovieComplete()==assist);
+ const auto movie_start=std::chrono::steady_clock::now();
+ bool early=false;
+ while(std::chrono::steady_clock::now()-movie_start<std::chrono::milliseconds(150)){
+  early|=ShouldForceIntroMovieComplete();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+ }
+ assert(!early);
+ bool done=false;
+ while(!done&&std::chrono::steady_clock::now()-movie_start<std::chrono::milliseconds(assist?3000:400)){
+  done=ShouldForceIntroMovieComplete();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+ }
+ assert(done==assist);
  c.r4.u64=1;Skate3DemoPath_LanguageSelectUpdateHook(c,nullptr);
  assert(queued==int(assist));
  Skate3DemoPath_LanguageSelectUpdateHook(c,nullptr);assert(queued==int(assist));
