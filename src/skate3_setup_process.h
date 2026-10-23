@@ -8,4 +8,8 @@ namespace skate3 {
 bool RunSetupProcess(const std::filesystem::path& executable,
                      const std::vector<std::string>& arguments,
                      const std::filesystem::path& log_path, std::string& error);
+
+// A bundled program copied without its Unix permissions (for example through a
+// Windows PC) is made executable again before it runs. Nothing to do on Windows.
+void EnsureExecutable(const std::filesystem::path& file);
 }

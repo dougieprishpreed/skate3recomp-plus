@@ -9,12 +9,27 @@
 #else
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char** environ;
 #endif
 
 namespace skate3 {
+void EnsureExecutable(const std::filesystem::path& file) {
+#if !defined(_WIN32)
+  struct stat st {};
+  if (::stat(file.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || ::access(file.c_str(), X_OK) == 0)
+    return;
+  // Execute wherever read is allowed, like the packaged 0755 programs. A failure
+  // leaves the spawn to report the real error.
+  const auto mode = static_cast<mode_t>(st.st_mode & 07777);
+  static_cast<void>(::chmod(file.c_str(), static_cast<mode_t>(mode | ((mode & 0444) >> 2))));
+#else
+  static_cast<void>(file);
+#endif
+}
+
 bool RunSetupProcess(const std::filesystem::path& executable,
                      const std::vector<std::string>& arguments,
                      const std::filesystem::path& log_path, std::string& error) {
@@ -65,6 +80,7 @@ bool RunSetupProcess(const std::filesystem::path& executable,
       &actions, STDOUT_FILENO, log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (!status) status = posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
   pid_t child = -1;
+  EnsureExecutable(executable);
   if (!status) status = posix_spawn(&child, executable.c_str(), &actions, nullptr, argv.data(), environ);
   posix_spawn_file_actions_destroy(&actions);
   if (status) { error = std::string("Unable to start setup: ") + std::strerror(status); return false; }

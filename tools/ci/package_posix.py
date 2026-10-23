@@ -201,12 +201,24 @@ def remove_links(output, interpreter):
     print(f'Release links: {copied} replaced by copies, dropped {dropped}', flush=True)
 
 
+def check_portable(output):
+    """Refuse what extract tools or drives would not reproduce: links, and names that
+    differ only by case (exFAT/NTFS drives and default macOS volumes merge them)."""
+    seen = {}
+    for p in output.rglob('*'):
+        if p.is_symlink():
+            raise ValueError('Release folders must not contain links (see remove_links): ' + str(p))
+        key = p.relative_to(output).as_posix().lower()
+        if key in seen:
+            raise ValueError(f'Release names differ only by case: {seen[key]} / {p}')
+        seen[key] = p
+
+
 def archive_package(output, platform):
     archive = output.with_suffix('.zip')
     if archive.exists():
         raise FileExistsError(archive)
-    if any(p.is_symlink() for p in output.rglob('*')):
-        raise ValueError('Release folders must not contain links (see remove_links)')
+    check_portable(output)
     if platform == 'macos-arm64':
         # Preserve app-bundle metadata and executable modes.
         run('/usr/bin/ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', output, archive)
@@ -277,6 +289,11 @@ def package(build, output, platform):
         shutil.copy2(p, binaries / p.name)
     shutil.copytree(build / 'installer', resources / 'installer', symlinks=True,
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    # The private interpreter only runs scripts. Its terminal database and manuals
+    # are unused, and terminfo has names that differ only by case (E/Eterm-color,
+    # e/eterm-color), which collide on exFAT/NTFS drives.
+    if (resources / 'installer/python/share').is_dir():
+        shutil.rmtree(resources / 'installer/python/share')
     (resources / 'settings.toml').write_bytes(settings_for('Darwin' if platform == 'macos-arm64' else 'Linux'))
     shutil.copy2(ROOT / 'packaging/README.txt', output / 'README.txt')
     shutil.copy2(ROOT / 'packaging/PLATFORM_SETUP.md', output / 'PLATFORM_SETUP.md')

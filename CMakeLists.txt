@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 0.2.3 LANGUAGES CXX)
+project(skate3 VERSION 0.2.4 LANGUAGES CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # This fork has its own release sequence; upstream v2 tags do not set its version.
-set(SKATE3_FULL_VERSION "0.2c")
+set(SKATE3_FULL_VERSION "0.2d")
 set(SKATE3_NUMERIC_VERSION "${PROJECT_VERSION}")
 
 # Four-part comma-separated form for Windows VERSIONINFO resources.

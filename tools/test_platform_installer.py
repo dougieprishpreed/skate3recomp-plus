@@ -140,6 +140,17 @@ int main(int argc, char** argv) {
                                 capture_output=True)
         self.assertEqual(result.returncode, 1)
 
+    @unittest.skipIf(sys.platform == 'win32', 'Unix permissions')
+    def test_program_copied_without_execute_permission_still_runs(self):
+        # Files copied through a Windows PC lose their execute bits.
+        helper = self.root / "helper copied from windows"
+        helper.write_text('#!/bin/sh\necho helper-ran\n')
+        helper.chmod(0o644)
+        log = self.root / 'helper.log'
+        subprocess.run([str(self.binary), str(helper), str(log)], check=True)
+        self.assertIn('helper-ran', log.read_text())
+        self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
+
 
 if __name__ == '__main__':
     unittest.main()

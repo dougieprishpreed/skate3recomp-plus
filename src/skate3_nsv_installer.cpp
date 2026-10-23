@@ -164,6 +164,8 @@ bool Prepare(const SetupInputs& input, const rex::PathConfig& paths,
       error = "The installer folder is missing. Extract the complete release package.";
       return false;
     }
+    // Python starts these itself; RunSetupProcess handles the interpreter.
+    for (const fs::path& tool : {media, media.parent_path() / "ffprobe", baker}) EnsureExecutable(tool);
     fs::create_directories(app / "install-state");
     scratch = app / "install-state" / ("nsv-" + std::to_string(std::random_device{}()));
     if (!fs::create_directory(scratch)) { error = "Unable to create installer scratch."; return false; }

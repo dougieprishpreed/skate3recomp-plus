@@ -624,6 +624,9 @@ class UpdateDialog final : public rex::ui::ImGuiDialog {
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
     ImGui::SetCursorScreenPos(point(90,392));
+    // The group keeps every following line at the panel's left edge; without it
+    // ImGui starts them at the full-screen window's edge.
+    ImGui::BeginGroup();
     ImGui::PushTextWrapPos(point(1186,0).x);
     const std::string current = updater::CurrentVersionDisplay();
     if (state_ == State::kAvailable) {
@@ -660,6 +663,7 @@ class UpdateDialog final : public rex::ui::ImGuiDialog {
       ImGui::TextColored(ImVec4(.66f,.75f,.80f,1), "%s", error_.c_str());
     }
     ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
     if (state_ == State::kInstalling) return;
     ImGui::SetCursorScreenPos(point(90,556));
     if (state_ == State::kAvailable) {

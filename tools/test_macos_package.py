@@ -80,6 +80,24 @@ class ReleaseLinks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'links a directory'):
                 package.remove_links(output, output / 'python3')
 
+    def test_archive_check_refuses_links_and_names_that_differ_only_by_case(self):
+        with tempfile.TemporaryDirectory(prefix="NSV names user's ") as tmp:
+            output = Path(tmp)
+            (output / 'E').mkdir()
+            (output / 'E/Eterm').write_text('a')
+            package.check_portable(output)
+            (output / 'link').symlink_to('E/Eterm')
+            with self.assertRaisesRegex(ValueError, 'must not contain links'):
+                package.check_portable(output)
+            (output / 'link').unlink()
+            try:
+                (output / 'e').mkdir()
+            except FileExistsError:
+                self.skipTest('This file system ignores case')
+            (output / 'e/eterm').write_text('b')
+            with self.assertRaisesRegex(ValueError, 'differ only by case'):
+                package.check_portable(output)
+
 
 class MacManifest(unittest.TestCase):
     def test_app_version_follows_generated_build_header(self):

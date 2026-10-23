@@ -55,10 +55,16 @@ def main():
     for name in ('ffmpeg', 'ffprobe'):
         copy(args.ffmpeg.with_name(name + suffix), out / 'media' / (name + suffix))
     # Preserve the supplied FFmpeg distribution's license/notice files.
+    supplied = set()
     for p in args.ffmpeg.parent.glob('*'):
         if p.is_file() and any(word in p.name.lower() for word in ('license', 'copying', 'notice')):
             copy(p, out / 'media' / p.name)
-    for flag, name in (('-L', 'LICENSE-ffmpeg.txt'), ('-version', 'BUILD-ffmpeg.txt')):
+            supplied.add(p.name.lower())
+    # Names that differ only by case collide on Windows, macOS and exFAT/NTFS drives
+    # (LICENSE-ffmpeg.txt once overwrote the build's LICENSE-FFmpeg.txt there).
+    for flag, name in (('-L', 'NOTICE-ffmpeg.txt'), ('-version', 'BUILD-ffmpeg.txt')):
+        if name.lower() in supplied:
+            raise ValueError(f'{name} would replace a supplied FFmpeg file')
         result = subprocess.run([str(args.ffmpeg), flag], capture_output=True, check=True)
         (out / 'media' / name).write_bytes(result.stdout + result.stderr)
 
