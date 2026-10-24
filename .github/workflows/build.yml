@@ -98,6 +98,9 @@ jobs:
           df -h .
           python -c "import os,platform; print(platform.platform()); print('CPUs',os.cpu_count())"
       - name: Check package diagnostics and native signing before the application build
+        # bash on every runner: Windows' default PowerShell reports only the last
+        # command's exit code, which hid a failing test (run 40035542235).
+        shell: bash
         run: |
           python tools/test_macos_package.py
           python tools/test_native_renderer_policies.py

@@ -48,9 +48,11 @@ class ReleaseLinks(unittest.TestCase):
             (python / 'bin/idle3.13').write_text('#!/bin/sh\n')
             (python / 'lib/libpython3.13.so.1.0').write_bytes(b'\0' * (package.LINK_COPY_LIMIT + 1))
             (python / 'share/terminfo/x/xterm').write_bytes(b'terminfo')
+            # Native separators: Windows cannot follow a link target written with
+            # '/', which then resolves outside the package from a short (8.3) temp path.
             for link, target in (('bin/python3', 'python3.13'), ('bin/python', 'python3.13'),
                                  ('bin/idle3', 'idle3.13'), ('lib/libpython3.13.so', 'libpython3.13.so.1.0'),
-                                 ('share/terminfo/a/ansi', '../x/xterm')):
+                                 ('share/terminfo/a/ansi', Path('..', 'x', 'xterm'))):
                 (python / link).symlink_to(target)
             with redirect_stdout(io.StringIO()):
                 package.remove_links(output, python / 'bin/python3')
@@ -86,7 +88,7 @@ class ReleaseLinks(unittest.TestCase):
             (output / 'E').mkdir()
             (output / 'E/Eterm').write_text('a')
             package.check_portable(output)
-            (output / 'link').symlink_to('E/Eterm')
+            (output / 'link').symlink_to(Path('E', 'Eterm'))
             with self.assertRaisesRegex(ValueError, 'must not contain links'):
                 package.check_portable(output)
             (output / 'link').unlink()
