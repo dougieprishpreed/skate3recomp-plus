@@ -34,6 +34,7 @@
 #include <rex/logging.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
+#include <rex/string/utf8.h>
 
 REXCVAR_DEFINE_BOOL(skate3_world_load_probe, false, "Skate 3",
                     "Log world loader configuration, state transitions and asset requests, "
@@ -461,8 +462,12 @@ void InstallOriginalLivingWorld(rex::filesystem::VirtualFileSystem* vfs,
   for (const char* relative : {"data\\content\\nsv_s2_vehicle", "data\\content\\nsv_s2_livingworld",
        "data\\content\\recipe\\nsv_s2_vehicle", "data\\content\\recipe\\nsv_s2_livingworld",
        "data\\audio\\nsv_s2_traffic", "data\\audio\\nsv_s2_speech"}) {
+    // Host check of a guest path: its backslashes are not separators on Linux/macOS,
+    // where the unconverted path never named the folder and every original actor
+    // install was refused.
     if (std::string_view(relative) == "data\\audio\\nsv_s2_speech" &&
-        !std::filesystem::is_directory(folder / "loose" / relative)) continue;
+        !std::filesystem::is_directory(folder / "loose" /
+                                       rex::string::utf8_fix_path_separators(relative))) continue;
     const std::string guest = "\\Device\\Harddisk0\\Partition1\\" + std::string(relative);
     if (!vfs->RegisterSymbolicLink(guest, "skate2lw:\\" + std::string(relative)) || !vfs->ResolvePath(guest)) {
       refuse("asset directory did not resolve: " + guest); return;
