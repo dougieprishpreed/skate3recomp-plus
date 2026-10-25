@@ -150,6 +150,99 @@ index d4c99fd..7d36bc4 100644
                                 uint32_t height, nrhi::Texture** guest_output_out);
  
  // Vulkan-only frame epilogue: ends any render pass still open in the frame
+diff --git a/include/rex/input/input.h b/include/rex/input/input.h
+index 450eb34..66208ed 100644
+--- a/include/rex/input/input.h
++++ b/include/rex/input/input.h
+@@ -10,6 +10,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <cstdint>
++
+ #include <rex/assert.h>
+ #include <rex/types.h>
+ 
+@@ -100,4 +103,57 @@ struct X_INPUT_KEYSTROKE {
+ };
+ static_assert_size(X_INPUT_KEYSTROKE, 8);
+ 
++// Only player 1 (user index 0) has a signed-in profile, so the device the
++// player uses must be player 1 whatever slot the host gives it. Windows
++// numbers XInput pads in connection order: a second pad, a virtual pad (Steam
++// Input, DS4Windows) or a reconnect can leave the player's pad in slot 2-4,
++// the game then asks whether that player is signed in and its sign-in prompt
++// loops. The first slot that presses a button becomes player 1 by swapping
++// with slot 1 for the session; player 1's device gone for kReleaseMs releases
++// the choice so the next device used takes over.
++class PlayerOneMap {
++ public:
++  static constexpr uint32_t kSlots = 4;
++  static constexpr uint64_t kReleaseMs = 2000;
++
++  // Host slot for a game player, and game player for a host slot (a swap).
++  uint32_t Map(uint32_t index) const {
++    const int slot = slot_.load(std::memory_order_acquire);
++    if (index >= kSlots || slot <= 0) return index;
++    if (index == 0) return uint32_t(slot);
++    return index == uint32_t(slot) ? 0 : index;
++  }
++  // The first host slot with a button down becomes player 1. True when this
++  // call made the choice.
++  bool ObserveButtons(uint32_t host, uint16_t buttons) {
++    if (!buttons || host >= kSlots || slot_.load(std::memory_order_acquire) >= 0) return false;
++    int expected = -1;
++    return slot_.compare_exchange_strong(expected, int(host), std::memory_order_acq_rel);
++  }
++  // Whether player 1's device answered this poll. True when this call
++  // released the choice after kReleaseMs without it.
++  bool ObservePlayerOneConnected(bool connected, uint64_t now_ms) {
++    if (slot_.load(std::memory_order_acquire) < 0) return false;
++    if (connected) {
++      lost_since_ms_.store(0, std::memory_order_relaxed);
++      return false;
++    }
++    const uint64_t since = lost_since_ms_.load(std::memory_order_relaxed);
++    if (!since) {
++      lost_since_ms_.store(now_ms ? now_ms : 1, std::memory_order_relaxed);
++      return false;
++    }
++    if (now_ms - since < kReleaseMs) return false;
++    lost_since_ms_.store(0, std::memory_order_relaxed);
++    slot_.store(-1, std::memory_order_release);
++    return true;
++  }
++  // Host slot of player 1's device, or -1 before any device was used.
++  int player_one_slot() const { return slot_.load(std::memory_order_acquire); }
++
++ private:
++  std::atomic<int> slot_{-1};
++  std::atomic<uint64_t> lost_since_ms_{0};
++};
++
+ }  // namespace rex::input
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 3b060a9..0c6a4d5 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -50,9 +50,16 @@ class InputSystem : public system::IInputSystem {
+   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
+ 
+  private:
++  // One host slot's state merged across drivers. any_connected counts every
++  // driver, device_connected only real devices (not the NOP fallback pad).
++  bool MergeHostState(uint32_t host, X_INPUT_STATE* merged, bool* any_connected,
++                      bool* device_connected);
++
+   rex::ui::Window* window_ = nullptr;
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
++  // Game player numbers -> host slots (see PlayerOneMap).
++  PlayerOneMap player_one_;
+   std::function<bool()> active_callback_ = nullptr;
+   std::function<void()> menu_chord_callback_ = nullptr;
+   bool menu_chord_down_ = false;
 diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
 index 5e4571d..acf486f 100644
 --- a/include/rex/input/sdl/sdl_input_driver.h
@@ -2312,6 +2405,152 @@ index 28fd5b0..cea6e92 100644
        height, guest_output_out);
  }
  
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index a1f41cc..0a46d0b 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -16,6 +16,7 @@
+ #include <string>
+ #include <string_view>
+ 
++#include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/input/flags.h>
+@@ -52,6 +53,9 @@ REXCVAR_DEFINE_STRING(menu_chord, "rb+start", "Input",
+                       "Controller chord that toggles the settings menu. Buttons joined by '+': "
+                       "a, b, x, y, lb, rb, l3, r3, back, start, dpad_up, dpad_down, dpad_left, "
+                       "dpad_right. Empty disables the chord.");
++REXCVAR_DEFINE_BOOL(hid_player_one_follows_first_input, true, "Input",
++                    "The first controller (or keyboard) used becomes player 1, the only player "
++                    "with a signed-in profile, whatever slot the host gives it");
+ REXCVAR_DEFINE_BOOL(hid_rumble_enabled, true, "Input", "Enable controller vibration");
+ REXCVAR_DEFINE_UINT32(hid_rumble_min_motor_speed, 0x1000, "Input",
+                       "Minimum XInput motor speed forwarded to host controllers")
+@@ -144,6 +148,9 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
+ 
++  if (REXCVAR_GET(hid_player_one_follows_first_input)) {
++    user_index = player_one_.Map(user_index);
++  }
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+     X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
+@@ -157,18 +164,19 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+ }
+ 
+-X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+-  SCOPE_profile_cpu_f("hid");
+-
+-  bool any_connected = false;
++bool InputSystem::MergeHostState(uint32_t host, X_INPUT_STATE* out_merged, bool* any_connected,
++                                 bool* device_connected) {
+   bool first_result = true;
+   X_INPUT_STATE merged = {};
+ 
+   for (auto& driver : drivers_) {
+     X_INPUT_STATE state = {};
+-    X_RESULT result = driver->GetState(user_index, &state);
++    X_RESULT result = driver->GetState(host, &state);
+     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+-      any_connected = true;
++      *any_connected = true;
++      if (!dynamic_cast<nop::NopInputDriver*>(driver.get())) {
++        *device_connected = true;
++      }
+     }
+     if (result == X_ERROR_SUCCESS) {
+       if (first_result) {
+@@ -198,8 +206,44 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+       }
+     }
+   }
++  *out_merged = merged;
++  return !first_result;
++}
++
++X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  SCOPE_profile_cpu_f("hid");
+ 
+-  if (first_result) {
++  const bool follow = REXCVAR_GET(hid_player_one_follows_first_input);
++  uint32_t host = follow ? player_one_.Map(user_index) : user_index;
++  bool any_connected = false;
++  bool device_connected = false;
++  X_INPUT_STATE merged = {};
++  bool have_state = MergeHostState(host, &merged, &any_connected, &device_connected);
++
++  if (follow && have_state && (!active_callback_ || active_callback_()) &&
++      player_one_.ObserveButtons(host, static_cast<uint16_t>(merged.gamepad.buttons))) {
++    if (host != 0) {
++      REXLOG_WARN(
++          "Input: the device in slot {} was used first and is now player 1 (slots 1 and {} "
++          "swapped); only player 1 has a signed-in profile",
++          host + 1, host + 1);
++      // This poll asked for the pressing device's old player number. Answer
++      // with slot 1's device instead, so the game never sees the press as
++      // that player's; its next player-1 poll reads the pressing device.
++      host = player_one_.Map(user_index);
++      merged = {};
++      any_connected = false;
++      device_connected = false;
++      have_state = MergeHostState(host, &merged, &any_connected, &device_connected);
++    }
++  }
++  if (follow && user_index == 0 &&
++      player_one_.ObservePlayerOneConnected(device_connected,
++                                            rex::chrono::Clock::QueryHostUptimeMillis())) {
++    REXLOG_WARN("Input: player 1's device disconnected; the next device used becomes player 1");
++  }
++
++  if (!have_state) {
+     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+@@ -273,6 +317,9 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+         filter_motor(static_cast<uint16_t>(vibration->right_motor_speed));
+   }
+ 
++  if (REXCVAR_GET(hid_player_one_follows_first_input)) {
++    user_index = player_one_.Map(user_index);
++  }
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+     X_RESULT result = driver->SetState(user_index, &filtered_vibration);
+@@ -290,13 +337,30 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
+ 
++  const bool follow = REXCVAR_GET(hid_player_one_follows_first_input);
++  const uint32_t host = follow ? player_one_.Map(user_index) : user_index;
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+-    X_RESULT result = driver->GetKeystroke(user_index, flags, out_keystroke);
++    X_RESULT result = driver->GetKeystroke(host, flags, out_keystroke);
+     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+       any_connected = true;
+     }
+     if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
++      if (follow && result == X_ERROR_SUCCESS && out_keystroke) {
++        // Drivers stamp the host slot; the game must see its player number.
++        const uint32_t slot = out_keystroke->user_index;
++        if ((static_cast<uint16_t>(out_keystroke->flags) & X_INPUT_KEYSTROKE_KEYDOWN) &&
++            (!active_callback_ || active_callback_()) && player_one_.ObserveButtons(slot, 1) &&
++            slot != 0) {
++          REXLOG_WARN(
++              "Input: the device in slot {} was used first and is now player 1 (slots 1 and {} "
++              "swapped); only player 1 has a signed-in profile",
++              slot + 1, slot + 1);
++        }
++        if (slot < PlayerOneMap::kSlots) {
++          out_keystroke->user_index = static_cast<uint8_t>(player_one_.Map(slot));
++        }
++      }
+       return result;
+     }
+   }
 diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
 index 99caf39..4169989 100644
 --- a/src/input/sdl/sdl_input_driver.cpp
@@ -2506,6 +2745,25 @@ index bfd3446..44a8ec6 100644
        auto old_value = kernel_state_->GetUserContext(user_index, context_id);
        kernel_state_->SetUserContext(user_index, context_id, context_value);
        rex::kernel::guest_presence::NotifyContext(user_index, context_id, context_value);
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 578533b..34a62dd 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -539,6 +539,14 @@ u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
+   // Showing sign-in is a system-UI operation. It should not imply that a local
+   // profile has signed in; titles observe the UI notification and then continue
+   // along their signed-out path.
++  // Only player 1 has a profile and nothing can sign one in here, so a title
++  // that keeps asking is being played from another player number.
++  static std::atomic<int> logged{0};
++  if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
++    REXLOG_WARN(
++        "XamShowSigninUI: the game asked to sign in a profile; only player 1 has one (the "
++        "first controller or keyboard used is player 1)");
++  }
+   kernel_state->BroadcastNotification(0x00000009, 1);
+   ++xam_dialogs_shown_;
+ 
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
 index 0c542aa..ef4437f 100644
 --- a/src/system/xmemory.cpp

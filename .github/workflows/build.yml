@@ -107,6 +107,7 @@ jobs:
           python tools/test_startup_and_voice.py
           python tools/test_actor_streaming_policies.py
           python tools/test_nsv_components.py
+          python tools/test_input_player_map.py
       - name: Compile, check installer tools and package (never launch the game)
         run: python tools/ci/run_build.py --platform ${{ matrix.platform }}
       - name: Upload verified packages only
