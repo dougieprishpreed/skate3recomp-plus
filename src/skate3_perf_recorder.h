@@ -111,6 +111,10 @@ enum class Activity : uint8_t {
 };
 void Count(Activity a, uint32_t amount = 1);
 void SetRenderPaused(bool paused);
+// Running totals since start and the current render pause, kept whether or
+// not the recorder runs (the actor history stores them with each frame).
+uint32_t ActivityTotal(Activity a);
+bool RenderPaused();
 
 // This thread's consumed CPU cycles (monotonic per thread; converted to time
 // at dump with the calibrated cycle rate). 0 where unsupported.

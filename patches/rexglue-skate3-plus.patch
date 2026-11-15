@@ -40,6 +40,89 @@ index 67064f8..009f0ee 100644
    rex::thread::Semaphore* semaphore_ = nullptr;
  
    SDL_AudioStream* sdl_stream_ = nullptr;
+diff --git a/include/rex/chrono/guest_tick_trace.h b/include/rex/chrono/guest_tick_trace.h
+new file mode 100644
+index 0000000..eaeb11a
+--- /dev/null
++++ b/include/rex/chrono/guest_tick_trace.h
+@@ -0,0 +1,77 @@
++/**
++ * @file        guest_tick_trace.h
++ * @brief       Diagnostic trace of the guest's timing: clock reads, waits, signals
++ *
++ * While enabled, every Clock::QueryGuestTickCount result (the guest's mftb
++ * reads) is kept with a number for its host thread and the code site that
++ * read it, in a bounded ring written lock-free. Kernel waits, signals and
++ * timers, and events a title adds itself, go into the same ring. Off by
++ * default. Kept out of clock.h, which every recompiled translation unit
++ * includes.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::chrono {
++
++enum GuestTimingKind : uint16_t {
++  kGuestTickRead = 0,    // site = code that read the clock
++  kGuestWaitBegin = 1,   // site = object (guest address or handle), arg = wait kind
++  kGuestWaitEnd = 2,     // site = object, arg = wait kind
++  kGuestSignal = 3,      // site = object, arg = signal kind
++  kGuestTimerSet = 4,    // site = timer handle, arg = period in ms
++  kGuestTitleEvent = 5,  // site and arg defined by the title
++};
++
++// Wait kinds (arg of kGuestWaitBegin / kGuestWaitEnd).
++enum : uint16_t {
++  kGuestWaitKeSingle = 1,
++  kGuestWaitNtSingle = 2,
++  kGuestWaitKeMultiple = 3,
++  kGuestWaitNtMultiple = 4,
++  kGuestWaitDelay = 5,  // site = the interval in microseconds
++  kGuestWaitSignalAndWait = 6,
++};
++
++// Signal kinds (arg of kGuestSignal).
++enum : uint16_t {
++  kGuestSignalKeSetEvent = 1,
++  kGuestSignalKePulseEvent = 2,
++  kGuestSignalNtSetEvent = 3,
++  kGuestSignalNtPulseEvent = 4,
++  kGuestSignalKeReleaseSemaphore = 5,
++  kGuestSignalNtReleaseSemaphore = 6,
++};
++
++struct GuestTickRead {
++  uint64_t ticks;
++  uint32_t thread;  // 1, 2, ... in order of each thread's first traced entry
++  uint32_t serial;  // low 32 bits of the entry's trace serial
++  uint32_t site;    // reads: code address relative to the main image
++  uint16_t kind;    // GuestTimingKind
++  uint16_t arg;
++};
++
++void SetGuestTickTrace(bool enabled);
++bool GuestTickTraceEnabled();
++// Number of entries traced so far (the serial the next entry gets).
++uint64_t GuestTickTraceSerial();
++// Copies the traced entries with serial >= from_serial still in the ring,
++// oldest first, at most max (the newest ones); returns how many.
++size_t CopyGuestTickTrace(uint64_t from_serial, GuestTickRead* out, size_t max);
++// Clock::QueryGuestTickCount without adding to the trace.
++uint64_t QueryGuestTickCountUntraced();
++
++// The main image relative address of a code address (trace sites).
++uint32_t GuestTickSiteOf(const void* code_address);
++// Site recorded for this thread's clock reads instead of the reader's own
++// return address (for reads behind a small wrapper: the wrapper's caller);
++// 0 = the return address again.
++void SetGuestTickSite(uint32_t site);
++// Adds a timing entry to the trace while it is on.
++void TraceGuestTimingEvent(uint16_t kind, uint32_t site, uint16_t arg);
++
++}  // namespace rex::chrono
 diff --git a/include/rex/graphics/native_rhi.h b/include/rex/graphics/native_rhi.h
 index d2bdcd4..4d1b9ae 100644
 --- a/include/rex/graphics/native_rhi.h
@@ -758,6 +841,156 @@ index 0e7cfce..7be6273 100644
 +}
 +
  }  // namespace rex::audio::sdl
+diff --git a/src/core/clock.cpp b/src/core/clock.cpp
+index ae72b7a..1ebbdd4 100644
+--- a/src/core/clock.cpp
++++ b/src/core/clock.cpp
+@@ -10,10 +10,13 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <limits>
++#include <memory>
+ #include <mutex>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/chrono/guest_tick_trace.h>
+ #include <rex/cvar.h>
+ #include <rex/math.h>
+ 
+@@ -155,11 +158,97 @@ void Clock::set_guest_system_time_base(uint64_t time_base) {
+   guest_system_time_base_ = time_base;
+ }
+ 
++namespace detail {
++uintptr_t MainImageBase();  // clock_win.cpp / clock_posix.cpp
++}  // namespace detail
++
++namespace {
++// ~3 s of the game's ~320k clock reads per second; 24 MiB, allocated on the
++// first enable.
++constexpr uint64_t kTickTraceSize = uint64_t(1) << 20;
++std::atomic<bool> tick_trace_enabled{false};
++std::atomic<uint64_t> tick_trace_next{0};
++std::atomic<uint32_t> tick_trace_threads{0};
++std::unique_ptr<GuestTickRead[]> tick_trace;  // allocated on first enable
++std::once_flag tick_trace_once;
++
++uint32_t TickTraceThread() {
++  // Plain integer, initialised on the thread's first traced read.
++  thread_local uint32_t id = tick_trace_threads.fetch_add(1, std::memory_order_relaxed) + 1;
++  return id;
++}
++
++thread_local uint32_t tick_trace_site = 0;  // SetGuestTickSite
++
++inline void TraceRecord(uint64_t ticks, uint32_t site, uint16_t kind, uint16_t arg) {
++  const uint64_t serial = tick_trace_next.fetch_add(1, std::memory_order_relaxed);
++  tick_trace[serial % kTickTraceSize] = {ticks, TickTraceThread(), static_cast<uint32_t>(serial),
++                                         site, kind, arg};
++}
++}  // namespace
++
++uint32_t GuestTickSiteOf(const void* code_address) {
++  static const uintptr_t base = detail::MainImageBase();
++  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(code_address) - base);
++}
++
++void SetGuestTickSite(uint32_t site) {
++  tick_trace_site = site;
++}
++
++void TraceGuestTimingEvent(uint16_t kind, uint32_t site, uint16_t arg) {
++  if (tick_trace_enabled.load(std::memory_order_acquire)) {
++    TraceRecord(UpdateGuestClock(), site, kind, arg);
++  }
++}
++
++bool GuestTickTraceEnabled() {
++  return tick_trace_enabled.load(std::memory_order_acquire);
++}
++
+ uint64_t Clock::QueryGuestTickCount() {
+   auto guest_tick_count = UpdateGuestClock();
++  if (tick_trace_enabled.load(std::memory_order_acquire)) {
++    // The return address is inside the recompiled function that read mftb
++    // (REX_QUERY_TIMEBASE calls straight into here).
++    const uint32_t site =
++        tick_trace_site != 0 ? tick_trace_site : GuestTickSiteOf(__builtin_return_address(0));
++    TraceRecord(guest_tick_count, site, kGuestTickRead, 0);
++  }
+   return guest_tick_count;
+ }
+ 
++uint64_t QueryGuestTickCountUntraced() {
++  return UpdateGuestClock();
++}
++
++void SetGuestTickTrace(bool enabled) {
++  if (enabled) {
++    std::call_once(tick_trace_once, [] { tick_trace.reset(new GuestTickRead[kTickTraceSize]()); });
++  }
++  tick_trace_enabled.store(enabled, std::memory_order_release);
++}
++
++uint64_t GuestTickTraceSerial() {
++  return tick_trace_next.load(std::memory_order_acquire);
++}
++
++size_t CopyGuestTickTrace(uint64_t from_serial, GuestTickRead* out, size_t max) {
++  if (!tick_trace) {
++    return 0;
++  }
++  const uint64_t end = tick_trace_next.load(std::memory_order_acquire);
++  uint64_t begin = std::max(from_serial, end > kTickTraceSize ? end - kTickTraceSize : 0);
++  if (end > begin && end - begin > max) {
++    begin = end - max;
++  }
++  size_t count = 0;
++  for (uint64_t serial = begin; serial < end; ++serial) {
++    out[count++] = tick_trace[serial % kTickTraceSize];
++  }
++  return count;
++}
++
+ uint64_t Clock::QueryGuestSystemTime() {
+   if (REXCVAR_GET(clock_no_scaling)) {
+     return Clock::QueryHostSystemTime();
+diff --git a/src/core/clock_posix.cpp b/src/core/clock_posix.cpp
+index 5365c53..5766480 100644
+--- a/src/core/clock_posix.cpp
++++ b/src/core/clock_posix.cpp
+@@ -16,6 +16,12 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ namespace rex::chrono {
+ 
++namespace detail {
++uintptr_t MainImageBase() {
++  return 0;  // trace sites stay absolute (low 32 bits)
++}
++}  // namespace detail
++
+ #if REX_PLATFORM_MAC
+ constexpr clockid_t kHostClock = CLOCK_MONOTONIC;
+ #else
+diff --git a/src/core/clock_win.cpp b/src/core/clock_win.cpp
+index 440f155..8f5bd63 100644
+--- a/src/core/clock_win.cpp
++++ b/src/core/clock_win.cpp
+@@ -15,6 +15,12 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ 
+ namespace rex::chrono {
+ 
++namespace detail {
++uintptr_t MainImageBase() {
++  return reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
++}
++}  // namespace detail
++
+ uint64_t Clock::host_tick_frequency_platform() {
+   LARGE_INTEGER frequency;
+   QueryPerformanceFrequency(&frequency);
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
 index 9d304be..7c9accf 100644
 --- a/src/core/cvar.cpp
@@ -2764,6 +2997,141 @@ index 578533b..34a62dd 100644
    kernel_state->BroadcastNotification(0x00000009, 1);
    ++xam_dialogs_shown_;
  
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index ab2afbc..8ea4a81 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/chrono/guest_tick_trace.h>
+ #include <rex/dbg.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+@@ -372,8 +373,24 @@ u32 KeQueryPerformanceFrequency_entry() {
+   return static_cast<uint32_t>(result);
+ }
+ 
++namespace {
++// Timing trace (rex/chrono/guest_tick_trace.h): when each guest thread blocks
++// and wakes, and on what.
++struct TracedWait {
++  TracedWait(uint32_t object, uint16_t kind) : object_(object), kind_(kind) {
++    chrono::TraceGuestTimingEvent(chrono::kGuestWaitBegin, object_, kind_);
++  }
++  ~TracedWait() { chrono::TraceGuestTimingEvent(chrono::kGuestWaitEnd, object_, kind_); }
++  uint32_t object_;
++  uint16_t kind_;
++};
++}  // namespace
++
+ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
+   XThread* thread = XThread::GetCurrentThread();
++  const int64_t interval_100ns = static_cast<int64_t>(static_cast<uint64_t>(*interval_ptr));
++  TracedWait traced(static_cast<uint32_t>((interval_100ns < 0 ? -interval_100ns : interval_100ns) / 10),
++                    chrono::kGuestWaitDelay);
+ 
+   if (alertable) {
+     thread->DeliverAPCs();
+@@ -472,10 +489,14 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, event_ptr.guest_address(),
++                                chrono::kGuestSignalKeSetEvent);
+   return xeKeSetEvent(event_ptr, increment, wait);
+ }
+ 
+ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, event_ptr.guest_address(),
++                                chrono::kGuestSignalKePulseEvent);
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -543,10 +564,12 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ }
+ 
+ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, handle, chrono::kGuestSignalNtSetEvent);
+   return xeNtSetEvent(handle, previous_state_ptr);
+ }
+ 
+ u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, handle, chrono::kGuestSignalNtPulseEvent);
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+@@ -612,6 +635,8 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
+ 
+ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
+                              u32 wait) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, semaphore_ptr.guest_address(),
++                                chrono::kGuestSignalKeReleaseSemaphore);
+   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
+ }
+ 
+@@ -654,6 +679,8 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
+ }
+ 
+ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, sem_handle,
++                                chrono::kGuestSignalNtReleaseSemaphore);
+   X_STATUS result = X_STATUS_SUCCESS;
+   int32_t previous_count = 0;
+ 
+@@ -786,6 +813,8 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
+   assert_true(unk_zero == 0);
+ 
+   uint64_t due_time = *due_time_ptr;
++  chrono::TraceGuestTimingEvent(chrono::kGuestTimerSet, timer_handle,
++                                static_cast<uint16_t>(std::min<uint32_t>(period_ms, 0xFFFF)));
+ 
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+@@ -838,6 +867,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++  TracedWait traced(object_ptr.guest_address(), chrono::kGuestWaitKeSingle);
+   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+   // timeout={}",
+   // object_ptr.guest_address(), (uint32_t)wait_reason,
+@@ -852,6 +882,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+                                   mapped_u64 timeout_ptr) {
+   X_STATUS result = X_STATUS_SUCCESS;
++  TracedWait traced(object_handle, chrono::kGuestWaitNtSingle);
+ 
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+@@ -871,6 +902,8 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
+                                    u32 wait_reason, u32 processor_mode, u32 alertable,
+                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
+   assert_true(wait_type <= 1);
++  TracedWait traced(count != 0 ? static_cast<uint32_t>(objects_ptr[0]) : 0u,
++                    chrono::kGuestWaitKeMultiple);
+ 
+   std::vector<object_ref<XObject>> objects;
+   for (uint32_t n = 0; n < count; n++) {
+@@ -919,6 +952,8 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
+                                      u32 alertable, mapped_u64 timeout_ptr) {
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++  TracedWait traced(count != 0 ? static_cast<uint32_t>(handles[0]) : 0u,
++                    chrono::kGuestWaitNtMultiple);
+   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
+                                       timeout_ptr ? &timeout : nullptr);
+ }
+@@ -926,6 +961,8 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
+ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
+                                            u32 r6, mapped_u64 timeout_ptr) {
+   X_STATUS result = X_STATUS_SUCCESS;
++  chrono::TraceGuestTimingEvent(chrono::kGuestSignal, signal_handle, chrono::kGuestSignalNtSetEvent);
++  TracedWait traced(wait_handle, chrono::kGuestWaitSignalAndWait);
+ 
+   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
+   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
 index 0c542aa..ef4437f 100644
 --- a/src/system/xmemory.cpp
@@ -2804,6 +3172,55 @@ index 0c542aa..ef4437f 100644
  int Memory::MapViews(uint8_t* mapping_base) {
    assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
  
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index e60111b..4369788 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -36,8 +36,10 @@
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ 
+-REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+-                    "Ignores game-specified thread priorities");
++REXCVAR_DEFINE_BOOL(ignore_thread_priorities, false, "Kernel",
++                    "Ignores game-specified thread priorities (Skate 3 raises its audio, "
++                    "streaming and file threads; ignoring that leaves them at normal "
++                    "priority against background load)");
+ 
+ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
+                     "Ignores game-specified thread affinities");
+@@ -828,21 +830,28 @@ void XThread::SetPriority(int32_t increment) {
+   // sets its RwAudioCore Dac audio thread to 16 - flattening that to host
+   // normal made it lose its ~5ms deadline against the emulation threads,
+   // which surfaced as silent-block audio crackle).
++  // (+2 is highest, as the comment says: Skate 3's simulation tick loop and
++  // file threads ask +2; mapped to above normal they woke late under load.)
+   int32_t target_priority = 0;
+-  if (increment >= 15) {
++  if (increment >= 2) {
+     target_priority = rex::thread::ThreadPriority::kHighest;
+   } else if (increment >= 1) {
+     target_priority = rex::thread::ThreadPriority::kAboveNormal;
+-  } else if (increment <= -15) {
++  } else if (increment <= -2) {
+     target_priority = rex::thread::ThreadPriority::kLowest;
+   } else if (increment <= -1) {
+     target_priority = rex::thread::ThreadPriority::kBelowNormal;
+   } else {
+     target_priority = rex::thread::ThreadPriority::kNormal;
+   }
+-  if (!REXCVAR_GET(ignore_thread_priorities)) {
++  const bool apply = !REXCVAR_GET(ignore_thread_priorities);
++  if (apply) {
+     thread_->set_priority(target_priority);
+   }
++  if (increment != 0) {
++    REXSYS_INFO("thread {} asks for priority {:+d} -> host {} ({})", thread_name_, increment,
++                target_priority, apply ? "applied" : "ignored: ignore_thread_priorities");
++  }
+ }
+ 
+ void XThread::SetAffinity(uint32_t affinity) {
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
 index 146c021..59a85d3 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp

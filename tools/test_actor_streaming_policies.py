@@ -142,15 +142,22 @@ extern bool skate3_actor_history_capture;
 bool skate3_native_render_scene_smooth_entities=true,skate3_native_render_scene_smooth_camera=true;
 int main(){
  using namespace skate3::actor_history;skate3::native_scene::FrameScene f;f.items.push_back({});
- for(int j=0;j<49;++j){auto part=f.items[0];part.ctx=100+j;part.mesh=1000+j;part.bones[3]=10000.f+j*100;f.items.push_back(part);}
- Request();Begin(nullptr,f,0,0);End(f,0,false);assert(!std::filesystem::exists("logs"));
+ float view[16]{};for(int k=0;k<16;++k)view[k]=float(k)+.5f;
+ // Far parts alternate sides: nearest to the camera (x=5000) differs from nearest to the origin.
+ for(int j=0;j<49;++j){auto part=f.items[0];part.ctx=100+j;part.mesh=1000+j;part.bones[3]=(j%2?-1.f:1.f)*(10000.f+j*100);f.items.push_back(part);}
+ Request();Begin(nullptr,f,0,0);Camera(f,view,0);CameraSample(0,view,view,1,7,8);End(f,0,false,{});
+ assert(!std::filesystem::exists("logs"));
  skate3_actor_history_capture=true;
  for(int i=0;i<1400;++i){
-  if(i==650)f.world_identity=4;
-  f.generation=i;f.items[0].bones[3]=float(i);Begin(nullptr,f,double(i)/60,i);
-  Retime(f.items[0],99,7,1./60,double(i)/60-.02);f.items[0].bones[3]+=.25f;
+  if(i==100)f.world_identity=4;
+  // Begin runs before the build reads the game's camera (cam_pos still zero).
+  f.generation=i;f.items[0].bones[3]=float(i);f.cam_pos[0]=0;Begin(nullptr,f,double(i)/60,i);
+  f.cam_pos[0]=5000;Camera(f,view,double(i)/60-.001);CameraSample(double(i)/60-.005,view,view,1+(i&1),1000+i,50+i);
+  Retime(f.items[0],99,7,1./60,double(i)/60-.02);Note(f.items[0],kPartReset,12.5f);f.items[0].bones[3]+=.25f;
   auto fill=f.items[0];fill.ctx=20;fill.mesh=6;fill.dbg_src=12;f.items.push_back(fill);
-  if(i==1399)Request();End(f,double(i)/60-.01,true);f.items.pop_back();
+  FrameState state;state.camera_events=kCameraSmoothed|(i==1300?kCameraClockSnap:0);
+  state.render_paused=i==1300;state.stream_loads=i/100;
+  if(i==1399)Request();End(f,double(i)/60-.01,true,state);f.items.pop_back();
  }
  Shutdown();
 }
@@ -161,42 +168,74 @@ int main(){
             binary = binaries[0]
             schema = json.loads(binary.with_suffix('.json').read_text())
             data = binary.read_bytes()
-            self.assertEqual(data[:8], b'S3ACT219')
+            self.assertEqual(data[:8], b'S3ACT234')
+            self.assertEqual(schema['version'], 234)
             count, frame_size, actor_size, pose_size = struct.unpack_from('<4I', data, 8)
-            self.assertEqual(len(data), 24 + count * frame_size)
+            cams, reads = schema['camera_samples'], schema['tick_reads']
+            # Timing trace entries: clock reads with their code site, waits, signals, title events.
+            self.assertEqual(reads['size'], 24)
+            self.assertEqual(reads['fields'], {'ticks': 0, 'thread': 8, 'serial': 12, 'site': 16, 'kind': 20, 'arg': 22})
+            self.assertEqual(reads['kinds']['title'], 5)
+            self.assertEqual(reads['title_events']['pace_end'], 5)
+            self.assertEqual(cams['offset'], 24 + count * frame_size)
+            self.assertEqual(len(data), cams['offset'] + cams['count'] * cams['size'] + reads['count'] * reads['size'])
+            # Every frame's camera sample within the saved window (plus half a second before it), in order.
+            self.assertGreaterEqual(cams['count'], count)
+            sample = cams['offset']
+            first_t, = struct.unpack_from('<d', data, sample + cams['fields']['t'])
+            ticks, = struct.unpack_from('<Q', data, sample + cams['fields']['guest_ticks'])
+            source, = struct.unpack_from('<I', data, sample + cams['fields']['source'])
+            self.assertEqual(ticks, 1000 + round((first_t + .005) * 60))
+            self.assertEqual(source, 1 + (ticks - 1000) % 2)
+            self.assertEqual(struct.unpack_from('<f', data, sample + cams['fields']['view'] + 4)[0], 1.5)
             self.assertLessEqual(count, 2048)
             self.assertLessEqual(frame_size * 2048, 128 * 1024 * 1024)
             first_time = last_time = None
+            frame = schema['frame']; actor = schema['actor']; pose = schema['pose']
+            def u32(at): return struct.unpack_from('<I', data, at)[0]
+            def f32(at): return struct.unpack_from('<f', data, at)[0]
             for i in range(count):
                 at = 24 + i * frame_size
-                frame = schema['frame']; actor = schema['actor']; pose = schema['pose']
                 world, = struct.unpack_from('<Q', data, at + frame['world'])
                 self.assertEqual(world, 4)
                 t, = struct.unpack_from('<d', data, at + frame['time'])
+                generation, = struct.unpack_from('<Q', data, at + frame['generation'])
                 if first_time is None: first_time = t
                 last_time = t
-                n, = struct.unpack_from('<I', data, at + frame['count'])
+                n = u32(at + frame['count'])
                 self.assertEqual(n, 48)
+                # The game's camera, read after Begin, is the raw camera and the selection centre.
+                self.assertEqual((f32(at + frame['raw_camera']), f32(at + frame['final_camera'])), (5000, 5000))
+                self.assertEqual(u32(at + frame['camera_events']), 65 if generation == 1300 else 1)
+                self.assertEqual(u32(at + frame['render_paused']), int(generation == 1300))
+                self.assertEqual(u32(at + frame['stream_loads']), generation // 100)
+                view_t, = struct.unpack_from('<d', data, at + frame['raw_view_t'])
+                self.assertAlmostEqual(view_t, generation / 60 - .001)
+                self.assertEqual(f32(at + frame['raw_view'] + 8), 2.5)
                 a = at + frame['actors']
-                raw, = struct.unpack_from('<f', data, a + actor['raw'] + pose['bones'] + 12)
-                final, = struct.unpack_from('<f', data, a + actor['final'] + pose['bones'] + 12)
+                parts = {u32(a + k * actor_size + actor['ctx']): a + k * actor_size for k in range(n)}
+                self.assertIn(148, parts)  # nearest the camera, not the origin
+                self.assertNotIn(147, parts)
+                self.assertNotIn(145, parts)
+                body = parts[10]
+                raw = f32(body + actor['raw'] + pose['bones'] + 12)
+                final = f32(body + actor['final'] + pose['bones'] + 12)
                 self.assertAlmostEqual(final - raw, .25)
-                key, = struct.unpack_from('<Q', data, a + actor['history_key'])
+                key, = struct.unpack_from('<Q', data, body + actor['history_key'])
                 self.assertEqual(key, 99)
-                fills=[]
-                for part in range(n):
-                    loc=a+part*actor_size
-                    ctx,=struct.unpack_from('<I',data,loc+actor['ctx'])
-                    if ctx==20:fills.append(loc)
-                self.assertEqual(len(fills),1)
-                raw_present,=struct.unpack_from('<I',data,fills[0]+actor['raw']+pose['present'])
-                final_present,=struct.unpack_from('<I',data,fills[0]+actor['final']+pose['present'])
-                self.assertEqual((raw_present,final_present),(0,1))
-            self.assertLessEqual(last_time - first_time, 8.00001)
-            self.assertGreater(last_time - first_time, 7.9)
+                self.assertEqual(u32(body + actor['events']), 1 | 16)
+                self.assertEqual(f32(body + actor['age_ms']), 12.5)
+                fill = parts[20]
+                self.assertEqual((u32(fill + actor['raw'] + pose['present']), u32(fill + actor['final'] + pose['present'])), (0, 1))
+            self.assertLessEqual(last_time - first_time, 20.00001)
+            self.assertGreater(last_time - first_time, 19.9)
             parsed = subprocess.run([shutil.which('python') or 'python', str(ROOT / 'tools/analyze_actor_history.py'), str(binary), '--top', '2'], capture_output=True, text=True, check=True)
-            self.assertEqual(json.loads(parsed.stdout)['parts'], count*48)
-            print('PASS actual recorder: disabled does no I/O, prior8 seconds, epoch reset, raw/final/history keys, final-only gap fills/nearest48 cap, bounded storage, asynchronous binary/schema roundtrip')
+            summary = json.loads(parsed.stdout)
+            self.assertEqual(summary['parts'], count*48)
+            self.assertEqual([e['generation'] for e in summary['camera_events']], [1300])
+            print('PASS actual recorder: disabled does no I/O, prior 20 seconds, epoch reset, raw camera selects nearest48, '
+                  'raw/final/history keys, part and camera events, final-only gap fills, bounded storage, '
+                  'asynchronous binary/schema roundtrip')
 
 
 if __name__ == '__main__':

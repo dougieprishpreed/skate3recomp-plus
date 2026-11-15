@@ -309,6 +309,7 @@ struct StackSample {
 Ring<StackSample, 131072> g_prof;  // ~85 s at 1.5 kHz
 
 std::atomic<uint32_t> g_activity[size_t(Activity::kCount)] = {};
+std::atomic<uint32_t> g_activity_total[size_t(Activity::kCount)] = {};
 std::atomic<bool> g_render_paused{false};
 std::atomic<int64_t> g_manual_press_us{0};
 constexpr int64_t kManualCaptureUs = 6'000'000;
@@ -834,11 +835,18 @@ void OnRenderFrame(const RenderRecord& rec) {
 
 void Count(Activity a, uint32_t amount) {
   g_activity[size_t(a)].fetch_add(amount, std::memory_order_relaxed);
+  g_activity_total[size_t(a)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 void SetRenderPaused(bool paused) {
   g_render_paused.store(paused, std::memory_order_relaxed);
 }
+
+uint32_t ActivityTotal(Activity a) {
+  return g_activity_total[size_t(a)].load(std::memory_order_relaxed);
+}
+
+bool RenderPaused() { return g_render_paused.load(std::memory_order_relaxed); }
 
 void RequestCapture() {
   const int64_t now = NowUs();

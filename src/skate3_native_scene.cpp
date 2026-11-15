@@ -8,6 +8,7 @@
 // skate3_native_scene_state.h.
 
 #include "skate3_native_scene.h"
+#include "skate3_native_render.h"
 #include "skate3_freecam_input.h"
 #include "native/skate3_native_scene_capacity.h"
 #include "native/skate3_native_world_item_storage.h"
@@ -40,6 +41,8 @@
 #include <windows.h>
 #endif
 
+#include <rex/chrono/clock.h>
+#include <rex/chrono/guest_tick_trace.h>
 #include <rex/cvar.h>
 #include "native/skate3_native_performance.h"
 #include <rex/graphics/native_guest_renderer.h>
@@ -1220,6 +1223,13 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_smooth_camera, true, "Skate 3",
                     "Interpolates between the last two distinct guest poses, one "
                     "sim-interval behind (a few ms of added camera latency, no "
                     "overshoot). Teleports/cuts snap.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(
+    skate3_uneven_step_captures, 6, "Skate 3",
+    "Timing research, with skate3_actor_history_capture on: how many actor "
+    "history captures a session saves by itself ~1 s after the camera shows an "
+    "uneven simulation step (at most one per 20 s; 0 = none).")
+    .range(0, 20)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(
     skate3_native_render_scene_smooth_camera_filter_ms, 50.0, "Skate 3",
@@ -7535,6 +7545,10 @@ bool g_smooth_active = false;
 // from its lag target after this frame's update and the camera tick estimate.
 float g_smooth_err_ms = 0.0f;
 float g_smooth_period_ms = 0.0f;
+// Actor history (skate3_actor_history_capture): this frame's smoothing events
+// (actor_history::CameraEvent bits) and the newest ring sample's age.
+uint32_t g_smooth_events = 0;
+float g_smooth_age_ms = -1.0f;
 void GetSmoothingTelemetry(float* err_ms, float* period_ms) {
   *err_ms = g_smooth_err_ms;
   *period_ms = g_smooth_period_ms;
@@ -7778,6 +7792,155 @@ std::mutex g_cam_samples_mutex;
 std::vector<RawCamSample> g_cam_samples;  // pending; drained by SmoothCamera
 std::atomic<bool> g_cam_sampler_started{false};
 std::atomic<uint64_t> g_cam_sampler_pushes{0};  // telemetry
+// Host time of the last main-camera sample taken in SetViewMatrix (see
+// OnMainCameraSet); the polling sampler only fills in while none arrives.
+std::atomic<double> g_cam_source_t{0.0};
+
+// One sample from the ViewCamera's stored view (+0x20) and projection (+0x60),
+// if it passes the sanity gate: perspective proj + a plausible rotation row
+// (stale viewcam addresses after a map change read garbage until
+// re-published).
+bool ToCamSample(const uint32_t raw[32], double t, RawCamSample& s) {
+  s.t = t;
+  for (int i = 0; i < 16; ++i) {
+    s.view[i] = std::bit_cast<float>(__builtin_bswap32(raw[i]));
+    s.proj[i] = std::bit_cast<float>(__builtin_bswap32(raw[16 + i]));
+  }
+  const float r0n = s.view[0] * s.view[0] + s.view[1] * s.view[1] +
+                    s.view[2] * s.view[2];
+  return s.proj[2 * 4 + 3] == 1.0f && r0n >= 0.9f && r0n <= 1.1f;
+}
+
+void PushCamSample(const RawCamSample& s) {
+  // Camera-signal recorder: every pose the smoother receives, with its
+  // host timestamp (kind 0).
+  if (s.t < g_camsig_deadline.load(std::memory_order_relaxed)) {
+    CamSigPush(s.t, 0.0, YawFromViewRows(s.view), 0);
+  }
+  // Every update arrives (unchanged ones too, keeping the ring fresh while the
+  // camera stands still); when nothing drains them (loading), keep the newest.
+  std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
+  if (g_cam_samples.size() >= 256) {
+    g_cam_samples.erase(g_cam_samples.begin(), g_cam_samples.begin() + 128);
+  }
+  g_cam_samples.push_back(s);
+  g_cam_sampler_pushes.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Called by the ViewCamera::SetViewMatrix override (bottom of this file)
+// right after the game stored the main camera, on the game's own thread: the
+// camera exactly as and when the game set it. The polling sampler could read
+// that memory partway through an update (a thread paused mid-write under load:
+// the new rotation with the old translation, metres off at New San Van's
+// distances from the origin; see SmoothCamera) and stamped what it saw up to
+// its polling interval late.
+// Uneven simulation steps, counted from the main camera's updates while the
+// actor history capture (and with it the guest timing trace) is on: a frame
+// with no movement while the camera was moving, or about twice the usual
+// step. The camera and the actors skip or double a 60 Hz step together
+// (log233 run 3, 73% of moving actors in the same frames), with the camera
+// set on time; logged every 30 s as a before/after meter. The timing trace
+// only holds ~3 s, so a capture is also saved ~1 s after the first uneven step
+// of a cluster (at most every 20 s, kMaxCaptures a session).
+void CountUnevenSteps(const RawCamSample& s) {
+  constexpr double kReportS = 30.0, kCaptureDelayS = 1.0, kCaptureGapS = 20.0;
+  const int kMaxCaptures = REXCVAR_GET(skate3_uneven_step_captures);
+  static double capture_at = 0.0, last_capture = -1e9;
+  static int captures = 0;
+  static std::mutex mutex;
+  static float last[3] = {}, steps[4] = {};
+  static int nsteps = 0;
+  static bool have_last = false;
+  static double last_report = 0.0;
+  static uint32_t odd_count = 0, moving_count = 0;
+  std::lock_guard<std::mutex> lock(mutex);
+  float c[3];
+  for (int j = 0; j < 3; ++j) {
+    c[j] = -(s.view[12] * s.view[j * 4 + 0] + s.view[13] * s.view[j * 4 + 1] +
+             s.view[14] * s.view[j * 4 + 2]);
+  }
+  if (last_report == 0.0) last_report = s.t;
+  if (have_last) {
+    const float dx = c[0] - last[0], dy = c[1] - last[1], dz = c[2] - last[2];
+    const float step = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (nsteps == 4) {
+      float sorted[4];
+      std::copy_n(steps, 4, sorted);
+      std::sort(sorted, sorted + 4);
+      const float usual = 0.5f * (sorted[1] + sorted[2]);
+      if (usual > 0.01f) {  // moving (over ~0.6 m/s)
+        ++moving_count;
+        // No step, or about two; past 3x is a cut, not a doubled step.
+        if (step < 0.1f * usual || (step > 1.8f * usual && step < 3.0f * usual)) {
+          ++odd_count;
+          skate3::native_render::NoteUnevenStep();  // adaptive smoothing trigger
+          if (!rex::chrono::GuestTickTraceEnabled()) {
+            // Research captures and the meter only with the timing trace on.
+          } else if (capture_at == 0.0 && captures < kMaxCaptures &&
+                     s.t - last_capture > kCaptureGapS) {
+            capture_at = s.t + kCaptureDelayS;
+          }
+        }
+      }
+      std::copy(steps + 1, steps + 4, steps);
+      steps[3] = step;
+    } else {
+      steps[nsteps++] = step;
+    }
+  }
+  std::copy_n(c, 3, last);
+  have_last = true;
+  if (capture_at != 0.0 && s.t >= capture_at) {
+    capture_at = 0.0;
+    last_capture = s.t;
+    ++captures;
+    REXLOG_INFO("uneven-steps: saving a timing capture ({} of {})", captures, kMaxCaptures);
+    skate3::actor_history::Request();
+  }
+  if (s.t - last_report >= kReportS) {
+    if (rex::chrono::GuestTickTraceEnabled()) {
+      REXLOG_INFO("uneven-steps: last {:.0f} s: {} of {} moving camera updates had no step or two",
+                  s.t - last_report, odd_count, moving_count);
+    }
+    odd_count = moving_count = 0;
+    last_report = s.t;
+  }
+}
+
+void OnMainCameraSet(uint8_t* base, uint32_t cam) {
+  if (g_synpan_active.load(std::memory_order_relaxed) == 3) {
+    return;  // synthetic pan: the sampler feeds generated poses
+  }
+  uint32_t raw[32];
+  if (!GuestTryCopy(raw, base + cam + 0x20, sizeof(raw))) {
+    return;
+  }
+  RawCamSample s;
+  if (!ToCamSample(raw, std::chrono::duration<double>(PerfClock::now().time_since_epoch()).count(),
+                   s)) {
+    return;
+  }
+  g_cam_source_t.store(s.t, std::memory_order_relaxed);
+  // The simulation tick count (the tick loop's global, +72; see SimTickWait):
+  // with the camera's step, whether a still frame missed a tick or showed one.
+  uint32_t sim_ticks = 0;
+  {
+    uint32_t sim_obj = 0;
+    if (GuestTryCopy(&sim_obj, base + 0x830842F4u, sizeof(sim_obj))) {
+      sim_obj = __builtin_bswap32(sim_obj);
+      if (sim_obj != 0 && GuestTryCopy(&sim_ticks, base + sim_obj + 72, sizeof(sim_ticks))) {
+        sim_ticks = __builtin_bswap32(sim_ticks);
+      }
+    }
+  }
+  rex::chrono::TraceGuestTimingEvent(rex::chrono::kGuestTitleEvent, sim_ticks,
+                                     skate3::actor_history::kTitleCameraSet);
+  CountUnevenSteps(s);
+  skate3::actor_history::CameraSample(s.t, s.view, s.proj, 1,
+                                      rex::chrono::QueryGuestTickCountUntraced(),
+                                      rex::chrono::GuestTickTraceSerial());
+  PushCamSample(s);
+}
 
 void CamSamplerLoop() {
   skate3::perf_recorder::NameCurrentThread("Native camera sampler");
@@ -7832,6 +7995,13 @@ void CamSamplerLoop() {
     if (vc == 0 || base == nullptr) {
       continue;
     }
+    // SetViewMatrix delivers the main camera itself; poll only while it does not.
+    const double now = std::chrono::duration<double>(
+                           PerfClock::now().time_since_epoch())
+                           .count();
+    if (now - g_cam_source_t.load(std::memory_order_relaxed) < 0.1) {
+      continue;
+    }
     // view at +0x20, proj at +0x60: one 128-byte guarded copy covers both.
     uint32_t raw_a[32], raw_b[32];
     if (!GuestTryCopy(raw_a, base + vc + 0x20, sizeof(raw_a)) ||
@@ -7839,36 +8009,18 @@ void CamSamplerLoop() {
         std::memcmp(raw_a, raw_b, sizeof(raw_a)) != 0) {
       continue;  // unreadable or torn mid-write: try again next tick
     }
-    const double now = std::chrono::duration<double>(
-                           PerfClock::now().time_since_epoch())
-                           .count();
     RawCamSample s;
-    s.t = now;
-    for (int i = 0; i < 16; ++i) {
-      s.view[i] = std::bit_cast<float>(__builtin_bswap32(raw_a[i]));
-      s.proj[i] = std::bit_cast<float>(__builtin_bswap32(raw_a[16 + i]));
-    }
-    // Sanity: perspective proj + a plausible rotation row (stale viewcam
-    // addresses after a map change read garbage until re-published).
-    const float r0n = s.view[0] * s.view[0] + s.view[1] * s.view[1] +
-                      s.view[2] * s.view[2];
-    if (s.proj[2 * 4 + 3] != 1.0f || r0n < 0.9f || r0n > 1.1f) {
+    if (!ToCamSample(raw_a, now, s)) {
       continue;
     }
     if (std::memcmp(last_view, s.view, sizeof(last_view)) == 0) {
       continue;  // pose unchanged
     }
     std::memcpy(last_view, s.view, sizeof(last_view));
-    // Camera-signal recorder: every DISTINCT pose the guest produced, with
-    // the sampler's precise host timestamp (kind 0).
-    if (now < g_camsig_deadline.load(std::memory_order_relaxed)) {
-      CamSigPush(now, 0.0, YawFromViewRows(s.view), 0);
-    }
-    std::lock_guard<std::mutex> lock(g_cam_samples_mutex);
-    if (g_cam_samples.size() < 256) {
-      g_cam_samples.push_back(s);
-      g_cam_sampler_pushes.fetch_add(1, std::memory_order_relaxed);
-    }
+    skate3::actor_history::CameraSample(s.t, s.view, s.proj, 2,
+                                        rex::chrono::QueryGuestTickCountUntraced(),
+                                        rex::chrono::GuestTickTraceSerial());
+    PushCamSample(s);
   }
 }
 
@@ -8200,6 +8352,10 @@ bool LoadingOrFrontendActive() {
 // their pose rings with it instead of the frame time avoids the same
 // aliasing. See the frame camera in SmoothCamera.
 double g_latest_cam_tick = 0.0;
+// Share of the full smoothing delay and filter applied this frame (0 = the
+// game's own frame, 1 = full; skate3::native_render::MotionSmoothingScale),
+// shared by the camera (SmoothCamera) and the actors (InterpolateDynamicItems).
+double g_smooth_scale = 1.0;
 
 // `view` is this frame's camera as the build read it from guest memory at
 // host time `view_t`.
@@ -8222,34 +8378,212 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   static double s_built_t[kBuilt] = {};
   static int s_built_next = 0;
 
+  // Camera states the game never renders: the sampler can read the
+  // ViewCamera partway through a sim camera update (log233 captures, New San
+  // Van under load: one sample metres off, position only, for ~10 ms). The
+  // boxcar below spread it into a 0.4-0.8 m camera bump for exactly its 50 ms
+  // window, seen as the world or the close-up skater "glitching". The
+  // double-read guard in CamSamplerLoop only rejects a write in progress
+  // during the copy. A real camera sample lies on the camera's route, so a
+  // new sample off the line of the two before it is marked suspect: playback
+  // does not use it, and the next sample decides, dropping it when it lies
+  // off the route between its neighbours (or it stands after kConfirmS: the
+  // camera stopped after a turn). Only a suspect sample is ever judged; a
+  // stray arriving after a good sample must not get the good one dropped. A
+  // jump/turn that would restart the ring waits for one more sample (at most
+  // kCutHoldS) to tell a real cut from a stray state. The tests are spatial,
+  // never against sample TIMES: a late sim runs its updates in bursts (the
+  // Dam, log233 run 2), so real samples arrive 1 ms apart a whole tick further
+  // along the route; a time-based check dropped those and jerked the camera.
+  constexpr float kOffPathM = 0.1f;   // a route's curvature between neighbours: < 4 cm
+  constexpr float kOffPathQ = 0.0175f;  // 4D quaternion distance: ~2 degrees
+  // Both grow by this share of the distance the samples span, so a speed
+  // glitch's metres-long steps keep their curves (sagitta grows with length).
+  constexpr float kOffPathShare = 0.05f;
+  // A step past the 5 m cut limit that continues along the camera's route is
+  // motion (speed glitches move several metres per game update), up to this
+  // and up to kMaxStepGrowth times the step before it plus a metre (a catch-up
+  // burst carries two or three updates; a teleport is hundreds of steps).
+  constexpr float kMaxStepM = 50.0f;
+  constexpr float kMaxStepGrowth = 4.0f;
+  // A turn past 30 degrees in one update is a cut (the game snaps; log233 run
+  // 3 respawns snapped 34 degrees and were swooped through over 50 ms). Fast
+  // pans turn ~6 degrees per update. Quaternion dot: cos(15 degrees).
+  constexpr float kCutTurnDot = 0.9659f;
+  // Long enough for a sim update two ticks late at 60 Hz (the stray's own
+  // follow-up sample is that late), short of the 100 ms staleness cut-off.
+  constexpr double kCutHoldS = 0.06;
+  constexpr double kConfirmS = 0.06;
+  // Distance of x from the segment a-b (or the whole line through them).
+  const auto off_line = [](const float* a, const float* b, const float* x, int n, bool segment) {
+    double ab2 = 0.0, along = 0.0;
+    for (int k = 0; k < n; ++k) {
+      ab2 += double(b[k] - a[k]) * (b[k] - a[k]);
+      along += double(x[k] - a[k]) * (b[k] - a[k]);
+    }
+    double w = ab2 > 1e-12 ? along / ab2 : 0.0;
+    if (segment) w = std::clamp(w, 0.0, 1.0);
+    double d2 = 0.0;
+    for (int k = 0; k < n; ++k) {
+      const double e = x[k] - (a[k] + (b[k] - a[k]) * w);
+      d2 += e * e;
+    }
+    return std::sqrt(d2);
+  };
+  // How far `mid` is off the route from a to b: metres and quaternion distance.
+  const auto off_route = [&](const CamPose& a, const CamPose& mid, const CamPose& b, bool segment,
+                             float* metres, float* turn) {
+    float qa[4], qb[4];
+    const float sa = a.q[0] * mid.q[0] + a.q[1] * mid.q[1] + a.q[2] * mid.q[2] + a.q[3] * mid.q[3];
+    const float sb = b.q[0] * mid.q[0] + b.q[1] * mid.q[1] + b.q[2] * mid.q[2] + b.q[3] * mid.q[3];
+    for (int k = 0; k < 4; ++k) {
+      qa[k] = sa < 0.0f ? -a.q[k] : a.q[k];
+      qb[k] = sb < 0.0f ? -b.q[k] : b.q[k];
+    }
+    *metres = float(off_line(a.c, b.c, mid.c, 3, segment));
+    *turn = float(off_line(qa, qb, mid.q, 4, segment));
+    const auto dist = [](const float* u, const float* v, int n) {
+      double d2 = 0.0;
+      for (int k = 0; k < n; ++k) d2 += double(u[k] - v[k]) * (u[k] - v[k]);
+      return float(std::sqrt(d2));
+    };
+    const float span = dist(a.c, b.c, 3) + dist(mid.c, b.c, 3);
+    const float qspan = dist(qa, qb, 4) + dist(mid.q, qb, 4);
+    return *metres > kOffPathM + kOffPathShare * span ||
+           *turn > kOffPathQ + kOffPathShare * qspan;
+  };
+  static bool s_newest_suspect = false;
+  static bool s_cut_pending = false;
+  static CamPose s_cut;
+  static float s_cut_view[16];
+  static uint64_t s_off_path = 0;
+  // Why moving from a to b would restart the ring (0: it would not). `before`
+  // (the sample ahead of a, if any) gives the route for the speed rule.
+  const auto cut_reason = [&](const CamPose* before, const CamPose& a,
+                              const CamPose& b) -> uint32_t {
+    const float dot = std::fabs(a.q[0] * b.q[0] + a.q[1] * b.q[1] + a.q[2] * b.q[2] +
+                                a.q[3] * b.q[3]);
+    const float dx = b.c[0] - a.c[0], dy = b.c[1] - a.c[1], dz = b.c[2] - a.c[2];
+    const float dist2 = dx * dx + dy * dy + dz * dz;
+    if (dist2 > 25.0f) {
+      // No route yet (just restarted): this step defines it, up to kMaxStepM.
+      bool along_route = before == nullptr && dist2 <= kMaxStepM * kMaxStepM;
+      if (before != nullptr) {
+        const float px = a.c[0] - before->c[0], py = a.c[1] - before->c[1],
+                    pz = a.c[2] - before->c[2];
+        const float last = std::sqrt(px * px + py * py + pz * pz);
+        const float step = std::sqrt(dist2);
+        if (step <= kMaxStepM && step <= kMaxStepGrowth * last + 1.0f &&
+            dx * px + dy * py + dz * pz > 0.0f) {
+          float metres = 0.0f, turn = 0.0f;
+          along_route = !off_route(*before, b, a, false, &metres, &turn);
+        }
+      }
+      if (!along_route) return skate3::actor_history::kCameraRingJump;
+    }
+    return dot < kCutTurnDot ? skate3::actor_history::kCameraRingTurn : 0u;
+  };
+  // The route: the last step on which the camera actually moved (position or
+  // rotation). A frame camera can repeat a sample's position, which left the
+  // bare previous sample no direction. After a restart the first step defines
+  // the route instead of being judged by it: at speed glitch speeds every
+  // step after a cut would otherwise read as another cut.
+  static float s_route_step[3] = {};
+  static float s_route_qstep[4] = {};
+  static bool s_route_known = false;
+  static CamPose s_route_before;
+  const auto route_before = [&]() -> const CamPose* {
+    if (s_count < 1 || !s_route_known) return nullptr;
+    s_route_before = s_ring[s_newest];
+    for (int k = 0; k < 3; ++k) s_route_before.c[k] -= s_route_step[k];
+    for (int k = 0; k < 4; ++k) s_route_before.q[k] -= s_route_qstep[k];
+    return &s_route_before;
+  };
+  const auto snap = [&](const CamPose& p, const float raw_view[16], uint32_t reason) {
+    // First sample / stale history / teleport / hard cut: restart the ring.
+    g_smooth_events |= reason;
+    s_ring[0] = p;
+    s_newest = 0;
+    s_count = 1;
+    s_newest_suspect = false;
+    s_route_known = false;
+    s_play_valid = false;
+    std::memcpy(s_ring_view[0], raw_view, sizeof(s_ring_view[0]));
+  };
+  const auto commit_cut = [&]() {
+    s_cut_pending = false;
+    snap(s_cut, s_cut_view, cut_reason(route_before(), s_ring[s_newest], s_cut));
+  };
   const auto push_pose = [&](const CamPose& p, const float raw_view[16]) {
     if (s_count < 0) {
       return;
     }
-    const CamPose& latest = s_ring[s_newest];
-    const float dot = std::fabs(p.q[0] * latest.q[0] + p.q[1] * latest.q[1] +
-                                p.q[2] * latest.q[2] + p.q[3] * latest.q[3]);
-    const float dx = p.c[0] - latest.c[0], dy = p.c[1] - latest.c[1],
-                dz = p.c[2] - latest.c[2];
-    const float dist2 = dx * dx + dy * dy + dz * dz;
-    if (s_count == 0 || p.t - latest.t > 0.1 || dist2 > 25.0f || dot < 0.9f) {
-      // First sample / stale history / teleport / hard cut: snap.
-      s_ring[0] = p;
-      s_newest = 0;
-      s_count = 1;
-      s_play_valid = false;
-    } else {
-      const double dt = p.t - latest.t;
-      if (dt <= 0.0) {
-        return;  // out-of-order/duplicate
+    if (s_cut_pending) {
+      // Back near the ring's path: the cut sample was a stray state.
+      if (p.t - s_ring[s_newest].t <= 0.1 &&
+          cut_reason(route_before(), s_ring[s_newest], p) == 0) {
+        s_cut_pending = false;
+        g_smooth_events |= skate3::actor_history::kCameraOutlier;
+      } else {
+        commit_cut();
       }
-      if (dt > 0.0005 && dt < 0.05) {
-        s_period = s_period * 0.9 + dt * 0.1;
-      }
-      s_newest = (s_newest + 1) % kRing;
-      s_ring[s_newest] = p;
-      s_count = std::min(s_count + 1, kRing);
     }
+    if (s_count == 0 || p.t - s_ring[s_newest].t > 0.1) {
+      snap(p, raw_view, skate3::actor_history::kCameraRingGap);
+      return;
+    }
+    if (cut_reason(route_before(), s_ring[s_newest], p) != 0) {
+      s_cut_pending = true;
+      s_cut = p;
+      std::memcpy(s_cut_view, raw_view, sizeof(s_cut_view));
+      return;
+    }
+    const double dt = p.t - s_ring[s_newest].t;
+    if (dt <= 0.0) {
+      return;  // out-of-order/duplicate
+    }
+    float metres = 0.0f, turn = 0.0f;
+    if (s_newest_suspect && s_count >= 2) {
+      const int prev = (s_newest + kRing - 1) % kRing;
+      const CamPose& a = s_ring[prev];
+      const CamPose& mid = s_ring[s_newest];
+      if (p.t - a.t <= 0.1 && off_route(a, mid, p, true, &metres, &turn)) {
+        const uint64_t n = s_off_path++;
+        if (n < 16 || (n & 255u) == 0) {
+          REXLOG_INFO("native-scene: dropped an off-path camera sample ({:.2f} m, {:.2f} deg) (n={})",
+                      metres, 4.0 * std::asin(std::min(turn * 0.5f, 1.0f)) * 57.29578, n + 1);
+        }
+        s_newest = prev;
+        --s_count;
+        g_smooth_events |= skate3::actor_history::kCameraOutlier;
+      }
+    }
+    // The new sample's own standing: off the line of the two kept before it?
+    const CamPose* route = route_before();
+    const bool suspect = route != nullptr && off_route(*route, p, s_ring[s_newest], false, &metres, &turn);
+    // A suspect sample may be a stray: keep it out of the tick estimate. After a
+    // dropped stray the step is the real gap between real samples, as without it.
+    const double step = p.t - s_ring[s_newest].t;
+    if (!suspect && step > 0.0005 && step < 0.05) {
+      s_period = s_period * 0.9 + step * 0.1;
+    }
+    if (!suspect) {
+      const CamPose& from = s_ring[s_newest];
+      const float sign = p.q[0] * from.q[0] + p.q[1] * from.q[1] + p.q[2] * from.q[2] +
+                         p.q[3] * from.q[3] < 0.0f ? -1.0f : 1.0f;
+      float moved = 0.0f, step[3], qstep[4];
+      for (int k = 0; k < 3; ++k) moved += std::fabs(step[k] = p.c[k] - from.c[k]);
+      for (int k = 0; k < 4; ++k) moved += std::fabs(qstep[k] = sign * p.q[k] - from.q[k]);
+      if (moved > 1e-5f) {
+        std::memcpy(s_route_step, step, sizeof(step));
+        std::memcpy(s_route_qstep, qstep, sizeof(qstep));
+        s_route_known = true;
+      }
+    }
+    s_newest = (s_newest + 1) % kRing;
+    s_ring[s_newest] = p;
+    s_count = std::min(s_count + 1, kRing);
+    s_newest_suspect = suspect;
     std::memcpy(s_ring_view[s_newest], raw_view, sizeof(s_ring_view[0]));
   };
   const auto pose_from_view = [](const float v[16], double t) {
@@ -8334,19 +8668,34 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
         proj[2 * 4 + 3] == 1.0f && r0n >= 0.9f && r0n <= 1.1f &&
         g_synpan_active.load(std::memory_order_relaxed) != 3) {
       push_pose(pose_from_view(view, view_t), view);
+      g_smooth_events |= skate3::actor_history::kCameraBuiltSample;
       std::memcpy(s_built_view[s_built_next], view, sizeof(s_built_view[0]));
       s_built_t[s_built_next] = view_t;
       s_built_next = (s_built_next + 1) % kBuilt;
     }
   }
+  // No later sample came back to the old path: the cut was real.
+  if (s_cut_pending && now - s_cut.t > kCutHoldS) {
+    commit_cut();
+  }
   g_latest_cam_tick = frame_tick;
   g_smooth_period_ms = float(s_period * 1000.0);
+  g_smooth_age_ms = s_count > 0 ? float((now - s_ring[s_newest].t) * 1000.0) : -1.0f;
   if (s_count < 3 || now - s_ring[s_newest].t > 0.1) {
+    g_smooth_events |= s_count < 0 ? skate3::actor_history::kCameraDisabled
+                       : s_count < 3 ? skate3::actor_history::kCameraFewSamples
+                                     : skate3::actor_history::kCameraStale;
     s_play_valid = false;
     g_smooth_active = false;
     g_smooth_err_ms = 0.0f;
     return false;
   }
+
+  // The last sample playback may use (see kConfirmS above); a held
+  // suspect sample sets neither the playback target nor the clamp.
+  const bool newest_held = s_newest_suspect && now - s_ring[s_newest].t < kConfirmS;
+  const int s_end = newest_held ? (s_newest + kRing - 1) % kRing : s_newest;
+  const int s_usable = newest_held ? s_count - 1 : s_count;
 
   // Playback clock: advance by real frame time; slew gently toward the
   // target lag point so detection-time noise never becomes pose velocity.
@@ -8355,11 +8704,16 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   s_last_now = now;
   // Boxcar pose filter (see below): the playback point must lag far enough
   // that the CENTERED window has ring samples on both sides.
-  const double filter_w = std::clamp(
+  const double full_filter_w = std::clamp(
       REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
       1e-3;
-  const double lag = std::max(2.0 * s_period, filter_w * 0.5 + s_period);
-  const double target = s_ring[s_newest].t - lag;
+  // Adaptive smoothing scales the delay and the filter together (the window's
+  // newest tap stays at or behind the newest sample): at 0 the playback point
+  // is the newest camera, the game's own frame.
+  const double scale = std::clamp(g_smooth_scale, 0.0, 1.0);
+  const double filter_w = full_filter_w * scale;
+  const double lag = std::max(2.0 * s_period, full_filter_w * 0.5 + s_period) * scale;
+  const double target = s_ring[s_end].t - lag;
   if (!s_play_valid) {
     s_play = target;
     s_play_valid = true;
@@ -8368,6 +8722,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     const double err = target - s_play;
     if (err > 0.1 || err < -0.1) {
       s_play = target;  // fell far behind/ahead (hitch): snap the clock
+      g_smooth_events |= skate3::actor_history::kCameraClockSnap;
     } else {
       s_play += err * 0.06;
     }
@@ -8378,16 +8733,19 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   // when I stop panning"). Parked at the newest sample, the smoothed pose
   // settles exactly onto the raw stop pose and every later handoff is
   // seamless.
-  s_play = std::min(s_play, s_ring[s_newest].t);
+  s_play = std::min(s_play, s_ring[s_end].t);
+  if (scale <= 0.0) {
+    s_play = target;  // no smoothing this frame: exactly the newest camera
+  }
   g_smooth_err_ms = float((target - s_play) * 1000.0);
 
   // Evaluate the piecewise-linear pose signal at an arbitrary time by
   // bracketing in the ring (samples are time-ordered oldest -> newest) and
   // slerping. Clamps to the ring's ends.
   const auto eval_ring = [&](double t_eval) {
-    int hi = s_newest;
-    int lo = (s_newest + kRing - 1) % kRing;
-    for (int step = 1; step < s_count - 1; ++step) {
+    int hi = s_end;
+    int lo = (s_end + kRing - 1) % kRing;
+    for (int step = 1; step < s_usable - 1; ++step) {
       if (s_ring[lo].t <= t_eval) {
         break;
       }
@@ -8426,7 +8784,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
     float qref[4] = {};
     for (int k = 0; k < kTaps; ++k) {
       const double tt = std::min(s_play - filter_w * 0.5 + (k + 0.5) * filter_w / kTaps,
-                                 s_ring[s_newest].t);
+                                 s_ring[s_end].t);
       const CamPose s = eval_ring(tt);
       float sq[4] = {s.q[0], s.q[1], s.q[2], s.q[3]};
       if (k == 0) {
@@ -8455,6 +8813,7 @@ bool SmoothCamera(const float view[16], const float proj[16], const float raw_vp
   g_smooth_play = s_play;
   g_smooth_pose = p;
   g_smooth_active = true;
+  g_smooth_events |= skate3::actor_history::kCameraSmoothed;
   return true;
 }
 
@@ -8535,9 +8894,19 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     uint32_t motion_owner = 0;
     uint64_t motion_world = 0;
     unsigned motion_samples = 0;
+    // A motion discontinuity of the SAME instance (teleport, respawn, a hitch
+    // the continuity test cannot vouch for) keeps the last pose before it,
+    // shown until the playback clock reaches the first pose after it: the
+    // jump happens where the camera's playback is, never frames early. A
+    // different object taking the slot (context, owner, world, unknown
+    // identity, clone mispair) or a stale/LOD restart keeps nothing.
+    DynPose held;
+    double held_until = 0.0;
+    bool has_held = false;
   };
   static std::unordered_map<uint64_t, DynHist> s_hist;
-  if (!REXCVAR_GET(skate3_native_render_scene_smooth_entities)) {
+  if (!REXCVAR_GET(skate3_native_render_scene_smooth_entities) ||
+      !skate3::native_render::MotionSmoothingWanted()) {
     // A re-enable starts fresh; no old pose ring can bridge the comparison.
     s_hist.clear();
     return;
@@ -8845,6 +9214,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     }
     DynHist& h = *hp;
     skate3::actor_history::Retime(item, key, h.count, h.period, 0.0);
+    skate3::actor_history::Note(item, 0, h.count > 0 ? float((now - h.ring[h.newest].t) * 1e3) : -1.0f);
     h.seen = s_frame;
     if (trk != nullptr) {
       trk->ring_n = h.count;
@@ -8961,6 +9331,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
         }
       }
       item.bones = latest.b;
+      skate3::actor_history::Note(item, skate3::actor_history::kPartCasterHold);
       if (trk != nullptr) {
         trk->hold = caster_stale_jump ? 2 : 1;
       }
@@ -9035,26 +9406,35 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           // its smoothed lag (the speed-scaled garment jumping). Genuine
           // teleports/respawns still clear the 1.5 m character gate.
           discontinuity = d2 > (skinned || item.ropa ? 2.25f : 0.09f);
-          // The distance gate above assumes one ordinary observation. A
-          // hitch can contain several ticks of valid travel (run259: 1.88m
-          // in 79ms). Resetting that history renders a zero-lag actor against
-          // the delayed camera, then steps backward as history fills again.
-          // For an established SAME instance across a missing observation,
-          // test deviation from its preceding motion over a comparable time span, using sample times.
+          // The distance gate above assumes ordinary speed in one
+          // observation. A hitch can contain several ticks of valid travel
+          // (run259: 1.88m in 79ms), and above ~90 m/s (speed glitches) every
+          // ordinary tick does. Resetting that history renders a zero-lag
+          // actor against the delayed camera, then steps backward as history
+          // fills again (every frame at speed-glitch speeds). For an
+          // established SAME instance, test deviation from its preceding
+          // motion over a comparable time span, using sample times.
           // Prediction is only a continuity test: rendering still interpolates
-          // the original observed poses. Normal ticks, clone claims, stale
-          // histories, size changes and rigid props retain their old gates.
+          // the original observed poses. Teleports still break the predicted
+          // motion and reset; clone claims, stale histories, size changes and
+          // rigid props retain their old gates.
           const double motion_dt = stamp - latest.t;
-          if (discontinuity && (skinned || item.ropa) && h.count >= 3 &&
-              h.motion_samples >= 3 && item.ctx != 0 &&
+          const bool same_instance = (skinned || item.ropa) && item.ctx != 0 &&
               h.motion_ctx == item.ctx && h.motion_owner == item.lw_entity &&
               scene.world_identity != 0 && h.motion_world == scene.world_identity &&
-              !item.retained && !item.caster_bank &&
-              motion_dt > 1.5 * h.period && motion_dt <= 0.1) {
+              !item.retained && !item.caster_bank && motion_dt <= 0.1;
+          if (discontinuity && same_instance && h.count == 1 && h.motion_samples >= 1) {
+            // A history that just restarted has no motion to predict from, so
+            // this step of the same instance defines it: at speed-glitch speeds
+            // the first huge step resets, and every later one would too,
+            // rendering raw for the whole glitch.
+            discontinuity = false;
+          } else if (discontinuity && same_instance && h.count >= 2 && h.motion_samples >= 2) {
             // Match the velocity-measurement interval to the missing interval.
             // Extrapolating a single tick magnifies ordinary limb animation
             // and timestamp noise by the hitch/tick ratio. Only use observed
             // samples from this same instance; never borrow an older owner.
+            // Two samples suffice right after a restart (at most 2x).
             int back = 1;
             const int available = std::min(h.count, int(h.motion_samples));
             while (back + 1 < available &&
@@ -9063,7 +9443,8 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
             }
             const DynPose& prev = h.ring[(h.newest + kRing - back) % kRing];
             const double prev_dt = latest.t - prev.t;
-            if (prev_dt >= motion_dt && prev_dt <= 0.1 + h.period &&
+            if (prev_dt >= (available > 2 ? motion_dt : 0.5 * motion_dt) &&
+                prev_dt <= 0.1 + h.period &&
                 (!skinned || prev.b.size() == item.bones.size())) {
               const float ratio = float(motion_dt / prev_dt);
               const auto residual2 = [&](const float* cur, const float* last,
@@ -9121,7 +9502,19 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
           }
         }
         if (discontinuity) {
+          const bool keep_pre =
+              now - latest.t <= 0.1 && (skinned || item.ropa) && item.ctx != 0 &&
+              (!skinned || latest.b.size() == item.bones.size()) &&
+              h.motion_ctx == item.ctx && h.motion_owner == item.lw_entity &&
+              scene.world_identity != 0 && h.motion_world == scene.world_identity &&
+              !item.retained && !item.caster_bank;
+          h.has_held = keep_pre;
+          if (keep_pre) {
+            h.held = latest;
+            h.held_until = stamp;
+          }
           h.count = 0;
+          skate3::actor_history::Note(item, skate3::actor_history::kPartReset);
           if (trk != nullptr) {
             trk->rst = 1;
           }
@@ -9171,11 +9564,76 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     } else if (changed && trk != nullptr) {
       trk->ing = 2;  // change withheld by the ingest spacing floor
     }
-    if (h.count < 3 || now - h.ring[h.newest].t > 0.1) {
+    // Per-entity playback point. Entities whose own pose stream is SLOWER
+    // than the 60 Hz character cadence (traffic vehicles tick on their own
+    // sim rate) pin the shared playback clock past their newest sample;
+    // alpha clamps at 1.0, the whole smoothing machinery degenerates to
+    // raw stepped poses, and every new sample renders as a visible jump
+    // (the vehicle judder/catch-up that survived the entity boxcar).
+    // Evaluating one own-period earlier keeps the eval point BRACKETED by
+    // samples: the staircase renders as continuous piecewise-linear
+    // motion, at the cost of that entity lagging one of ITS sim updates
+    // behind the world, invisible for background traffic, and never
+    // applied to 60 Hz entities (the skater/NPCs keep the shared clock).
+    // The lead fades in between 18 and 22 ms of period, so an entity whose
+    // rate sits near that boundary never jumps by several ms in one frame.
+    // (Scaled with the smoothing: at 0 every entity is its own frame.)
+    const double lead = std::min(h.period - 1.0 / 60.0, 0.1) *
+                        std::clamp((h.period - 0.018) / 0.004, 0.0, 1.0) *
+                        std::clamp(g_smooth_scale, 0.0, 1.0);
+    const double play_e = g_smooth_play - lead;
+    if (h.has_held && (h.count == 0 || play_e >= h.held_until)) {
+      h.has_held = false;  // playback reached the jump
+    }
+    if (h.count == 0 || now - h.ring[h.newest].t > 0.1) {
+      // Nothing recent: the entity is not changing (its raw pose is its
+      // newest), or it just appeared after a gap.
+      skate3::actor_history::Note(item, skate3::actor_history::kPartRawShort);
       if (trk != nullptr) {
         trk->raw_render = 1;
       }
-      continue;  // not enough history yet: raw stepped pose (one-time snap)
+      continue;
+    }
+    if (h.has_held || h.count < 3) {
+      // Consistent smoothing: a short or just-restarted history is drawn at
+      // the shared playback time too, from what it has (the pose before a
+      // same-instance jump until playback reaches the jump, the oldest pose
+      // until playback reaches it, then the pair between them). Drawing its
+      // newest (raw) pose instead put the part up to the playback delay
+      // ahead of the camera and stepped it back as the history filled: the
+      // offset skater of the log234 load runs.
+      const DynPose& oldest = h.ring[(h.newest + kRing - h.count + 1) % kRing];
+      const DynPose& newest = h.ring[h.newest];
+      const DynPose* p0 = h.has_held ? &h.held : &oldest;
+      const DynPose* p1 = p0;
+      float a = 0.0f;
+      if (!h.has_held && h.count >= 2 && play_e > oldest.t) {
+        // Count 2: oldest and newest are the only pair.
+        p1 = &newest;
+        a = float(std::clamp((play_e - oldest.t) / std::max(newest.t - oldest.t, 0.0005), 0.0, 1.0));
+      }
+      const bool fits = skinned ? p0->b.size() == item.bones.size() &&
+                                      p1->b.size() == item.bones.size()
+                                : true;
+      if (!fits) {
+        skate3::actor_history::Note(item, skate3::actor_history::kPartRawShort);
+        if (trk != nullptr) {
+          trk->raw_render = 1;
+        }
+        continue;
+      }
+      if (skinned) {
+        for (size_t i = 0; i < item.bones.size(); ++i) {
+          item.bones[i] = p0->b[i] + (p1->b[i] - p0->b[i]) * a;
+        }
+      } else {
+        for (int i = 0; i < 16; ++i) {
+          item.world[i] = p0->w[i] + (p1->w[i] - p0->w[i]) * a;
+        }
+      }
+      skate3::actor_history::Note(item, skate3::actor_history::kPartHeld);
+      skate3::actor_history::Retime(item, key, h.count, h.period, play_e);
+      continue;
     }
     // Evaluate the ring's piecewise-linear pose signal at time tt into
     // `out_b` (skinned, weighted-accumulated) / `out_w` (rigid), scaled by
@@ -9221,23 +9679,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
     // blur), the trade the game's own 60 Hz presentation makes anyway.
     const double filter_w = std::clamp(
         REXCVAR_GET(skate3_native_render_scene_smooth_camera_filter_ms), 0.0, 200.0) *
-        1e-3;
-    // Per-entity playback point. Entities whose own pose stream is SLOWER
-    // than the 60 Hz character cadence (traffic vehicles tick on their own
-    // sim rate) pin the shared playback clock past their newest sample;
-    // alpha clamps at 1.0, the whole smoothing machinery degenerates to
-    // raw stepped poses, and every new sample renders as a visible jump
-    // (the vehicle judder/catch-up that survived the entity boxcar).
-    // Evaluating one own-period earlier keeps the eval point BRACKETED by
-    // samples: the staircase renders as continuous piecewise-linear
-    // motion, at the cost of that entity lagging one of ITS sim updates
-    // behind the world, invisible for background traffic, and never
-    // applied to 60 Hz entities (the skater/NPCs keep the shared clock).
-    // The lead fades in between 18 and 22 ms of period, so an entity whose
-    // rate sits near that boundary never jumps by several ms in one frame.
-    const double lead = std::min(h.period - 1.0 / 60.0, 0.1) *
-                        std::clamp((h.period - 0.018) / 0.004, 0.0, 1.0);
-    const double play_e = g_smooth_play - lead;
+        1e-3 * std::clamp(g_smooth_scale, 0.0, 1.0);
     static std::vector<float> acc;  // guest render thread only
     float wacc[16] = {};
     bool ok = true;
@@ -9258,6 +9700,7 @@ void InterpolateDynamicItems(uint8_t* base, FrameScene& scene, double now) {
       ok = accum_at(play_e, 1.0f, acc.data(), wacc);
     }
     if (!ok) {
+      skate3::actor_history::Note(item, skate3::actor_history::kPartRawSize);
       if (trk != nullptr) {
         trk->raw_render = 2;
       }
@@ -11323,6 +11766,22 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
   }
+  {
+    // The guest clock read trace for the actor recorder (registered once).
+    static const bool clock_registered = [] {
+      namespace chrono = rex::chrono;
+      static_assert(sizeof(skate3::actor_history::TickRead) == sizeof(chrono::GuestTickRead));
+      skate3::actor_history::ClockAccess access;
+      access.set_trace = [](bool on) { chrono::SetGuestTickTrace(on); };
+      access.copy_trace = [](uint64_t from, skate3::actor_history::TickRead* out, size_t max) {
+        return chrono::CopyGuestTickTrace(from, reinterpret_cast<chrono::GuestTickRead*>(out), max);
+      };
+      access.tick_frequency = chrono::Clock::guest_tick_frequency();
+      skate3::actor_history::SetClockAccess(access);
+      return true;
+    }();
+    (void)clock_registered;
+  }
   skate3::actor_history::Begin(base, scene, frame_clock_s, g_guest_frame);
   // Publish-gap telemetry and fill ("skater flickered invisible for a
   // moment"): a skinned/ropa/character mesh that published recently can
@@ -11517,6 +11976,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         -(cam_view[12] * cam_view[j * 4 + 0] + cam_view[13] * cam_view[j * 4 + 1] +
           cam_view[14] * cam_view[j * 4 + 2]);
   }
+  skate3::actor_history::Camera(scene, cam_view, cam_view_t);
   // The game's projection uses a negative x scale which already yields
   // correct D3D NDC orientation; use the view*proj matrix as captured.
   // (Negating column 0 here mirrors the image left-right.)
@@ -11934,10 +12394,16 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // rate. All consumers (items, sky follow, sorting, outline) use the
   // smoothed pose coherently.
   bool retime_entities = false;
-  if (REXCVAR_GET(skate3_native_render_scene_smooth_camera)) {
-    // Publish the ViewCamera for the ~1 kHz sampler thread and make sure it
-    // runs (see CamSamplerLoop).
-    g_sampler_viewcam.store(viewcam, std::memory_order_relaxed);
+  g_smooth_events = 0;
+  g_smooth_age_ms = -1.0f;
+  // The main ViewCamera, published either way: SetViewMatrix reports its
+  // updates (OnMainCameraSet: the smoothing input, the uneven-step count and
+  // the actor history's camera stream).
+  g_sampler_viewcam.store(viewcam, std::memory_order_relaxed);
+  if (REXCVAR_GET(skate3_native_render_scene_smooth_camera) &&
+      skate3::native_render::MotionSmoothingWanted()) {
+    g_smooth_scale = skate3::native_render::MotionSmoothingScale();
+    // Make sure the ~1 kHz sampler thread runs (see CamSamplerLoop).
     EnsureCamSampler();
     float proj[16];
     for (int i = 0; i < 16; ++i) {
@@ -12024,11 +12490,26 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
 
   // Even with camera smoothing off, disabling entity retiming clears its
   // histories. A later re-enable cannot inherit poses from before the toggle.
-  if (retime_entities || !REXCVAR_GET(skate3_native_render_scene_smooth_entities)) {
+  if (retime_entities || !REXCVAR_GET(skate3_native_render_scene_smooth_entities) ||
+      !skate3::native_render::MotionSmoothingWanted()) {
     InterpolateDynamicItems(base, scene, frame_clock_s);
   }
 
-  skate3::actor_history::End(scene, g_latest_cam_tick, retime_entities);
+  {
+    namespace perf = skate3::perf_recorder;
+    skate3::actor_history::FrameState state;
+    state.camera_events = g_smooth_events;
+    state.camera_err_ms = g_smooth_err_ms;
+    state.camera_age_ms = g_smooth_age_ms;
+    state.camera_period_ms = g_smooth_period_ms;
+    state.camera_play = g_smooth_play;
+    state.render_paused = perf::RenderPaused() ? 1 : 0;
+    state.stream_loads = perf::ActivityTotal(perf::Activity::kStreamLoad);
+    state.stream_unloads = perf::ActivityTotal(perf::Activity::kStreamUnload);
+    state.stream_loads_done = perf::ActivityTotal(perf::Activity::kStreamLoadDone);
+    state.stream_unloads_done = perf::ActivityTotal(perf::Activity::kStreamUnloadDone);
+    skate3::actor_history::End(scene, g_latest_cam_tick, retime_entities, state);
+  }
 
   // Hor+ ultrawide scale for this frame's camera (1.0 when the output is not
   // wide). The matrices are widened after the camera overrides below; the
@@ -12958,5 +13439,9 @@ extern "C" REX_FUNC(sub_82802A00) {
     ns::g_freecam_guest_rewrites.fetch_add(1, std::memory_order_relaxed);
   }
   __imp__sub_82802A00(ctx, base);
+  // The main camera as the game just stored it feeds the camera smoother.
+  if (mtx != 0 && cam != 0 && cam == ns::g_sampler_viewcam.load(std::memory_order_relaxed)) {
+    ns::OnMainCameraSet(base, cam);
+  }
 }
 

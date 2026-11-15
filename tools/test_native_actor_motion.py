@@ -41,7 +41,7 @@ bool skate3_native_render_scene_lw_identity=true;
 bool skate3_native_render_scene_ropa_boxcar=true;
 int skate3_native_render_scene_ropa_bias=0;
 double skate3_native_render_scene_smooth_camera_filter_ms=50;
-double g_latest_cam_tick=0,g_smooth_play=0;
+double g_latest_cam_tick=0,g_smooth_play=0,g_smooth_scale=1.0;
 std::unordered_map<uint32_t,uint64_t>g_ropa_last_seq;
 constexpr double kMinDynIngestSpacing=0.0035;
 struct SkinSampleVert {uint32_t w[4]{},bone[4]{};float p[3]{};};
@@ -49,9 +49,12 @@ bool ReadSkinVertGuest(uint8_t*,const DrawItem&,uint32_t,SkinSampleVert*){return
 bool BoneSigTick(double){return false;}
 void BoneSigAppend(int,uint64_t,double,double,const float*,uint32_t){}
 namespace skate3::native_entity {bool ReadEntityWorldRows(uint8_t*,uint32_t,float*){return false;}}
+namespace skate3::native_render {bool MotionSmoothingWanted(){return true;}}
 namespace skate3::actor_history {
 std::unordered_map<uint32_t,uint32_t>counts;
 void Retime(const DrawItem&i,uint64_t,uint32_t n,double,double){counts[i.mesh]=std::max(counts[i.mesh],n);}
+enum PartEvent:uint32_t{kPartReset=1,kPartRawShort=2,kPartRawSize=4,kPartCasterHold=8,kPartInterpolated=16,kPartHeld=32};
+void Note(const DrawItem&,uint32_t,float=-1.0f){}
 }
 void serve(DrawItem&item,const float*pick_rows,uint32_t n){
 ''' + commit + r'''
@@ -115,12 +118,15 @@ void scenario(int fps,int kind,bool expect_good){
  item.skinned=kind!=1&&kind!=10&&kind!=11;item.ropa=kind==1||kind==11;
  item.char_family=kind==12?6:2;item.lw_entity=kind==12?6000:0;
  item.draws.push_back({3,0,0,6});
- double now=1;float previous=0;bool must_reset=(kind>=2&&kind<=11)||kind>=13;
- float event_raw=0,event_output=0;uint32_t next_history=0;
+ double now=1;float previous=0;bool must_reset=(kind>=2&&kind<=11)||kind==13||kind==14;
+ // Same-instance jumps keep the pose before them until playback reaches the jump
+ // (consistent smoothing); other resets start from the new object's first pose.
+ bool keep_pre=kind==2||kind==3||kind==11||kind==13||kind==14;
+ float event_raw=0,event_output=0,previous_raw=0;uint32_t next_history=0;
  for(int f=0;f<fps+8;++f){
   double dt=1./fps;if(f==fps)dt=kind==7?.12:.079289;
   if(kind==14&&f==fps)dt=1./fps; // normal-tick teleport remains a reset
-  now+=dt;float x=float((now-1)*24),y=1;
+  now+=dt;float x=float((now-1)*(kind==15?300:24)),y=1; // 15: a speed glitch, 300 m/s
   if(kind==12)x=float(std::floor((now-1)*30+1e-6)/30*24); // traffic updates30Hz
   if(kind==13&&f>=fps-2)item.ctx=1001; // insufficient same-context history
   if(f>=fps){
@@ -140,17 +146,28 @@ void scenario(int fps,int kind,bool expect_good){
   item.dbg_src=11;g_latest_cam_tick=now;g_smooth_play=now-.03;
   skate3::actor_history::counts.clear();InterpolateDynamicItems(nullptr,scene,now);
   float output=item.skinned?item.bones[3]:item.world[12];assert(std::isfinite(output));assert(item.draws.size()==1);
-  if(f==fps){event_raw=x;event_output=output;if(must_reset||!expect_good){assert(std::fabs(x-output)<.001);}else{assert(x-output>.5);}}
+  if(f==fps){event_raw=x;event_output=output;
+   if(!expect_good){assert(std::fabs(x-output)<.001);}
+   else if(must_reset&&keep_pre){assert(std::fabs(previous_raw-output)<.001);} // held: never ahead of playback
+   else if(must_reset){assert(std::fabs(x-output)<.001);}
+   else{assert(x-output>.5);}}
   if(f==fps+1)next_history=skate3::actor_history::counts[item.mesh];
   if(f>fps&&expect_good&&!must_reset)assert(output>=previous-.001f);
-  previous=output;
+  // Consistent smoothing: no part ever steps backward while a restarted history refills
+  // (the old raw-first fallback drew it ahead of the camera, then stepped it back).
+  if(f>=fps&&expect_good)assert(output>=previous-.001f);
+  if(f==fps+7&&expect_good&&(kind==3||kind==14))assert(output>event_raw-1.f); // playback reached the jump
+  previous=output;previous_raw=x;
  }
- assert(must_reset||!expect_good?next_history==1:next_history==24);
+ // A restarted history fills again (2 poses the next frame); a rigid prop (10) moving
+ // over the 0.3 m one-tick bound (24 m/s at 60 fps) restarts every ingest by design
+ // (clone safety) and stays at 1.
+ assert(!expect_good?next_history==1:must_reset?next_history==(kind==10&&fps==60?1u:2u):next_history==24);
  std::printf("fps=%d scenario=%d reset=%d raw=%.6f output=%.6f next_history=%u\n",fps,kind,must_reset||!expect_good,event_raw,event_output,next_history);
 }
 int main(int argc,char**argv){assert(argc==2);bool fixed=std::atoi(argv[1])!=0;
- for(int fps:{60,144})for(int kind=0;kind<=14;++kind)scenario(fps,kind,fixed);
- std::puts("PASS full retimer: fast skater/garment/vehicle hitch continuity; teleport, context, owner, world, stale, LOD, unknown identity, rigid prop and rotation boundaries");
+ for(int fps:{60,144})for(int kind=0;kind<=15;++kind)scenario(fps,kind,fixed);
+ std::puts("PASS full retimer: fast skater/garment/vehicle hitch continuity; teleport, context, owner, world, stale, LOD, unknown identity, rigid prop and rotation boundaries; 300 m/s keeps its history");
 }
 '''
 

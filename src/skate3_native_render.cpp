@@ -3,6 +3,7 @@
 #include "skate3_perf_recorder.h"
 #include "skate3_world_loading.h"
 
+#include "native/skate3_native_actor_history.h"
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
 #include "native/skate3_native_guest_read.h"
@@ -18,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -27,6 +29,7 @@
 #include <dwmapi.h>
 #endif
 
+#include <rex/chrono/guest_tick_trace.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/presenter.h>
@@ -79,9 +82,81 @@ REXCVAR_DEFINE_DOUBLE(skate3_guest_present_margin_ms, 4.0, "Skate 3",
                       "skipped one.")
     .range(1.0, 12.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_raise_process_priority, true, "Skate 3",
+                    "Run the game one priority level above normal (Windows: above "
+                    "normal priority class), so background work such as a compile only "
+                    "gets the CPU time the game leaves. At normal priority every game "
+                    "thread shares the CPU evenly with the background work and frames "
+                    "slow to ~25-30 fps under full load. Linux/macOS cannot raise a "
+                    "program's own priority without extra rights.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_motion_smoothing_auto, true, "Skate 3",
+                    "Choose the motion smoothing (the camera and actor smoothing switches) "
+                    "by display: full smoothing while frames are shown faster than the "
+                    "game's 60 Hz simulation (120/144 Hz displays, VRR), where it fills in "
+                    "the frames between simulation steps; adaptive smoothing otherwise "
+                    "(see skate3_adaptive_smoothing_max). Off: full smoothing whenever its "
+                    "switches are on.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_adaptive_smoothing_max, 0.5, "Skate 3",
+                      "Adaptive smoothing (60 Hz displays, skate3_motion_smoothing_auto): "
+                      "while frames and simulation steps arrive evenly, the game's own "
+                      "camera and actors are drawn with no delay. When frames start "
+                      "running late (heavy CPU load, hitches) the smoothing delay builds "
+                      "up gradually to this share of the full smoothing (1.0 = ~42 ms of "
+                      "delay and a 50 ms filter; 0.5 = ~21 ms and 25 ms) and eases back "
+                      "to none 2 s after they settle; the change is a few percent of "
+                      "playback speed, never a jump. 0 = no smoothing at 60 Hz.")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_sim_tick_lock, true, "Skate 3",
+                    "Wake the game's 60 Hz simulation tick precisely and in step with "
+                    "the displayed frames. The game times its simulation with a one-shot "
+                    "kernel timer per tick; on PC that timer lands on a 0.5 ms grid "
+                    "(16.0/16.5/17.0 ms ticks) and drifts against the display-locked "
+                    "frames, so a step sometimes finishes just after a frame picked the "
+                    "world up: that frame shows no movement and the next one two steps "
+                    "(camera, skater and every actor at once). Locked, each tick fires "
+                    "skate3_sim_tick_lead_ms before a frame starts. While the frame "
+                    "pacing is not locked to the display (VRR, tearing, FIFO, a refresh "
+                    "rate that is not a multiple of 60 Hz) the ticks are only made "
+                    "precise. Off: the game's own timer.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_sim_tick_lead_ms, 8.0, "Skate 3",
+                      "Simulation tick lock: how long before a frame starts each tick "
+                      "fires. It must cover the step's work (about 5 ms in the city); "
+                      "every extra millisecond is a millisecond of input latency.")
+    .range(2.0, 15.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace skate3::native_render {
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 namespace {
+
+// Frame releases for the simulation tick lock (see SimTickWait): when the
+// pacer last let a guest frame go (steady_clock ns), and the display period
+// it is locked to (0 = not locked to the display).
+std::atomic<int64_t> g_release_ns{0};
+std::atomic<int64_t> g_locked_period_ns{0};
+int64_t g_pace_locked_period_ns = 0;  // PaceGuestFrame, guest render thread
+// The rate the pacer shows guest frames at (Hz; 1000 = uncapped, 0 = not
+// paced yet) and whether motion smoothing is worth running (see
+// skate3_motion_smoothing_auto); both written on the guest render thread.
+std::atomic<double> g_paced_hz{0.0};
+std::atomic<bool> g_smoothing_wanted{false};
+// Share of the full smoothing delay/filter applied this frame (0 = the game's
+// own frame, 1 = full smoothing), slewed by UpdateSmoothingWanted.
+std::atomic<double> g_smooth_k{0.0};
+// Uneven simulation steps the camera showed (NoteUnevenStep), steady ns.
+std::mutex g_uneven_mutex;
+std::deque<int64_t> g_uneven_steps;
+
 
 // One per-mesh submission. kind 0 = RenderMesh (dynamic entities: a = the
 // MeshContext, b = VertexProgramState, c = dynitem index+1). kind 1 =
@@ -326,11 +401,13 @@ uint64_t PaceGuestFrame() {
   double cap = REXCVAR_GET(skate3_guest_fps_cap);
   VblankGrid grid;
   bool synced = false;
+  double fifo_hz = 0.0;  // display-paced (FIFO): the refresh rate
   if (REXCVAR_GET(skate3_guest_fps_cap_auto)) {
     const double refresh_hz = rex::ui::Window::CachedDisplayRefreshHz();
     switch (Presenter::GetHostPresentSync()) {
       case Presenter::HostPresentSync::kFifo:
         cap = 0.0;
+        fifo_hz = refresh_hz > 0.0 ? refresh_hz : 60.0;
         break;
       case Presenter::HostPresentSync::kMailbox:
         if (refresh_hz > 0.0) {
@@ -350,6 +427,12 @@ uint64_t PaceGuestFrame() {
       }
     }
   }
+  g_pace_locked_period_ns = synced ? grid.period_ns : 0;
+  g_paced_hz.store(synced ? 1e9 / double(grid.period_ns)
+                   : cap >= 1.0 ? cap
+                   : fifo_hz > 0.0 ? fifo_hz
+                                   : 1000.0,
+                   std::memory_order_relaxed);
   static Clock::time_point s_next{};
   static uint64_t s_ready_seq = 0;
   g_frame_beat_ns = 0;
@@ -407,7 +490,153 @@ uint64_t PaceGuestFrame() {
                       .count());
 }
 
-void OnSwapIssued() { g_last_pace_ns = PaceGuestFrame(); }
+// skate3_raise_process_priority, applied on change (guest render thread).
+void ApplyProcessPriority() {
+  static int s_applied = -1;
+  const int want = REXCVAR_GET(skate3_raise_process_priority) ? 1 : 0;
+  if (want == s_applied) {
+    return;
+  }
+  s_applied = want;
+#if defined(_WIN32)
+  if (SetPriorityClass(GetCurrentProcess(),
+                       want ? ABOVE_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS)) {
+    REXLOG_INFO("process priority: {}", want ? "above normal" : "normal");
+  } else {
+    REXLOG_WARN("process priority: could not set {} (error {})",
+                want ? "above normal" : "normal", GetLastError());
+  }
+#else
+  if (want) {
+    REXLOG_INFO("process priority: raising it is not available on this platform; normal");
+  }
+#endif
+}
+
+// Motion smoothing mode and strength, once per guest frame (guest render
+// thread). Full (k = 1) while frames are shown faster than the 60 Hz
+// simulation (paced over ~66 Hz and measured: leaves below ~66 fps after
+// 0.5 s, returns above ~80 fps after 2 s) or with skate3_motion_smoothing_auto
+// off. Otherwise adaptive: k = 0 (the game's own frames) until frames run late
+// (2 releases over 1.25 frame periods within 1.5 s) or the camera shows
+// sustained uneven steps (4 within 1.5 s; the occasional lone one does not
+// count), then up to skate3_adaptive_smoothing_max until 2 s after the last
+// trigger. k moves at most 0.024 per frame up (~1 ms of delay, a 6% playback
+// stretch) and 0.008 down (~2%): the delay builds and fades, never jumps.
+void UpdateSmoothingWanted(int64_t release_ns) {
+  static int64_t s_last = 0, s_since = 0, s_trigger = 0;
+  static double s_interval = 0.0;
+  static bool s_fast = false;
+  static std::deque<int64_t> s_late;
+  static int s_logged = -1;
+  static uint64_t s_frames = 0, s_engaged = 0;
+  static double s_max_k = 0.0;
+  static int64_t s_report = 0;
+  double frame_ns = 0.0;
+  if (s_last != 0) {
+    const double dt = double(release_ns - s_last);
+    if (dt > 0.0 && dt < 1e9) {
+      s_interval = s_interval == 0.0 ? dt : s_interval * 0.9 + dt * 0.1;
+      frame_ns = dt;
+    }
+  }
+  s_last = release_ns;
+  const double measured_hz = s_interval > 0.0 ? 1e9 / s_interval : 0.0;
+  const double paced_hz = g_paced_hz.load(std::memory_order_relaxed);
+  if (paced_hz <= 66.0) {
+    s_fast = false;
+    s_since = release_ns;
+  } else if (s_fast ? measured_hz >= 66.0 : measured_hz <= 80.0) {
+    s_since = release_ns;  // still where it is
+  } else if (release_ns - s_since > (s_fast ? 500'000'000 : 2'000'000'000)) {
+    s_fast = !s_fast;
+    s_since = release_ns;
+  }
+  // Late frames and sustained uneven steps (adaptive mode's triggers).
+  const double period_ns = paced_hz > 1.0 && paced_hz < 999.0 ? 1e9 / paced_hz : 1e9 / 60.0;
+  if (frame_ns > 1.25 * period_ns) {
+    s_late.push_back(release_ns);
+  }
+  while (!s_late.empty() && s_late.front() < release_ns - 1'500'000'000) {
+    s_late.pop_front();
+  }
+  size_t uneven = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_uneven_mutex);
+    while (!g_uneven_steps.empty() && g_uneven_steps.front() < release_ns - 1'500'000'000) {
+      g_uneven_steps.pop_front();
+    }
+    uneven = g_uneven_steps.size();
+  }
+  if (s_late.size() >= 2 || uneven >= 4) {
+    s_trigger = release_ns;
+  }
+  const bool triggered = s_trigger != 0 && release_ns - s_trigger < 2'000'000'000;
+  const double k_max = std::clamp(REXCVAR_GET(skate3_adaptive_smoothing_max), 0.0, 1.0);
+  int mode = 0;  // 0 off, 1 adaptive, 2 full
+  double target = 0.0;
+  if (!REXCVAR_GET(skate3_motion_smoothing_auto) || s_fast) {
+    mode = 2;
+    target = 1.0;
+  } else if (k_max > 0.0) {
+    mode = 1;
+    target = triggered ? k_max : 0.0;
+  }
+  double k = g_smooth_k.load(std::memory_order_relaxed);
+  k = target > k ? std::min(target, k + 0.024) : std::max(target, k - 0.008);
+  g_smooth_k.store(k, std::memory_order_relaxed);
+  g_smoothing_wanted.store(mode != 0 || k > 0.0, std::memory_order_relaxed);
+  if (mode != s_logged) {
+    s_logged = mode;
+    if (mode == 2) {
+      REXLOG_INFO("motion-smoothing: full ({}; frames paced at {:.1f} Hz, measured {:.1f} fps)",
+                  s_fast ? "frames outpace the 60 Hz simulation" : "automatic choice off",
+                  paced_hz, measured_hz);
+    } else if (mode == 1) {
+      REXLOG_INFO("motion-smoothing: adaptive (no delay while frames arrive evenly, up to {:.0f}% "
+                  "of the full smoothing while they run late; frames paced at {:.1f} Hz)",
+                  k_max * 100.0, paced_hz);
+    } else {
+      REXLOG_INFO("motion-smoothing: off (the game's own camera and actors are drawn)");
+    }
+  }
+  ++s_frames;
+  s_engaged += k > 0.0 ? 1 : 0;
+  s_max_k = std::max(s_max_k, k);
+  if (rex::chrono::GuestTickTraceEnabled() && release_ns - s_report > 60'000'000'000) {
+    if (s_report != 0) {
+      REXLOG_INFO("motion-smoothing: last 60 s smoothing active in {} of {} frames, strongest {:.2f}",
+                  s_engaged, s_frames, s_max_k);
+    }
+    s_report = release_ns;
+    s_frames = s_engaged = 0;
+    s_max_k = 0.0;
+  }
+}
+
+void OnSwapIssued() {
+  ApplyProcessPriority();
+  g_last_pace_ns = PaceGuestFrame();
+  g_locked_period_ns.store(g_pace_locked_period_ns, std::memory_order_relaxed);
+  const int64_t release = SteadyNowNs();
+  g_release_ns.store(release, std::memory_order_release);
+  UpdateSmoothingWanted(release);
+}
+
+void SleepUntilNs(int64_t target_ns) {
+  // Coarse sleep to ~1.5 ms before (0.5 ms timer resolution), then yield-spin.
+  for (;;) {
+    const int64_t remaining = target_ns - SteadyNowNs();
+    if (remaining <= 0) {
+      return;
+    }
+    if (remaining > 2'000'000) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(remaining - 1'500'000));
+    } else if (remaining > 50'000) {
+      std::this_thread::yield();
+    }
+  }
+}
 
 void OnFrameEnd(uint8_t* base) {
   const uint64_t pace_ns = g_last_pace_ns;
@@ -534,6 +763,106 @@ void OnFrameEnd(uint8_t* base) {
 
 }  // namespace
 
+bool MotionSmoothingWanted() {
+  return g_smoothing_wanted.load(std::memory_order_relaxed);
+}
+
+double MotionSmoothingScale() {
+  return g_smooth_k.load(std::memory_order_relaxed);
+}
+
+void NoteUnevenStep() {
+  std::lock_guard<std::mutex> lock(g_uneven_mutex);
+  g_uneven_steps.push_back(SteadyNowNs());
+  if (g_uneven_steps.size() > 256) {
+    g_uneven_steps.pop_front();
+  }
+}
+
+// The game's simulation tick loop (sub_82966930, on its own thread): each
+// pass waits on a one-shot timer, ticks the simulation (one 60 Hz step, run
+// by worker threads, finished ~5 ms later) and sets the timer again for one
+// period minus its average oversleep over the last 60 ticks. The render
+// thread picks up the latest finished step when a frame starts, so a step
+// finishing within a moment of a frame start decides between that frame and
+// the next. On PC the timer lands on the 0.5 ms timer grid and the ticks
+// drift against the display-locked frames (log234: ticks 16.0/16.5/17.0 ms,
+// steps finishing at the frame start for seconds at a time, then 0/2-step
+// frames). This replaces the wait: ticks keep the game's period (game speed)
+// and are pulled, at most 1 ms per tick, to skate3_sim_tick_lead_ms before a
+// frame start while the pacing is locked to a display at a multiple of the
+// tick rate; otherwise they are only made precise.
+void SimTickWait(int64_t period_100ns) {
+  // The tick decides when the world moves: it must wake on time even when the
+  // CPU is saturated (log234 load run: leads of 2-20 ms at the game's own
+  // priority). It sleeps nearly all the time.
+  static thread_local bool t_raised = false;
+  if (!t_raised) {
+    t_raised = true;
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+  }
+  static int64_t s_last = 0;
+  static int s_state = -1;  // -1 unknown, 0 free, 1 locked
+  static uint64_t s_ticks = 0, s_locked = 0, s_restarts = 0;
+  static int64_t s_max_pull = 0, s_report = 0;
+  int64_t period = 16'666'667;
+  if (period_100ns >= 40'000 && period_100ns <= 1'000'000) {
+    period = period_100ns * 100;
+  }
+  const int64_t now = SteadyNowNs();
+  const int64_t nominal = s_last != 0 ? s_last + period : now + period;
+  int64_t next = nominal;
+  bool locked = false;
+  const int64_t frame = g_locked_period_ns.load(std::memory_order_relaxed);
+  const int64_t release = g_release_ns.load(std::memory_order_acquire);
+  if (frame > 0 && release > 0 && now - release < 4 * frame) {
+    const double ratio = double(period) / double(frame);
+    const double whole = std::round(ratio);
+    if (whole >= 1.0 && whole <= 4.0 && std::abs(ratio - whole) < 0.005 * whole) {
+      const int64_t lead = int64_t(REXCVAR_GET(skate3_sim_tick_lead_ms) * 1e6);
+      const int64_t anchor = release - lead;
+      const int64_t n = std::llround(double(nominal - anchor) / double(frame));
+      const int64_t pull = anchor + n * frame - nominal;  // within half a frame
+      const int64_t step = std::clamp<int64_t>(pull / 2, -1'000'000, 1'000'000);
+      next = nominal + step;
+      locked = true;
+      s_max_pull = std::max<int64_t>(s_max_pull, std::abs(pull));
+    }
+  }
+  if (now - next > 3 * period) {
+    next = now;  // a long stall (loading, pause): start again rather than burst
+    ++s_restarts;
+  }
+  SleepUntilNs(next);
+  s_last = next;
+  ++s_ticks;
+  s_locked += locked ? 1 : 0;
+  rex::chrono::TraceGuestTimingEvent(rex::chrono::kGuestTitleEvent, locked ? 1u : 0u,
+                                     skate3::actor_history::kTitleSimTick);
+  if (int(locked) != s_state) {
+    s_state = int(locked);
+    if (locked) {
+      REXLOG_INFO("sim-tick: locked to the display ({:.3f} ms frames, ticks {:.3f} ms, "
+                  "{:.1f} ms before each frame)", double(frame) / 1e6, double(period) / 1e6,
+                  REXCVAR_GET(skate3_sim_tick_lead_ms));
+    } else {
+      REXLOG_INFO("sim-tick: not locked to the display; precise {:.3f} ms ticks",
+                  double(period) / 1e6);
+    }
+  }
+  if (rex::chrono::GuestTickTraceEnabled() && next - s_report > 60'000'000'000) {
+    if (s_report != 0) {
+      REXLOG_INFO("sim-tick: last 60 s {} ticks, {} locked, largest pull {:.2f} ms, {} restarts",
+                  s_ticks, s_locked, double(s_max_pull) / 1e6, s_restarts);
+    }
+    s_report = next;
+    s_ticks = s_locked = s_restarts = 0;
+    s_max_pull = 0;
+  }
+}
+
 void Install() {
   if (!Enabled()) {
     return;
@@ -606,19 +935,118 @@ extern "C" REX_FUNC(sub_827FAF50) {
 
 
 // Guest D3D Swap: frame boundary. The frame goes out first; pacing then
-// delays the start of the next one (see PaceGuestFrame).
+// delays the start of the next one (see PaceGuestFrame). Each step is marked
+// in the guest timing trace while it is on (actor history capture).
 extern "C" REX_FUNC(sub_82B82E08) {
+  namespace history = skate3::actor_history;
+  const auto mark = [](uint16_t event) {
+    rex::chrono::TraceGuestTimingEvent(rex::chrono::kGuestTitleEvent, 0, event);
+  };
   const bool native = skate3::native_render::Enabled();
+  mark(history::kTitleFrameEndBegin);
   if (native) {
     skate3::native_render::OnFrameEnd(base);
   }
+  mark(history::kTitleSwapCall);
   {
     skate3::perf_recorder::GuestSwapScope swap_detail(native);
     __imp__sub_82B82E08(ctx, base);
   }
+  mark(history::kTitlePaceBegin);
   if (native) {
     skate3::native_render::OnSwapIssued();
   }
+  mark(history::kTitlePaceEnd);
+}
+
+// The game's two clock-read wrappers: sub_82B1F7E8 (a bare mftb, 34 call
+// sites) and sub_82EDE320 (QueryPerformanceCounter, ~40). With the guest
+// timing trace on, their reads are tagged with the caller's code site
+// instead of the wrapper's, so a trace shows which code read the clock.
+extern "C" REX_FUNC(sub_82B1F7E8) {
+  if (rex::chrono::GuestTickTraceEnabled()) {
+    rex::chrono::SetGuestTickSite(rex::chrono::GuestTickSiteOf(__builtin_return_address(0)));
+    __imp__sub_82B1F7E8(ctx, base);
+    rex::chrono::SetGuestTickSite(0);
+    return;
+  }
+  __imp__sub_82B1F7E8(ctx, base);
+}
+
+extern "C" REX_FUNC(sub_82EDE320) {
+  if (rex::chrono::GuestTickTraceEnabled()) {
+    rex::chrono::SetGuestTickSite(rex::chrono::GuestTickSiteOf(__builtin_return_address(0)));
+    __imp__sub_82EDE320(ctx, base);
+    rex::chrono::SetGuestTickSite(0);
+    return;
+  }
+  __imp__sub_82EDE320(ctx, base);
+}
+
+// The game's simulation tick loop thread (see SimTickWait): r3 = the loop
+// object (+8 timer handle, +24 period in 100 ns units). The function only
+// returns when the loop is stopped.
+namespace {
+thread_local uint32_t t_sim_tick_loop = 0;
+}
+
+// The tick loop's rate setter (sub_82966910(loop, hz): +32 = hz, +24 =
+// 1e7 / hz), reached only through a function pointer. The game lowers its
+// simulation rate when frames run slow (log234: 59 -> 30 -> 47 -> 60 Hz over a
+// 0.35 s hitch); each change is logged with its caller and marked in the trace.
+extern "C" REX_FUNC(sub_82966910) {
+  const uint32_t hz = ctx.r4.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_82966910(ctx, base);
+  static uint32_t s_hz = 0;
+  static int64_t s_window = 0;
+  static uint32_t s_lines = 0, s_quiet = 0;
+  rex::chrono::TraceGuestTimingEvent(rex::chrono::kGuestTitleEvent, hz,
+                                     skate3::actor_history::kTitleSimRate);
+  if (hz == s_hz) {
+    return;
+  }
+  const uint32_t was = s_hz;
+  s_hz = hz;
+  const int64_t now = skate3::native_render::SteadyNowNs();
+  if (now - s_window > 10'000'000'000) {
+    if (s_quiet != 0) {
+      REXLOG_INFO("sim-rate: {} more rate changes in the last 10 s not listed", s_quiet);
+    }
+    s_window = now;
+    s_lines = s_quiet = 0;
+  }
+  if (++s_lines <= 12) {
+    REXLOG_INFO("sim-rate: the game set its simulation rate {} -> {} Hz (caller {:08X})", was, hz,
+                caller);
+  } else {
+    ++s_quiet;
+  }
+}
+
+extern "C" REX_FUNC(sub_82966930) {
+  t_sim_tick_loop = ctx.r3.u32;
+  REXLOG_INFO("sim-tick: simulation tick loop started (object {:08X})", ctx.r3.u32);
+  __imp__sub_82966930(ctx, base);
+  t_sim_tick_loop = 0;
+}
+
+// WaitForSingleObject(handle, ms), 232 callers. On the tick loop's thread,
+// its wait on the tick timer is replaced (skate3_sim_tick_lock).
+extern "C" REX_FUNC(sub_82EDFEC0) {
+  const uint32_t loop = t_sim_tick_loop;
+  if (loop != 0 && REXCVAR_GET(skate3_sim_tick_lock)) {
+    uint32_t timer = 0;
+    uint64_t period = 0;
+    if (skate3::native_scene::GuestTryCopy(&timer, REX_RAW_ADDR(loop + 8), sizeof(timer)) &&
+        __builtin_bswap32(timer) == ctx.r3.u32 &&
+        skate3::native_scene::GuestTryCopy(&period, REX_RAW_ADDR(loop + 24), sizeof(period))) {
+      skate3::native_render::SimTickWait(int64_t(__builtin_bswap64(period)));
+      ctx.r3.u64 = 0;  // WAIT_OBJECT_0
+      return;
+    }
+  }
+  __imp__sub_82EDFEC0(ctx, base);
 }
 
 // cProcessArenaAsset::RegisterTexture(cAssetList*, cAssetID,
