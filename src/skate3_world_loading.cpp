@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -26,7 +27,9 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <cctype>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -88,6 +91,10 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_world_audio, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_skate2_painted_audio, true, "Skate 3",
                     "Translate New San Van's painted audio (ambience beds, sound zones, reverb) "
                     "so Skate 3's audio plays it (tools/build_skate2_audio.py); restart required");
+REXCVAR_DEFINE_BOOL(skate3_skate2_reverb, true, "Skate 3",
+                    "New San Van: apply Skate 2's reverb (its painted reverb zones, translated to "
+                    "Skate 3's reverb presets, and its reverb map). false = no Skate 2 reverb, for "
+                    "comparing how horns and other sounds echo; restart required");
 
 REXCVAR_DEFINE_BOOL(skate3_skate2_livingworld_probe, false, "Skate 3",
                     "Log New San Van census, road activation, actor creation and navigation");
@@ -95,6 +102,46 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_original_pedestrians, true, "Skate 3",
                     "Enable original New San Van pedestrians when prepared navigation is installed");
 REXCVAR_DEFINE_BOOL(skate3_skate2_original_vehicles, true, "Skate 3",
                     "Load the original vehicle roster on New San Van roads; restart required");
+REXCVAR_DEFINE_STRING(skate3_skate2_horn_replace, "", "Skate 3",
+                      "New San Van car horns to replace, as bad=good pairs of horn numbers "
+                      "(1-27, Traffic_Horn.abk sample order; e.g. \"1=10,4=10\"). Each listed horn "
+                      "plays the other horn's sound instead; applied when the traffic horn bank "
+                      "loads (restart or map change). Empty = every original horn.");
+REXCVAR_DEFINE_BOOL(skate3_skate2_goals, true, "Skate 3",
+                    "New San Van: offer Skate 2's goals when their package is installed "
+                    "(tools/build_skate2_goals.py; development). Their start markers load at "
+                    "startup; restart required");
+REXCVAR_DEFINE_BOOL(skate3_skate2_goal_intros, true, "Skate 3",
+                    "Skate 2 goals: play Skate 2's spot intro cutscenes (camera fly-by with Reda) "
+                    "when a goal starts. The goals package adds them the way Skate 3's DLC adds "
+                    "cutscenes, in one newer cutscene file that holds every Skate 3 cutscene "
+                    "unchanged; false = the game loads its own newest cutscene file. Restart "
+                    "required");
+REXCVAR_DEFINE_BOOL(skate3_nsv_autosave_hold, true, "Skate 3",
+                    "New San Van: hold career autosave off while New San Van is loaded, so a save "
+                    "never stores New San Van coordinates (the next start would load into a void "
+                    "in Skate 3's Downtown). False = autosave as usual (test only: return to a "
+                    "Skate 3 map and let it autosave before quitting)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_goal_arrows, true, "Skate 3",
+                    "New San Van: show the Skate 2 goals' arrows (and the teleport on the map) as soon as "
+                    "the city loads. Skate 3 shows a goal only once your career has it unlocked; New San "
+                    "Van's goals are not in the career (its saves are held), so each session showed no "
+                    "arrow until the first 'spot found'. Off = Skate 3's discovery rule")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_goals_log, false, "Skate 3",
+                    "Diagnostics: log each mission hull (goal, props, teleport) the game asks to "
+                    "load in New San Van, once per name. Off by default.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_skate2_original_horns, true, "Skate 3",
+                    "New San Van car horns: Skate 2's original horn sounds; false = Skate 3's own "
+                    "horns (the other Skate 2 traffic sounds stay); restart or map change");
+REXCVAR_DEFINE_BOOL(skate3_skate2_horn_oneshot, true, "Skate 3",
+                    "New San Van car horns: play Skate 2's nine held (looped) horns once, as "
+                    "Skate 3's own horns in those slots play. Skate 3's traffic never stops a "
+                    "horn, so a looped one kept sounding and repeated honks stacked into a "
+                    "flanged sound. Applied when the traffic horn bank loads (restart or map "
+                    "change).");
 
 namespace {
 // Populated during Install before guest execution; immutable thereafter.
@@ -103,6 +150,13 @@ std::atomic<bool> skate2_ready{false};
 std::atomic<bool> load_requested{false};
 std::atomic<bool> skate2_loading{false};
 std::atomic<bool> bam_gameplay{false};
+// Skate 2 goals package (tools/build_skate2_goals.py, mods/skate2/goals-v1):
+// its start-marker files (Skate 2 district locator arenas) sit in Skate 3's
+// global_locators\BAM\DIST_DownTown, the Downtown template New San Van runs
+// under, so a goal is only discoverable where its start marker is loaded.
+// Lowercase file names of those arenas; the locator scan skips them unless
+// New San Van is loading (sub_8298FE90 / sub_8298FFF8 hooks below).
+std::unordered_set<std::string> nsv_goal_locator_files;
 std::atomic<uint64_t> render_world_identity{0};
 std::atomic<uint64_t> indoor_world_identity{0};
 // Debug-only snapshots; never retain or dereference a guest resource unguarded.
@@ -134,6 +188,28 @@ std::vector<std::string> skate2_streams;
 // The stream the armed template load turns into, and the one running now.
 std::atomic<int> requested_stream{0};
 std::atomic<int> loaded_stream{-1};
+// Challenge collections the goals package adds (mods/skate2/goals-v1/goals.txt:
+// goals, groups, teleports; never the re-exported 'default'). Filled during
+// Install before guest execution; immutable thereafter.
+std::unordered_set<uint64_t> nsv_challenge_keys;
+// Same keys -> "<kind> <name>" from goals.txt, for the goals log.
+std::unordered_map<uint64_t, std::string> nsv_challenge_names;
+// The package teleports' destination locators ("exit=" in goals.txt). Their
+// World is Downtown's, NSV's template district, so a teleport to one of these
+// is an in-city hop and must not take the leave-New San Van reload (log 352:
+// the reload showed a loading screen and dropped the skater into the void).
+std::unordered_set<std::string> nsv_teleport_exits;
+// Reda's line per Skate 2 intro scene ("intro <scene id> <goal> speaker= line="
+// in goals.txt): scene id -> (speaker, line). See sub_82826C98.
+std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> nsv_intro_lines;
+// Package challenges left out since the last world load (one log line per map).
+std::atomic<uint64_t> nsv_challenges_hidden{0};
+// The package's challenges belong to New San Van (BAM, stream 0) only. They
+// borrow Downtown's world record, so without this Skate 3's Downtown and the
+// Skate 2 DLC maps would stream and run them too (log 348).
+bool NsvChallengesHidden() {
+  return !nsv_challenge_keys.empty() && !(skate2_loading.load() && loaded_stream.load() == 0);
+}
 bool LivingWorldStream(int stream) {
   return stream >= 0 && stream < int(skate2_actor_streams.size()) && skate2_actor_streams[stream];
 }
@@ -313,7 +389,8 @@ bool CareerAutosaveHeld() {
 }
 
 void HoldCareerAutosave(uint8_t* base, bool may_release) {
-  const bool hold = skate2_loading.load() || template_world.load() != 0;
+  const bool hold = REXCVAR_GET(skate3_nsv_autosave_hold) &&
+                    (skate2_loading.load() || template_world.load() != 0);
   std::lock_guard lock(autosave_mutex);
   if (!hold && !autosave_hold.active) return;
   uint32_t game = 0;
@@ -336,8 +413,9 @@ void HoldCareerAutosave(uint8_t* base, bool may_release) {
   } else if (may_release) {
     flags[35] = autosave_hold.enabled;
     autosave_hold.active = false;
-    REXLOG_INFO("nsv-autosave: career autosave handed back in Skate 3 ({})",
-                autosave_hold.enabled ? "on" : "off");
+    REXLOG_INFO("nsv-autosave: career autosave handed back ({}){}",
+                autosave_hold.enabled ? "on" : "off",
+                REXCVAR_GET(skate3_nsv_autosave_hold) ? " in Skate 3" : " (skate3_nsv_autosave_hold = false)");
   }
 }
 
@@ -409,6 +487,10 @@ void InstallPaintedAudio(rex::filesystem::VirtualFileSystem* vfs,
     const uint64_t key = std::strtoull(key_text.c_str(), &end, 16);
     if (key == 0 || !end || *end != '\0' || (kind != "layer" && kind != "value")) {
       REXLOG_WARN("skate2-audio: invalid worldpainter.txt line '{}'", line);
+      continue;
+    }
+    if (kind == "layer" && name == "audio_reverb" && !REXCVAR_GET(skate3_skate2_reverb)) {
+      REXLOG_INFO("skate2-audio: Skate 2 reverb zones off (skate3_skate2_reverb = false)");
       continue;
     }
     (kind == "layer" ? paint_layers : paint_values)[id] = key;
@@ -561,6 +643,67 @@ void skate3::world_loading::Install(rex::filesystem::VirtualFileSystem* vfs,
                                     const std::filesystem::path& app_root) {
   skate2_ready.store(false);
   skate2_streams = {"BAM"};
+  // Gate the Skate 2 goals' start markers before any early return: the
+  // package's files load on every map whether or not New San Van is enabled.
+  nsv_goal_locator_files.clear();
+  {
+    std::error_code ec;
+    const auto markers = app_root / "mods" / "skate2" / "goals-v1" / "loose" / "data" /
+                         "content" / "global_locators" / "BAM" / "DIST_DownTown";
+    for (const auto& entry : std::filesystem::directory_iterator(markers, ec)) {
+      if (!entry.is_regular_file(ec) || entry.path().extension() != ".rx2") continue;
+      std::string name = entry.path().filename().string();
+      std::transform(name.begin(), name.end(), name.begin(),
+                     [](unsigned char c) { return char(std::tolower(c)); });
+      nsv_goal_locator_files.insert(std::move(name));
+    }
+    if (!nsv_goal_locator_files.empty()) {
+      REXLOG_INFO("skate2-goals: {} Skate 2 goal marker files; New San Van only{}",
+                  nsv_goal_locator_files.size(),
+                  REXCVAR_GET(skate3_skate2_goals) ? "" : " (goals off: skate3_skate2_goals = false)");
+    }
+  }
+  // "<kind> <16 hex digits> nsv_<name> ..." per challenge collection; the
+  // header lines carry no key.
+  nsv_challenge_keys.clear();
+  nsv_challenge_names.clear();
+  nsv_teleport_exits.clear();
+  nsv_intro_lines.clear();
+  {
+    std::ifstream list(app_root / "mods" / "skate2" / "goals-v1" / "goals.txt");
+    std::string line;
+    while (std::getline(list, line)) {
+      std::istringstream fields(line);
+      std::string kind, key, name;
+      if (kind.empty() && (fields >> kind >> key >> name) && kind == "intro" && key.size() == 8) {
+        uint32_t speaker = 0, number = 0;
+        for (std::string option; fields >> option;) {
+          if (option.rfind("speaker=", 0) == 0) speaker = uint32_t(std::strtoul(option.c_str() + 8, nullptr, 10));
+          if (option.rfind("line=", 0) == 0) number = uint32_t(std::strtoul(option.c_str() + 5, nullptr, 10));
+        }
+        if (speaker && number) nsv_intro_lines[uint32_t(std::strtoul(key.c_str(), nullptr, 16))] = {speaker, number};
+        continue;
+      }
+      fields.clear();
+      fields.str(line);
+      kind.clear();
+      if (!(fields >> kind >> key >> name) || key.size() != 16 || name.rfind("nsv_", 0) != 0 ||
+          !std::all_of(key.begin(), key.end(), [](unsigned char c) { return std::isxdigit(c) != 0; })) {
+        continue;
+      }
+      const uint64_t value = std::strtoull(key.c_str(), nullptr, 16);
+      nsv_challenge_keys.insert(value);
+      nsv_challenge_names[value] = kind + " " + name;
+      for (std::string option; fields >> option;) {
+        if (kind == "teleport" && option.rfind("exit=", 0) == 0 && option.size() > 5)
+          nsv_teleport_exits.insert(option.substr(5));
+      }
+    }
+    if (!nsv_challenge_keys.empty()) {
+      REXLOG_INFO("skate2-goals: {} New San Van challenges (goals.txt); left out of every other map",
+                  nsv_challenge_keys.size());
+    }
+  }
   if (!vfs || !REXCVAR_GET(skate3_skate2_enabled)) return;
   // The prepared map is the release artifact. Its catalogs, global cells,
   // spatial cells and lighting inventory form one complete mounted directory.
@@ -1360,8 +1503,13 @@ bool skate3::world_loading::ArmMenuSpawn(uint8_t* base, const std::string& label
 // Inside BAM the loaded world (+40) is the template district, so a retail
 // destination in that district would compare equal and teleport to Skate 3
 // coordinates inside New San Van. An invalid +40 forces the full reload.
-void skate3::world_loading::BeforeRetailTeleport(uint8_t* base, uint64_t world) {
+void skate3::world_loading::BeforeRetailTeleport(uint8_t* base, uint64_t world,
+                                                  const std::string& locator) {
   if (!skate2_loading.load() || world == kNewSanVanWorld) return;
+  if (world == WorldField(base, 40) && nsv_teleport_exits.contains(locator)) {
+    REXLOG_INFO("skate2: New San Van teleport to '{}' stays in the city (no reload)", locator);
+    return;
+  }
   lw_load_group_pending.store(false);
   lw_load_group_loaded.store(false);
   const uint64_t invalid = ~uint64_t(0);
@@ -2562,6 +2710,7 @@ extern "C" REX_FUNC(sub_82476608) {
   __imp__sub_82476608(ctx, base);
   skate2_loading.store(false);
   bam_gameplay.store(false);
+  nsv_challenges_hidden.store(0);
   if (skate2_ready.load() && world == template_world.load() && world != 0) {
     // These are the actual fixed-size fields filled by the original function.
     // Require the observed retail layout before changing either field.
@@ -2634,6 +2783,106 @@ extern "C" REX_FUNC(sub_82476608) {
 // loads that record's emitter maps through 828DCCF8. It runs before the
 // stream loader is configured (run 120: the map request precedes 82476608 by
 // about 1 s), so a New San Van load is still the armed template here.
+// Goal intro voices (logs 345-347: the fly-by plays silent; the NIS loader
+// sub_824A5A08 was never asked for our bank). Retail DLC banks (Maloof, Danny
+// Way) are loose files in their package: data/audio/english/<resident>.big
+// (the .snr headers) and <NAME>.sns streams, in an aud_bigfiles record with
+// the DLC flag, which the boot loader sub_824A47F8 skips. A world's DLC bank
+// loads through its aud_worlddata in the per-frame audio loader sub_824A92D8:
+// the resident file (folder + resident name, sub_824A49E0 / sub_824A4B28)
+// through the package-aware file system, then sub_824A5A08(manager, slot,
+// resident, folder, 1); r7 = 1 takes the folder as is ("%s") where base banks
+// get "data\%s|", an archive on the disc. New San Van borrows Downtown's world
+// record, so no world names nsv_goals_audio: load it the same way, once, when
+// New San Van loads. Log 348: the boot path (sub_824A48C8) instead opened
+// d:\data\audio\english\nsvgoals_nis.big, an archive that only existed inside
+// the goals package; its resident load came back empty and the audio thread
+// crashed half a second later. Every step here is checked: without the
+// package or its resident file the intros stay silent and nothing is loaded.
+constexpr uint64_t kAudBigfilesClass = 0x8DAAF4BDCF82DA94ull;  // h64("aud_bigfiles")
+constexpr uint64_t kGoalVoiceRecord = 0x6F9BCDF5F2AFDE50ull;   // h64("nsv_goals_audio")
+void LoadGoalVoiceBank(PPCContext& ctx, uint8_t* base) {
+  static std::atomic<bool> loaded{false};
+  if (!REXCVAR_GET(skate3_skate2_goals) || !REXCVAR_GET(skate3_skate2_goal_intros) ||
+      loaded.exchange(true)) {
+    return;
+  }
+  uint32_t manager = 0, heap = 0;
+  if (!GuestU32(base, 0x830CFDDC, manager) || manager < 0x10000 ||
+      !GuestU32(base, 0x830CFDBC, heap) || heap < 0x10000) {
+    loaded.store(false);  // Audio not up yet: the next New San Van load tries again.
+    return;
+  }
+  auto call = ctx;
+  call.r3.u64 = kAudBigfilesClass;
+  call.r4.u64 = kGoalVoiceRecord;
+  sub_82B69B08(call, base);
+  const uint32_t collection = call.r3.u32;
+  if (collection == 0) {
+    REXLOG_WARN("skate2-goals: goal voice record nsv_goals_audio not mounted; goal intros stay silent");
+    return;
+  }
+  auto* memory = rex::system::kernel_memory();
+  const uint32_t scratch = memory->SystemHeapAlloc(16 + 256, 16);
+  if (!scratch) {
+    REXLOG_ERROR("skate2-goals: goal voice bank scratch allocation failed");
+    return;
+  }
+  // The record's slot through an attribute instance, as sub_824A48C8 reads it.
+  const uint32_t instance = scratch, path = scratch + 16;
+  call = ctx;
+  call.r3.u32 = instance;
+  call.r4.u32 = collection;
+  sub_82B6CC78(call, base);
+  call = ctx;
+  call.r3.u32 = instance;
+  sub_82484248(call, base);
+  uint32_t slot = ~0u;
+  GuestU32(base, call.r3.u32, slot);
+  call = ctx;
+  call.r3.u32 = collection;
+  sub_82B69978(call, base);  // The instance's collection reference.
+  call = ctx;
+  call.r3.u64 = kGoalVoiceRecord;
+  sub_824A49E0(call, base);
+  const uint32_t folder = call.r3.u32;
+  call = ctx;
+  call.r3.u64 = kGoalVoiceRecord;
+  sub_824A4B28(call, base);
+  const std::string folder_name = GuestString(base, folder);
+  const std::string resident_path = folder_name + GuestString(base, call.r3.u32);
+  if (slot > 15 || folder_name.empty() || resident_path.size() <= folder_name.size() ||
+      resident_path.size() >= 256) {
+    REXLOG_WARN("skate2-goals: goal voice record unreadable (slot {} folder '{}' resident '{}'); intros stay silent",
+                slot, folder_name, resident_path);
+    memory->SystemHeapFree(scratch);
+    return;
+  }
+  std::memcpy(base + path, resident_path.c_str(), resident_path.size() + 1);
+  call = ctx;
+  call.r3.u32 = path;
+  call.r4.u32 = heap + 112;  // The audio heap sub_824A48C8 loads residents into.
+  call.r5.u32 = 0;
+  call.r6.u32 = 1;
+  call.r7.u32 = 16;
+  sub_8298ED88(call, base);
+  const uint32_t resident = call.r3.u32;
+  memory->SystemHeapFree(scratch);
+  if (resident == 0) {
+    REXLOG_WARN("skate2-goals: goal voice headers '{}' not found; goal intros stay silent", resident_path);
+    return;
+  }
+  call = ctx;
+  call.r3.u32 = manager;
+  call.r4.u32 = slot;
+  call.r5.u32 = resident;
+  call.r6.u32 = folder;  // Formatted into the bank's own buffer.
+  call.r7.u32 = 1;
+  sub_824A5A08(call, base);
+  REXLOG_INFO("skate2-goals: goal voice bank loaded: slot {} headers '{}' streams '{}'", slot, resident_path,
+              folder_name);
+}
+
 extern "C" REX_FUNC(sub_82489490) {
   const uint64_t world = ctx.r4.u64;
   const bool original = lw_assets_ready && REXCVAR_GET(skate3_skate2_original_vehicles) &&
@@ -2653,6 +2902,7 @@ extern "C" REX_FUNC(sub_82489490) {
     }
   }
   audio_stream.store(stream);
+  if (world != 0 && world == template_world.load()) LoadGoalVoiceBank(ctx, base);
   if (!skate2_audio_maps.empty()) {
     REXLOG_INFO("skate2-audio: world {:016X} audio: {}", world,
                 stream >= 0 ? "Skate 2 maps of " + skate2_streams[stream] : std::string("retail"));
@@ -2727,6 +2977,17 @@ extern "C" REX_FUNC(sub_828DC380) {
   constexpr std::string_view prefix = "data/audio/";
   const std::string name = original.starts_with(prefix) ? original.substr(prefix.size()) : std::string();
   if (!lw_traffic_banks.contains(name)) { __imp__sub_828DC380(ctx, base); return; }
+  // skate3_skate2_original_horns = false keeps Skate 3's own horn bank in New
+  // San Van (the other Skate 2 traffic banks still load).
+  if (name == "Traffic_Horn.abk" && !REXCVAR_GET(skate3_skate2_original_horns)) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("skate2-horns: Skate 3's own horns in New San Van (skate3_skate2_original_horns = false)");
+    }
+    __imp__sub_828DC380(ctx, base);
+    return;
+  }
   const uint32_t manager = ctx.r3.u32;
   const uint32_t slot = manager + 12 + (40 * group + index) * 100;
   uint32_t state = 0, references = 0;
@@ -2753,10 +3014,662 @@ extern "C" REX_FUNC(sub_828DC380) {
     REXLOG_INFO("skate2-lw: original traffic bank queued group={} index={} path='{}' allocation=owned", group, index, path);
 }
 
+// skate3_skate2_horn_replace: point listed entries of the loaded original
+// horn bank's S10A sample table at other entries, before the game registers
+// the bank. Only the in-memory copy changes (no file, no rebake). The S10A
+// chunk: "S10A", u32 0, u32 count, then count u32 offsets of each sample's
+// SNR header + data from the chunk start (Traffic_Horn.abk: 27 samples,
+// every third one a looped held horn). Replacements keep their own header,
+// so a held horn should replace a held horn.
+//
+// skate3_skate2_horn_oneshot: Skate 2 stores every third horn as a held horn,
+// a looped sample (SNR loop bit, a loop-start word, then a short pre-loop
+// block and the loop block) that Skate 2's traffic started and later stopped.
+// Skate 3's traffic only fires horns (its own bank has a 1.5 s one-shot in
+// each of those slots) and never stops one, so the Skate 2 loop kept playing
+// and every further honk stacked another slightly detuned copy on top: the
+// flanged "kazoo" horn (audio taps 1794795040/1794795083: horns 1 and 16,
+// every harmonic doubled 0.3-1% apart). Each looped sample in the loaded bank
+// becomes a one-shot of its loop body: the second block moves to the first
+// block's place, the loop bit is cleared and the sample count becomes the
+// body's (1.5-2.6 s; Skate 3's own held-horn slots are 1.5 s). The body is a
+// self-contained EA-XMA block (the loop restarts decoding there), so it
+// decodes exactly as the loop does; vgmstream-checked bit-identical, while
+// keeping both blocks as one one-shot decoded only the 0.1 s pre-loop part.
+// The short pre-loop onset is dropped. Validated per sample: exactly two
+// blocks that add up to its sample count inside its own slot, else untouched.
+static void ConvertLoopedHorns(uint8_t* base, uint32_t s10a,
+                               const std::vector<uint32_t>& table, uint32_t chunk_end) {
+  std::vector<uint32_t> starts;
+  starts.reserve(table.size());
+  for (uint32_t offset : table) starts.push_back(s10a + offset);
+  std::vector<uint32_t> sorted = starts;
+  std::sort(sorted.begin(), sorted.end());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+  std::string converted, skipped;
+  for (size_t i = 0; i < starts.size(); ++i) {
+    const uint32_t at = starts[i];
+    const auto next = std::upper_bound(sorted.begin(), sorted.end(), at);
+    const uint32_t end = next == sorted.end() ? chunk_end : *next;
+    uint32_t h2 = 0;
+    if (end < at + 20 || !GuestU32(base, at + 4, h2) || !(h2 & (1u << 29))) continue;
+    const uint32_t total = h2 & 0x1FFFFFFFu;
+    uint32_t p = at + 12, samples = 0, blocks = 0, body = 0, body_size = 0, body_samples = 0;
+    while (samples < total && p + 8 <= end) {
+      uint32_t word = 0, block_samples = 0;
+      if (!GuestU32(base, p, word) || !GuestU32(base, p + 4, block_samples)) break;
+      const uint32_t size = word & 0xFFFFFFu;
+      if (size < 8 || size > end - p) break;
+      if (++blocks == 2) {
+        body = p;
+        body_size = size;
+        body_samples = block_samples;
+      }
+      samples += block_samples;
+      p += size;
+    }
+    const std::string number = std::to_string(i + 1);
+    if (samples != total || blocks != 2 || body_samples == 0) {
+      skipped += (skipped.empty() ? "" : ", ") + number;
+      continue;
+    }
+    std::memmove(base + at + 8, base + body, body_size);
+    std::memset(base + at + 8 + body_size, 0, p - (at + 8 + body_size));
+    StoreGuestU32(base, at + 4, (h2 & 0xC0000000u & ~(1u << 29)) | body_samples);
+    converted += (converted.empty() ? "" : ", ") + number;
+  }
+  if (!converted.empty()) {
+    REXLOG_INFO("skate2-horns: held horns {} now play once (Skate 3 never stops a horn)",
+                converted);
+  }
+  if (!skipped.empty()) {
+    REXLOG_WARN("skate2-horns: held horns {} have an unexpected layout; left looped", skipped);
+  }
+}
+
+static void ApplyHornReplacements(uint8_t* base, uint32_t slot) {
+  const std::string spec = REXCVAR_GET(skate3_skate2_horn_replace);
+  const bool oneshot = REXCVAR_GET(skate3_skate2_horn_oneshot);
+  if (spec.empty() && !oneshot) {
+    return;
+  }
+  // The slot's +0x4C is the loaded ABKC bank (828DC660, kind 1). Its size
+  // comes from the bank's own header (+0x14 = file size, 0x508B0 for
+  // Traffic_Horn.abk): the native owning-buffer loader that queues the
+  // original banks leaves the slot's +0x50 unset, which made this hook skip
+  // every horn fix (log 337: "horn bank not readable"). +0x20 is the S10A
+  // sample chunk's offset (registration relocates it to +0x40 afterwards).
+  uint32_t data = 0, bytes = 0, magic = 0;
+  if (!GuestU32(base, slot + 0x4C, data) || !GuestU32(base, data, magic) ||
+      magic != 0x41424B43u || !GuestU32(base, data + 0x14, bytes) || bytes < 64 ||
+      bytes > 0x4000000) {  // "ABKC", at most 64 MB
+    REXLOG_ERROR("skate2-horns: horn bank not readable; horn fixes skipped");
+    return;
+  }
+  uint32_t s10a = 0, chunk = 0, word = 0;
+  if (GuestU32(base, data + 0x20, chunk) && chunk >= 0x24 && chunk + 16 <= bytes &&
+      GuestU32(base, data + chunk, word) && word == 0x53313041u) {  // "S10A"
+    s10a = data + chunk;
+  }
+  for (uint32_t at = 0; s10a == 0 && at + 16 <= bytes; at += 4) {
+    if (GuestU32(base, data + at, word) && word == 0x53313041u) {
+      s10a = data + at;
+    }
+  }
+  uint32_t count = 0;
+  if (s10a == 0 || !GuestU32(base, s10a + 8, count) || count == 0 || count > 1024 ||
+      s10a + 12 + count * 4 > data + bytes) {
+    REXLOG_ERROR("skate2-horns: no sample table in the horn bank; horn fixes skipped");
+    return;
+  }
+  std::vector<uint32_t> table(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    GuestU32(base, s10a + 12 + i * 4, table[i]);
+  }
+  if (oneshot) {
+    ConvertLoopedHorns(base, s10a, table, data + bytes);
+  }
+  std::vector<uint32_t> result = table;
+  std::string applied;
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t end = spec.find_first_of(", ;", pos);
+    if (end == std::string::npos) end = spec.size();
+    const std::string pair = spec.substr(pos, end - pos);
+    pos = end + 1;
+    const size_t eq = pair.find_first_of("=>");
+    if (pair.empty() || eq == std::string::npos) continue;
+    const int bad = std::atoi(pair.substr(0, eq).c_str());
+    const int good = std::atoi(pair.substr(eq + 1).c_str());
+    if (bad < 1 || good < 1 || uint32_t(bad) > count || uint32_t(good) > count) {
+      REXLOG_ERROR("skate2-horns: ignoring '{}' (horns are 1-{})", pair, count);
+      continue;
+    }
+    result[bad - 1] = table[good - 1];  // from the ORIGINAL table: no chains
+    applied += (applied.empty() ? "" : ", ") + std::to_string(bad) + "->" + std::to_string(good);
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    if (result[i] != table[i]) StoreGuestU32(base, s10a + 12 + i * 4, result[i]);
+  }
+  if (!applied.empty()) {
+    REXLOG_INFO("skate2-horns: replaced horns {} ({} in the bank)", applied, count);
+  }
+}
+
+// Global locator scan (sub_82910388, "Temp Load Locators Buffer"): walks a
+// district's global_locators folder with find-first sub_8298FE90 (state r3,
+// folder r4, pattern "*.rx2") and find-next sub_8298FFF8 (state r3); the
+// state's +8 byte = found, +0x140 = file name. The *.rx2 loop's call sites
+// return to 82910454 (first) and 829105E8 (next). Skate 2 goal marker files
+// are skipped when skate3_skate2_goals is off. (9 of the 22 start markers lie
+// inside Skate 3 Downtown's area; whether a goal can surface there is open,
+// see HANDOFF round 268.)
+static bool SkipNsvGoalMarkerFile(uint8_t* base, uint32_t state) {
+  if (nsv_goal_locator_files.empty() || base[state + 8] == 0) return false;
+  std::string name = GuestString(base, state + 0x140);
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return char(std::tolower(c)); });
+  if (!nsv_goal_locator_files.contains(name)) return false;
+  // Log 344: the scan runs at startup and when DLC mounts (sub_826D9040 /
+  // sub_826DAB98 -> sub_828A3D50 -> sub_82910388), never on a world load, so
+  // skipping unless New San Van was loading kept every marker out. The files
+  // now load whenever the goals are on; a Skate 2 goal can only be discovered
+  // where its streamed mission hull (trigger volumes) loads, i.e. New San Van.
+  if (REXCVAR_GET(skate3_skate2_goals)) {
+    static std::mutex logged_mutex;
+    static std::unordered_set<std::string> logged;
+    std::lock_guard<std::mutex> lock(logged_mutex);
+    if (logged.insert(name).second) {
+      REXLOG_INFO("skate2-goals: loaded goal marker file {}", name);
+    }
+    return false;
+  }
+  return true;
+}
+
+// Skate 2 goal intro cutscenes: the goals package adds data\scene\scene_050.bin
+// and ice_050.bin (tools/build_skate2_goals.py SCENE_NUMBER), Skate 3's newest
+// scene table and ICE database plus the goals' intro scenes. The loaders
+// (sub_82823898 for scene_*, sub_82827DE8 for ice_*) keep the highest number
+// they find, as they do for the retail DLC files 002-006, so with
+// skate3_skate2_goal_intros off these two names are skipped and the game falls
+// back to its own newest files.
+static bool SkipGoalIntroFile(uint8_t* base, uint32_t state) {
+  if (REXCVAR_GET(skate3_skate2_goal_intros) || base[state + 8] == 0) return false;
+  std::string name = GuestString(base, state + 0x140);
+  std::transform(name.begin(), name.end(), name.begin(),
+                 [](unsigned char c) { return char(std::tolower(c)); });
+  return name == "scene_050.bin" || name == "ice_050.bin";
+}
+
+static void SkipPackageFiles(PPCContext& ctx, uint8_t* base, uint32_t state, bool marker_scan) {
+  for (int guard = 0; guard < 256 &&
+                      ((marker_scan && SkipNsvGoalMarkerFile(base, state)) || SkipGoalIntroFile(base, state));
+       ++guard) {
+    auto call = ctx;
+    call.r3.u32 = state;
+    __imp__sub_8298FFF8(call, base);
+  }
+}
+
+extern "C" REX_FUNC(sub_8298FE90) {
+  const uint32_t state = ctx.r3.u32;
+  const bool marker_scan = uint32_t(ctx.lr) == 0x82910454u;
+  __imp__sub_8298FE90(ctx, base);
+  SkipPackageFiles(ctx, base, state, marker_scan);
+}
+
+extern "C" REX_FUNC(sub_8298FFF8) {
+  const uint32_t state = ctx.r3.u32;
+  const bool marker_scan = uint32_t(ctx.lr) == 0x829105E8u;
+  __imp__sub_8298FFF8(ctx, base);
+  SkipPackageFiles(ctx, base, state, marker_scan);
+}
+
+// Mission hull load (sub_82DD52F0 formats the challenge's RequiredChallengeHull
+// entry into a 256-byte buffer, r5 here, and calls this from 82DD53B4). Log 346:
+// the Poop Deck props hull loaded but its object never appeared, and the
+// lighthouse teleport's hull never showed up in the file probes at all.
+extern "C" REX_FUNC(sub_82D2AB98) {
+  // Log 347: in NSV only goal/props hulls were requested, at goal start; the
+  // teleport's never. Skate 3's own teleports ship no stream XML either, so
+  // this logs on every map (per map tag) to see when e.g. tele_dwtn_to_dwtnskpk
+  // loads in Downtown.
+  if (uint32_t(ctx.lr) == 0x82DD53B4u) {
+    const bool log = REXCVAR_GET(skate3_skate2_goals_log);
+    const bool hidden = NsvChallengesHidden();
+    // Package hulls are named nsv_* (naming contract), Skate 3's never are.
+    const bool leak = hidden && base[ctx.r5.u32] == 'n' && GuestString(base, ctx.r5.u32).rfind("nsv_", 0) == 0;
+    if (log || leak) {
+      static std::mutex logged_mutex;
+      static std::unordered_set<std::string> logged;
+      const bool nsv = skate3::world_loading::IsSkate2Gameplay();
+      std::string name = GuestString(base, ctx.r5.u32);
+      std::lock_guard<std::mutex> lock(logged_mutex);
+      if (logged.size() < 512 && logged.insert(std::string(nsv ? "nsv:" : "s3:") + name).second) {
+        // Guest callers (saved LR at back chain - 8): which path asked, e.g.
+        // what loads Skate 3's teleport hulls with the world (log 350).
+        std::string callers;
+        uint32_t frame = ctx.r1.u32;
+        for (int i = 0; i < 8; ++i) {
+          uint32_t next = 0, lr = 0;
+          if (!GuestU32(base, frame, next) || next <= frame || !GuestU32(base, next - 8, lr)) break;
+          char text[16];
+          std::snprintf(text, sizeof(text), " %08X", lr);
+          callers += text;
+          frame = next;
+        }
+        if (leak) {
+          // Should not happen since the challenge query gate below.
+          REXLOG_WARN("skate2-goals: New San Van hull '{}' requested on another map; callers{}", name, callers);
+        } else {
+          REXLOG_INFO("skate2-goals: mission hull requested [{}] '{}'; callers{}", nsv ? "nsv" : "s3", name,
+                      callers);
+        }
+      }
+    }
+  }
+  __imp__sub_82D2AB98(ctx, base);
+}
+
+// Challenge query (sub_82BD2328, reached through sub_82BD2668 from the hull
+// streamer 82DD39C0, the challenge manager 82BD18C0, map/FE code 8254DF70 /
+// 82553DD0 and 82D53F70 / 82D57210): splits the challenges of the vector r3
+// into matches appended to r4 and the rest appended to r5, by a flag mask,
+// World == the current world (the challenge's World attribute, or a caller's
+// predicate) and caller predicates. The goals package's challenges carry
+// Downtown's world record, which New San Van borrows, so on Skate 3's Downtown
+// they matched too: log 348 streamed the statue goal's hull and its props
+// (nsv_ots_10_dt22_statue, nsv_otsp_10) there. Off New San Van they move from
+// the matches to the rejected list, as any other world's challenge would.
+// Challenge key: [[[challenge+16]]+24], as the query reads it.
+static uint64_t ChallengeKey(uint8_t* base, uint32_t challenge) {
+  uint32_t instance = 0, collection = 0;
+  uint64_t key = 0;
+  if (!GuestU32(base, challenge + 16, instance) || !GuestU32(base, instance, collection) || collection == 0 ||
+      !GuestU64(base, collection + 24, key)) {
+    return 0;
+  }
+  return key;
+}
+
+// Append to a guest vector<T*> {begin, end, capacity}: in place while there
+// is room, else through the insert the query itself uses when full
+// (sub_82723DF0(vector, position, &value)) with the value in a frame below
+// the caller's stack pointer.
+static void AppendGuestPointer(PPCContext& ctx, uint8_t* base, uint32_t vector, uint32_t value) {
+  uint32_t end = 0, capacity = 0;
+  if (!GuestU32(base, vector + 4, end) || !GuestU32(base, vector + 8, capacity)) return;
+  if (end != 0 && end < capacity) {
+    StoreGuestU32(base, end, value);
+    StoreGuestU32(base, vector + 4, end + 4);
+    return;
+  }
+  const uint32_t frame = (ctx.r1.u32 - 160) & ~15u;
+  StoreGuestU32(base, frame, ctx.r1.u32);  // Back chain.
+  StoreGuestU32(base, frame + 80, value);
+  auto call = ctx;
+  call.r1.u32 = frame;
+  call.r3.u32 = vector;
+  call.r4.u32 = end;
+  call.r5.u32 = frame + 80;
+  sub_82723DF0(call, base);
+}
+
+// skate3_skate2_goals_log, on New San Van: which queries see each package
+// challenge and whether the game's own filters kept it (log 350: the lighthouse
+// teleport's hull was never requested, even at the tower). One line per
+// challenge, outer caller (the query's caller's caller: hull streamer
+// 82DD39C0, challenge manager 82BD18C0, ...) and outcome.
+// Trigger volume events reaching the Own the Spot listener (sub_8255BD38, r3
+// listener, r4 event: +16 u64 volume ID, +24 event type; it marks a spot found
+// when the type matches sub_82563520() and the volume is a goal's
+// OTSTriggerBoundary). Skate 2 volume IDs end in its layer 0x03E38706. Lilypads
+// still scores 0 (logs 349-351) although its scoring volume 0006480903E38706
+// ships in the goal hull with the same box layout as Skate 3's: log every event
+// on a package volume (skate3_skate2_goals_log, first 300).
+extern "C" REX_FUNC(sub_8255BD38) {
+  if (REXCVAR_GET(skate3_skate2_goals_log)) {
+    uint64_t volume = 0;
+    uint32_t type = 0;
+    if (GuestU64(base, ctx.r4.u32 + 16, volume) && GuestU32(base, ctx.r4.u32 + 24, type) &&
+        uint32_t(volume) == 0x03E38706u) {
+      static std::atomic<int> lines{0};
+      if (lines.fetch_add(1) < 300) {
+        REXLOG_INFO("skate2-goals: trigger volume {:016X} event type {} (listener {:08X})", volume, type, ctx.r3.u32);
+      }
+    }
+  }
+  __imp__sub_8255BD38(ctx, base);
+}
+
+// Why a package teleport is rejected (sub_82BD2328's three terms, log 351):
+// flags attribute 73938743BA6C6693 must contain the query's mask r6; World
+// (7565CD2A80E93A5E) must equal the query's world instance r7's key (unless a
+// predicate r8 decides); then, when r10 names a bypass attribute (the manager
+// passes "IgnorePrereqForGlobalStart", 0x820D2678), that bool = 1 passes, else
+// the prerequisite object r9 (vtable +4, &challenge key) decides. Round 276
+// sets IgnorePrereqForGlobalStart on nsv_teleports.
+struct ChallengeQueryArgs {
+  uint32_t mask = 0, world = 0, predicate = 0, prereq = 0, instance = 0;
+};
+static uint32_t ChallengeAttribute(PPCContext& ctx, uint8_t* base, uint32_t challenge, uint64_t attribute) {
+  uint32_t instance = 0, collection = 0;
+  if (!GuestU32(base, challenge + 20, instance) || !GuestU32(base, instance, collection) || !collection) return 0;
+  auto call = ctx;
+  call.r3.u32 = collection;
+  call.r4.u64 = attribute;
+  call.r5.u64 = 0;
+  sub_82B72420(call, base);
+  return call.r3.u32;
+}
+static void LogTeleportFilter(PPCContext& ctx, uint8_t* base, uint32_t challenge, const ChallengeQueryArgs& q,
+                              uint32_t outer, const std::string& name) {
+  uint32_t flags = 0, world_now_hi = 0, world_now_lo = 0, collection = 0;
+  uint64_t world = 0;
+  if (const uint32_t at = ChallengeAttribute(ctx, base, challenge, 0x73938743BA6C6693ull)) GuestU32(base, at, flags);
+  if (const uint32_t at = ChallengeAttribute(ctx, base, challenge, 0x7565CD2A80E93A5Eull)) GuestU64(base, at, world);
+  if (q.world && GuestU32(base, q.world, collection) && collection) {
+    GuestU32(base, collection + 24, world_now_hi);
+    GuestU32(base, collection + 28, world_now_lo);
+  }
+  uint8_t ignore = 0;
+  if (const uint32_t at = ChallengeAttribute(ctx, base, challenge, 0x136812614CD4BCC7ull)) {
+    ignore = base[at];
+  }
+  int prereq = -1;
+  uint32_t prereq_fn = 0, vtable = 0;
+  if (q.prereq && GuestU32(base, q.prereq, vtable) && GuestU32(base, vtable + 4, prereq_fn) &&
+      prereq_fn >= 0x82380000u && prereq_fn < 0x83000000u) {
+    const uint64_t key = ChallengeKey(base, challenge);
+    const uint32_t frame = (ctx.r1.u32 - 192) & ~15u;
+    StoreGuestU32(base, frame, ctx.r1.u32);  // Back chain.
+    StoreGuestU32(base, frame + 80, uint32_t(key >> 32));
+    StoreGuestU32(base, frame + 84, uint32_t(key));
+    auto call = ctx;
+    call.r1.u32 = frame;
+    call.r3.u32 = q.prereq;
+    call.r4.u32 = frame + 80;
+    {
+      PPCContext& ctx = call;  // REX_CALL_INDIRECT_FUNC uses ctx/base
+      REX_CALL_INDIRECT_FUNC(prereq_fn);
+    }
+    prereq = call.r3.u32 & 0xFF;
+  }
+  const uint64_t world_now = (uint64_t(world_now_hi) << 32) | world_now_lo;
+  REXLOG_INFO("skate2-goals: {} filtered by {:08X}: flags {:08X} vs mask {:08X} ({}), World {:016X} vs {:016X} "
+              "({}{}), IgnorePrereqForGlobalStart {}, prerequisites {} (check {:08X}){}",
+              name, outer, flags, q.mask, (flags & q.mask) == q.mask ? "ok" : "MISSING",
+              world, world_now, world == world_now ? "ok" : "DIFFERENT", q.predicate ? ", caller predicate" : "",
+              ignore, prereq < 0 ? "n/a" : prereq ? "met" : "NOT MET", prereq_fn,
+              q.instance ? "" : " (this query has no bypass attribute)");
+}
+
+static void LogNsvChallengeQuery(PPCContext& ctx, uint8_t* base, uint32_t sp, uint32_t vector, uint32_t from,
+                                 bool kept, const ChallengeQueryArgs& q) {
+  uint32_t begin = 0, end = 0, chain = 0, outer = 0;
+  if (!GuestU32(base, vector, begin) || !GuestU32(base, vector + 4, end) || end < begin) return;
+  if (GuestU32(base, sp, chain) && chain > sp) GuestU32(base, chain - 8, outer);
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  for (uint32_t read = begin + from * 4; read < end; read += 4) {
+    uint32_t challenge = 0;
+    if (!GuestU32(base, read, challenge) || !challenge) continue;
+    const auto it = nsv_challenge_names.find(ChallengeKey(base, challenge));
+    if (it == nsv_challenge_names.end()) continue;
+    char tag[24];
+    std::snprintf(tag, sizeof(tag), " %08X %d", outer, kept ? 1 : 0);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (seen.size() >= 200 || !seen.insert(it->second + tag).second) continue;
+    REXLOG_INFO("skate2-goals: challenge query from {:08X}: {} {}", outer, it->second,
+                kept ? "kept" : "filtered out by the game");
+    // Logs 354-355: the goal-arrow query 82D5402C rejected all 22 goals on
+    // arrival in New San Van; one goal passed only after its spot was found.
+    // Which term rejects them: once per goal and query caller.
+    if (!kept) LogTeleportFilter(ctx, base, challenge, q, outer, it->second);
+  }
+}
+
+extern "C" REX_FUNC(sub_82BD2328) {
+  const uint32_t matches = ctx.r4.u32, rejects = ctx.r5.u32, sp = ctx.r1.u32;
+  ChallengeQueryArgs query;
+  query.mask = ctx.r6.u32;
+  query.world = ctx.r7.u32;
+  query.predicate = ctx.r8.u32;
+  query.prereq = ctx.r9.u32;
+  query.instance = ctx.r10.u32;
+  uint32_t begin = 0, end = 0;
+  const bool hide = NsvChallengesHidden() && GuestU32(base, matches, begin) &&
+                    GuestU32(base, matches + 4, end) && end >= begin;
+  const uint32_t first = hide ? (end - begin) / 4 : 0;
+  const bool trace = !hide && REXCVAR_GET(skate3_skate2_goals_log) && !nsv_challenge_keys.empty() &&
+                     skate3::world_loading::IsSkate2Gameplay();
+  uint32_t trace_matches = 0, trace_rejects = 0;
+  if (trace) {
+    uint32_t b = 0, e = 0;
+    if (GuestU32(base, matches, b) && GuestU32(base, matches + 4, e) && e >= b) trace_matches = (e - b) / 4;
+    if (GuestU32(base, rejects, b) && GuestU32(base, rejects + 4, e) && e >= b) trace_rejects = (e - b) / 4;
+  }
+  __imp__sub_82BD2328(ctx, base);
+  if (trace) {
+    LogNsvChallengeQuery(ctx, base, sp, matches, trace_matches, true, query);
+    LogNsvChallengeQuery(ctx, base, sp, rejects, trace_rejects, false, query);
+  }
+  if (!hide || !GuestU32(base, matches, begin) || !GuestU32(base, matches + 4, end) || end < begin) return;
+  std::array<uint32_t, 32> moved{};
+  size_t count = 0;
+  uint32_t write = begin + first * 4;
+  for (uint32_t read = write; read < end; read += 4) {
+    uint32_t challenge = 0;
+    GuestU32(base, read, challenge);
+    if (challenge != 0 && nsv_challenge_keys.contains(ChallengeKey(base, challenge))) {
+      if (count < moved.size()) moved[count] = challenge;
+      ++count;
+      continue;
+    }
+    if (write != read) StoreGuestU32(base, write, challenge);
+    write += 4;
+  }
+  if (count == 0) return;
+  StoreGuestU32(base, matches + 4, write);
+  for (size_t i = 0; i < std::min(count, moved.size()); ++i) AppendGuestPointer(ctx, base, rejects, moved[i]);
+  if (nsv_challenges_hidden.fetch_add(count) == 0) {
+    REXLOG_INFO("skate2-goals: New San Van challenges left out of this map's challenge queries (first: {})",
+                count);
+  }
+}
+
+// Challenge key list filter (sub_82562C78; keeps the u64 keys of the vector r4
+// whose challenge has attribute F9A9A1DDED84A643 set, FD40 clear, type r3 and
+// a loaded Location locator; returns the count). Round 272 also dropped the
+// package's keys here off New San Van; log 349 then had NSV goal arrows appear
+// only on discovery (seen from afar before), with no other change able to
+// remove them, so this is a list built while another map was current and kept.
+// Diagnostic only now (skate3_skate2_goals_log): which callers list package
+// challenges, on which map.
+extern "C" REX_FUNC(sub_82562C78) {
+  const uint32_t list = ctx.r4.u32, type = ctx.r3.u32, caller = uint32_t(ctx.lr);
+  __imp__sub_82562C78(ctx, base);
+  uint32_t begin = 0, end = 0;
+  if (!REXCVAR_GET(skate3_skate2_goals_log) || nsv_challenge_keys.empty() || !GuestU32(base, list, begin) ||
+      !GuestU32(base, list + 4, end) || end < begin) {
+    return;
+  }
+  uint32_t ours = 0;
+  for (uint32_t read = begin; read + 8 <= end; read += 8) {
+    uint64_t key = 0;
+    if (GuestU64(base, read, key) && nsv_challenge_keys.contains(key)) ++ours;
+  }
+  static std::atomic<int> lines{0};
+  if (ours != 0 && lines.fetch_add(1) < 64) {
+    REXLOG_INFO("skate2-goals: challenge list from {:08X} (type {}) on {}: {} entries, {} New San Van", caller, type,
+                NsvChallengesHidden() ? "another map" : "New San Van", (end - begin) / 8, ours);
+  }
+}
+
+// Sample bank loader (slot r4, resident r5, path r6: a disc archive formatted
+// as "data\%s|", or with r7 = 1 a package folder as is). Package banks load
+// rarely (a DLC world's bank, the goal voices): one line each with
+// skate3_skate2_goals_log.
+// Speech requests (sub_824A4EE8: manager r3, speaker r4, line r5, r6, r7 ->
+// r3; lines >= 5000 and speaker 40 take their own branches) and sample
+// lookups (sub_824A63F0: manager, speaker r4, line r5 -> 2 = not loaded).
+// Log 349: the goal voice bank loaded (slot 3; Skate 2 Reda = speaker 40,
+// lines 5035...) yet the Lilypads intro stayed silent. One line per distinct
+// speaker/line with skate3_skate2_goals_log, at most 160.
+static void LogSpeechRequest(const char* what, uint32_t speaker, uint32_t line, uint32_t r6, uint32_t r7,
+                             uint32_t result, uint32_t caller) {
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  const uint64_t key = (uint64_t(what[0]) << 56) | (uint64_t(speaker & 0xFFFF) << 32) | line;
+  if (seen.size() >= 160 || !seen.insert(key).second) return;
+  REXLOG_INFO("skate2-goals: speech {} speaker {} line {} (r6 {:08X} r7 {:08X}) -> {} from {:08X}", what, speaker,
+              line, r6, r7, result, caller);
+}
+
+extern "C" REX_FUNC(sub_824A4EE8) {
+  const uint32_t speaker = ctx.r4.u32, line = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+  __imp__sub_824A4EE8(ctx, base);
+  if (REXCVAR_GET(skate3_skate2_goals_log)) LogSpeechRequest("request", speaker, line, r6, r7, ctx.r3.u32, caller);
+}
+
+extern "C" REX_FUNC(sub_824A63F0) {
+  const uint32_t speaker = ctx.r4.u32, line = ctx.r5.u32, caller = uint32_t(ctx.lr);
+  __imp__sub_824A63F0(ctx, base);
+  if (REXCVAR_GET(skate3_skate2_goals_log)) LogSpeechRequest("lookup", speaker, line, 0, 0, ctx.r3.u32, caller);
+}
+
+// Career prerequisite check (prerequisite object vtable +4 = sub_827CEEC0,
+// object r3, &challenge key r4): met when the object's vt8 says prerequisites
+// are off, else when the key is in the career's unlocked list ([obj+68], nodes
+// with the key at +8). Log 356: the goal-arrow query 82D5402C rejected all 22
+// New San Van goals on this term alone (flags and World passed); a goal enters
+// the list only when its spot is found, and New San Van saves nothing.
+extern "C" REX_FUNC(sub_827CEEC0) {
+  uint64_t key = 0;
+  const bool ours = REXCVAR_GET(skate3_skate2_goal_arrows) && !nsv_challenge_keys.empty() &&
+                    skate3::world_loading::IsSkate2Gameplay() && GuestU64(base, ctx.r4.u32, key) &&
+                    nsv_challenge_keys.contains(key);
+  __imp__sub_827CEEC0(ctx, base);
+  if (!ours || (ctx.r3.u32 & 0xFF)) return;
+  ctx.r3.u64 = 1;
+  static std::atomic<bool> logged{false};
+  if (REXCVAR_GET(skate3_skate2_goals_log) && !logged.exchange(true))
+    REXLOG_INFO("skate2-goals: New San Van goals count as unlocked for the career prerequisite check (arrows shown)");
+}
+
+// World-wide goals on arrival in New San Van (log 353: the lighthouse teleport
+// had no marker and its trigger never fired although the skater stood in it).
+// Teleports start only from the challenge manager's global pass (sub_82BD17C0
+// -> sub_82BD18C0 -> query 82BD19B4), after which the teleport's own update
+// (sub_82BD0E98 -> vt80) requests its hull. The pass runs when a goal session
+// starts (sub_82551E58 -> sub_82552650, only when the game MODE changes, from
+// sub_82552750) and on goal events. Free skate in Downtown and free skate in
+// New San Van are the same mode, and the Downtown pass ran while the package's
+// goals were held off that map, so on arrival nothing started the teleport:
+// log 352 got it at 09:53 only by a menu query, log 353 at 11:14 only when the
+// Lilypads trigger fired. Run the same refresh once per New San Van visit,
+// from the manager's own update on the game thread.
+std::atomic<uint64_t> nsv_goal_refresh_world{0};
+extern "C" REX_FUNC(sub_82BD0E98) {  // challenge manager update (manager r3, dt r4)
+  const uint32_t manager = ctx.r3.u32;
+  __imp__sub_82BD0E98(ctx, base);
+  if (!REXCVAR_GET(skate3_skate2_goals) || nsv_challenge_keys.empty() ||
+      !skate3::world_loading::IsSkate2Gameplay() || loaded_stream.load() != 0) {
+    return;
+  }
+  const uint64_t world = skate3::world_loading::RenderWorldIdentity();
+  if (world == 0 || nsv_goal_refresh_world.exchange(world) == world) return;
+  auto call = ctx;
+  call.r3.u32 = manager;
+  sub_82BD17C0(call, base);
+  if (REXCVAR_GET(skate3_skate2_goals_log))
+    REXLOG_INFO("skate2-goals: New San Van arrival: refreshed the world-wide goals (teleports) of manager {:08X}",
+                manager);
+}
+
+// Cutscene audio (log 353): Skate 3's Own the Lot intro otl_dwtn_01 looked up
+// its narration (speaker 77 line 8253) and effect (99/8253) at scene start from
+// sub_82826C98 (cutscene presenter vtable 823127D0 slot 8): it builds an ICE
+// evaluator over the scene (sub_828EE788/828EECC8) and reads channels 141/142,
+// then 138 (play?), 139 and 140 (speaker/line) with sub_828EEB20 before the
+// lookup. The Skate 2 Lilypads intro made no lookup at all. One line per scene
+// start with every channel read inside (skate3_skate2_goals_log).
+namespace {
+struct SceneAudioTrace {
+  bool active = false;
+  std::string reads;
+};
+thread_local SceneAudioTrace t_scene_audio;
+}  // namespace
+
+extern "C" REX_FUNC(sub_828EEB20) {  // ICE evaluator r3: value of channel r4
+  const uint32_t channel = ctx.r4.u32;
+  __imp__sub_828EEB20(ctx, base);
+  if (t_scene_audio.active && t_scene_audio.reads.size() < 400)
+    t_scene_audio.reads += " " + std::to_string(channel) + "=" + std::to_string(ctx.r3.s32);
+}
+
+extern "C" REX_FUNC(sub_82826C98) {  // cutscene presenter r3, scene id r4: start its audio
+  const uint32_t presenter = ctx.r3.u32, scene = ctx.r4.u32;
+  const bool log = REXCVAR_GET(skate3_skate2_goals_log);
+  const SceneAudioTrace saved = t_scene_audio;
+  t_scene_audio = SceneAudioTrace{};
+  t_scene_audio.active = log;
+  __imp__sub_82826C98(ctx, base);
+  const std::string reads = t_scene_audio.reads;
+  t_scene_audio = saved;
+  // Log 356: for the Skate 2 Lilypads intro (scene 3671477D) channels 138-140
+  // read 0 / unset / 0, so no speech started (Own the Lot: speaker 77, line
+  // 8253). With 138 = 1 or 2 the presenter asks [0x830CFDC4] vtable +116
+  // (r4 speaker = channel 140, r5 line = channel 139; the lookup that ran from
+  // 82826E7C) and keeps speaker +232, line +236, started byte +240, which its
+  // update plays. Do the same with the intro's own Reda line (goals.txt).
+  std::string started;
+  const auto it = nsv_intro_lines.find(scene);
+  if (REXCVAR_GET(skate3_skate2_goal_intros) && it != nsv_intro_lines.end() && base[presenter + 240] == 0) {
+    uint32_t object = 0, vtable = 0, lookup = 0;
+    if (GuestU32(base, 0x830CFDC4u, object) && object >= 0x10000 && GuestU32(base, object, vtable) &&
+        GuestU32(base, vtable + 116, lookup) && lookup >= 0x82380000u && lookup < 0x83000000u) {
+      const auto [speaker, number] = it->second;
+      auto call = ctx;
+      call.r3.u32 = object;
+      call.r4.u32 = speaker;
+      call.r5.u32 = number;
+      {
+        PPCContext& ctx = call;  // REX_CALL_INDIRECT_FUNC uses ctx/base
+        REX_CALL_INDIRECT_FUNC(lookup);
+      }
+      StoreGuestU32(base, presenter + 232, speaker);
+      StoreGuestU32(base, presenter + 236, number);
+      base[presenter + 240] = 1;
+      started = " -> Skate 2 intro line speaker " + std::to_string(speaker) + " line " + std::to_string(number) +
+                " handed to the cutscene (lookup " + std::to_string(call.r3.s32) + ")";
+    }
+  }
+  static std::atomic<uint32_t> logged{0};
+  if (log && logged.fetch_add(1) < 64)
+    REXLOG_INFO("skate2-goals: cutscene audio start presenter {:08X} scene {:08X}: channels{}{}", presenter, scene,
+                reads.empty() ? std::string(" none read (no scene element)") : reads, started);
+}
+
+extern "C" REX_FUNC(sub_824A5A08) {
+  if (REXCVAR_GET(skate3_skate2_goals_log) && (ctx.r7.u32 & 0xFF) == 1) {
+    REXLOG_INFO("skate2-goals: package sound bank load: slot {} resident {:08X} folder '{}'", ctx.r4.u32,
+                ctx.r5.u32, GuestString(base, ctx.r6.u32));
+  }
+  __imp__sub_824A5A08(ctx, base);
+}
+
 // Report successful native graph/data registration, separately from queuing.
 extern "C" REX_FUNC(sub_828DC660) {
   const uint32_t slot = ctx.r4.u32;
   const std::string path = GuestString(base, slot + 12);
+  if (path == "data/audio/nsv_s2_traffic/Traffic_Horn.abk") {
+    ApplyHornReplacements(base, slot);
+  }
   __imp__sub_828DC660(ctx, base);
   if (REXCVAR_GET(skate3_skate2_livingworld_probe) && path.starts_with("data/audio/nsv_s2_traffic/")) {
     uint32_t state = 0, data = 0, bytes = 0;
@@ -2797,9 +3710,13 @@ extern "C" REX_FUNC(sub_828DCCF8) {
           kAudioRoles.begin(), kAudioRoles.end(),
           std::string_view(original).substr(kPrefix.size(), underscore - kPrefix.size()));
       if (role != kAudioRoles.end()) {
+        // skate3_skate2_reverb = false: Skate 2's reverb map is replaced by
+        // the empty map the DLC maps already use for that role.
+        const bool no_reverb = *role == "reverb" && !REXCVAR_GET(skate3_skate2_reverb);
         const std::string replacement =
             "data\\audio\\skate2\\" +
-            skate2_audio_maps.at(skate2_streams[stream])[role - kAudioRoles.begin()];
+            (no_reverb ? std::string("empty.ems")
+                       : skate2_audio_maps.at(skate2_streams[stream])[role - kAudioRoles.begin()]);
         std::memcpy(base + path, replacement.c_str(), replacement.size() + 1);
         if (REXCVAR_GET(skate3_world_load_probe)) REXLOG_INFO("skate2-audio: {} -> {}", original, replacement);
       }

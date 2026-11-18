@@ -111,7 +111,8 @@ void Sample(const native_scene::DrawItem& item, const uint32_t ids[kBones], Pose
   pose.crc = Fingerprint(item.bones.data(), item.bones.size());
   pose.flags = (item.skinned ? 1u : 0u) | (item.ropa ? 2u : 0u) |
       (item.caster_bank ? 4u : 0u) | (item.pending ? 8u : 0u) |
-      (item.retained ? 16u : 0u) | (uint32_t(item.dbg_src) << 8);
+      (item.retained ? 16u : 0u) | (uint32_t(item.dbg_src) << 8) |
+      (uint32_t(item.rows_src) << 16);
   std::copy_n(item.world, 16, pose.world);
   std::copy_n(item.char_rows + 48, 8, pose.colors);
   for (size_t i = 0; i < kBones; ++i)

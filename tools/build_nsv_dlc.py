@@ -56,8 +56,10 @@ EXPORT_TYPE = 0xAD303B8F42B3307E      # Attrib CollectionLoadData export type
 WORLD = 'dist_newsanvan'
 FILTER = 'newsanvan'
 LISTING = 'map_listing_newsanvan'
-LISTING_ORDER = 50                    # retail districts 0..6, DLC maps 9+
-CATEGORY_ORDER = 15000                # retail districts 10000..14000
+# Sort keys of the Locations list (Int16, ascending): retail districts 0..6, DLC maps 9+.
+# -1 puts New San Vanelona first (user, 16 Nov 2026); it was 50 (last) through v0.2e.
+LISTING_ORDER = -1
+CATEGORY_ORDER = 9000                 # retail districts 10000..14000; below them, first
 DISTRICT_LABEL = 'ID_COMMON_NEW_SAN_VANELONA'   # retail: "New San Vanelona"
 IMAGE = 'fe\\source\\images\\locations\\any_location'
 
@@ -266,7 +268,7 @@ def build_vault(spawns, extra=()):
     ref = v.blob(struct.pack('>QQQ', h64('map_filter'), h64(FILTER), 0))
     v.record('map_listing', LISTING, PARENT_LOCATIONS_GROUP, [T_REFSPEC, T_INT16], [
         (h64('Listing'), 0, 0x0800, ref),
-        (A_ORDER_LISTING, 1, 0x4000, LISTING_ORDER << 16)])
+        (A_ORDER_LISTING, 1, 0x4000, (LISTING_ORDER & 0xFFFF) << 16)])
 
     image = v.string(IMAGE)
     for s in spawns:

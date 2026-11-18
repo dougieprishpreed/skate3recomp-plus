@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -28,7 +29,14 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_pedestrian_speech, true, "Skate 3",
 REXCVAR_DEFINE_BOOL(skate3_skate2_speech_log, false, "Skate 3",
     "Log New San Van pedestrian speech diagnostics (dispatches, voice state, stream queues, "
     "readers and decoded output); off keeps only the startup status lines");
+REXCVAR_DEFINE_BOOL(skate3_skate2_voice_records, true, "Skate 3",
+    "New San Van: give the Skate 2 voices Skate 3 has no speaker settings for (the security "
+    "guards' secg4/secg5, adult_male03's adtm4) the settings of the same kind of Skate 3 voice "
+    "(guard secg1, adult male adtm1), so those peds speak in their own Skate 2 voice. Off: "
+    "they stay silent; restart required");
 REXCVAR_DECLARE(bool, skate3_skate2_livingworld_probe);
+namespace {
+}  // namespace
 namespace {
 // Speech diagnostics (builds 141-147) stay in place behind this switch; with
 // it off the purely diagnostic hooks only call through.
@@ -58,14 +66,18 @@ thread_local bool loading = false;
 thread_local uint32_t loading_event = 0;
 thread_local std::vector<uint64_t>* census = nullptr;
 thread_local bool original_sfx = false;
+// The speaking actor's Skate 2 voice ID while original_sfx (0 = unknown).
+thread_local uint32_t original_voice = 0;
 std::mutex owners_mutex;
-std::unordered_set<uint32_t> handles, owners;
+// Bridge handle -> voice, and speech object -> voice of its actor.
+std::unordered_map<uint32_t, uint32_t> handles, owners;
 std::atomic<uint32_t> dispatches{0}, requests{0}, starts{0}, bridges{0};
 uint32_t Read(uint8_t* base, uint32_t address) { return REX_LOAD_U32(address); }
 struct Scope {
   bool previous = original_sfx;
-  explicit Scope(bool value) { original_sfx = value; }
-  ~Scope() { original_sfx = previous; }
+  uint32_t previous_voice = original_voice;
+  explicit Scope(bool value, uint32_t voice = 0) { original_sfx = value; original_voice = voice; }
+  ~Scope() { original_sfx = previous; original_voice = previous_voice; }
 };
 // The engine owns this allocation through manager+0x14 and frees it during
 // normal speech shutdown. Preserve its allocator and all existing entries.
@@ -111,6 +123,13 @@ bool Owns(uint32_t sfx) {
   if (!instance.load()) return false;
   std::lock_guard lock(owners_mutex);
   return owners.contains(sfx);
+}
+// Voice of an owned speech object (0 = not ours).
+uint32_t OwnerVoice(uint32_t sfx) {
+  if (!instance.load()) return 0;
+  std::lock_guard lock(owners_mutex);
+  const auto it = owners.find(sfx);
+  return it == owners.end() ? 0 : it->second;
 }
 // Speech streams open "<archive>|<entry>" paths, which the BigFile handler
 // 82A83808 resolves only against mounted archives. Retail speech archives are
@@ -369,6 +388,42 @@ extern "C" REX_FUNC(sub_82C5C1C0) {
 // The bridge emits one packed record per model lookup, in the same order.
 // Substitute only prepared model identities, retaining the flag at bit 14.
 // Voice IDs stay NONE in Attrib so missing/disabled speech is safely silent.
+// Per-voice speaker records (log 354/355 trace). Each speaker's info gets its
+// settings from the audio manager's per-voice table (manager + 0x1BE78, 104
+// u64 record keys; sub_824F91B0: info +84 voice -> key -> record class
+// D3B2C1F36DA3B433 -> info +88..+132). +116 picks the route: set = the
+// living-world request (sub_824ABA18), 0 = the cast/skater family
+// (sub_824AC560), where living-world lines never play. sub_824A9778 fills the
+// table at boot from the records under 'default' (first layout word = voice).
+// Skate 3 has records for 84 voices but none for 44 (adtm4), 78 (secg4) or 79
+// (secg5): the guards and adult_male03 asked for lines (logs 354-355: shove
+// lines 206C/206D) on the wrong route and stayed silent; every voice with a
+// record spoke. Give each the record of the same kind of voice; the speaker
+// keeps its own voice number, so its lines still come from Skate 2's bank.
+namespace {
+constexpr uint32_t kVoiceTable = 0x1BE78;
+struct VoiceRecordBorrow {
+  uint32_t voice, from;
+  const char* what;
+};
+constexpr VoiceRecordBorrow kVoiceRecordBorrows[] = {
+    {44, 41, "adtm4 <- adtm1"}, {78, 75, "secg4 <- secg1"}, {79, 75, "secg5 <- secg1"}};
+}  // namespace
+extern "C" REX_FUNC(sub_824A9778) {  // fill the per-voice record table (audio manager r3)
+  const uint32_t manager=ctx.r3.u32;
+  __imp__sub_824A9778(ctx,base);
+  if(!prepared || !REXCVAR_GET(skate3_skate2_voice_records)) return;
+  std::string done;
+  for(const auto& b : kVoiceRecordBorrows) {
+    const uint32_t slot=manager+kVoiceTable+b.voice*8, from=manager+kVoiceTable+b.from*8;
+    const uint32_t hi=Read(base,from), lo=Read(base,from+4);
+    if((Read(base,slot) || Read(base,slot+4)) || !(hi || lo)) continue;  // own record, or none to borrow
+    REX_STORE_U32(slot,hi);
+    REX_STORE_U32(slot+4,lo);
+    done+=std::string(done.empty() ? "" : ", ")+std::to_string(b.voice)+" ("+b.what+")";
+  }
+  REXLOG_INFO("skate2-speech: speaker records for Skate 2 voices Skate 3 lacks: {}",done.empty() ? "none needed" : done);
+}
 extern "C" REX_FUNC(sub_8269A6E8) {
   if (census) census->push_back(ctx.r4.u64);
   __imp__sub_8269A6E8(ctx,base);
@@ -387,7 +442,7 @@ extern "C" REX_FUNC(sub_827A3978) {
   auto* previous=census; census=&models;
   __imp__sub_827A3978(ctx,base);
   census=previous;
-  std::unordered_set<uint32_t> current;
+  std::unordered_map<uint32_t, uint32_t> current;
   if (probe && ctx.r3.u32<=30 && ctx.r3.u32==models.size()) {
     uint32_t imported=0;
     for(const auto key:models) imported+=voices.contains(key);
@@ -398,13 +453,40 @@ extern "C" REX_FUNC(sub_827A3978) {
       REXLOG_INFO("skate2-speech: pedestrian identities world={} snapshot={} nearby={} imported={} other={}",
                   bam ? "BAM" : "retail",n,models.size(),imported,models.size()-imported);
   }
+  if (active && ctx.r3.u32<=30 && ctx.r3.u32==models.size() && SpeechLog()) {
+    // Log 351: no guard (voice 78) or jock (54-56) ever asked for a line,
+    // while 15 other voices did. Name each nearby model once: voiced or not.
+    static std::mutex seen_mutex;
+    static std::unordered_set<uint64_t> seen;
+    std::lock_guard seen_lock(seen_mutex);
+    for(uint32_t i=0;i<ctx.r3.u32;++i) {
+      if(seen.size()>=96 || !seen.insert(models[i]).second) continue;
+      const auto found=voices.find(models[i]);
+      if(found==voices.end())
+        REXLOG_INFO("skate2-speech: nearby ped model {:016X}: no prepared Skate 2 voice (speaks with its own, none)",
+                    models[i]);
+      else
+        REXLOG_INFO("skate2-speech: nearby ped model {:016X}: Skate 2 voice {}",models[i],found->second);
+    }
+  }
   if (active && ctx.r3.u32<=30 && ctx.r3.u32==models.size()) {
     for(uint32_t i=0;i<ctx.r3.u32;++i) {
-      const auto found=voices.find(models[i]);
-      if(found==voices.end() || found->second==104) continue;
+      auto found=voices.find(models[i]);
+      uint32_t voice=found==voices.end() ? 0 : found->second;
+      // Model group keys (the variants' parents) in case a guard or jock is
+      // reported by its group: the variants' own Skate 2 voices (78 for all
+      // three guard models; jocks 54-56, joc2 has the chase lines).
+      if(!voice) {
+        switch(models[i]) {
+          case 0xD5BF47AD432BCAECull: case 0x271BBCF7D7B1A37Cull: voice=78; break;  // security_street / _guard
+          case 0xCE9A4D3E7A57ED03ull: voice=55; break;                               // jock
+          default: break;
+        }
+      }
+      if(!voice || voice==104) continue;
       const uint32_t row=output+i*20;
-      REX_STORE_U32(row,(Read(base,row)&~(0x7Fu<<7))|(found->second<<7));
-      current.insert(Read(base,row+12));
+      REX_STORE_U32(row,(Read(base,row)&~(0x7Fu<<7))|(voice<<7));
+      current[Read(base,row+12)]=voice;
     }
   }
   if (!current.empty()) {
@@ -414,19 +496,55 @@ extern "C" REX_FUNC(sub_827A3978) {
   }
   std::lock_guard lock(owners_mutex); handles=std::move(current);
 }
+namespace {
+// Speech path trace (skate3_skate2_speech_log, New San Van). Log 353: voices
+// 44 and 78 never reached the dispatcher while every other voice did. Each
+// step a line passes is logged once per (step, voice, event): the speaker
+// object's activation (sub_824D9248), its speak methods (824D9370, 824D9908,
+// 824D92B0, 824D9AD8, 824D9DB8), the request gates (sub_824ABA18 /
+// sub_824AC560) and whether they reached the dispatch switch sub_824ABD90.
+bool TraceSpeech() {
+  return SpeechLog() && instance.load() && skate3::world_loading::OriginalPedestriansActive();
+}
+void TraceStep(const char* step, uint32_t voice, uint32_t value, const std::string& detail) {
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  const std::string key=std::string(step)+"/"+std::to_string(voice)+"/"+std::to_string(value);
+  std::lock_guard lock(mutex);
+  if(seen.size()>=400 || !seen.insert(key).second) return;
+  REXLOG_INFO("skate2-speech: trace {} voice {}: {}",step,voice ? std::to_string(voice) : std::string("none"),detail);
+}
+thread_local bool t_reached_switch=false;
+}  // namespace
 extern "C" REX_FUNC(sub_824D9248) {
   const uint32_t object=ctx.r3.u32;
   __imp__sub_824D9248(ctx,base);
   const uint32_t handle=Read(base,object+0x2C);
-  std::lock_guard lock(owners_mutex);
-  owners.erase(object);
-  if(handles.contains(handle)) owners.insert(object);
+  uint32_t voice=0;
+  {
+    std::lock_guard lock(owners_mutex);
+    owners.erase(object);
+    if(const auto it=handles.find(handle); it!=handles.end()) owners[object]=voice=it->second;
+  }
+  if(TraceSpeech()) {
+    char text[96];
+    std::snprintf(text,sizeof(text),"speaker object %08X activated (handle %08X, +48 %08X)",object,handle,
+                  Read(base,object+0x30));
+    TraceStep("activate",voice,0,text);
+  }
 }
 // Ownership survives map changes until native teardown/reset. Never classify
 // a cancellation solely from the currently displayed world.
 #define NSV_SPEECH_SCOPE(address) \
 extern "C" REX_FUNC(sub_##address) { \
-  Scope scope(Owns(ctx.r3.u32)); __imp__sub_##address(ctx,base); \
+  const uint32_t voice=OwnerVoice(ctx.r3.u32); \
+  if(TraceSpeech()) { \
+    char text[96]; \
+    std::snprintf(text,sizeof(text),"speaker %08X method " #address " r4 %08X r10 %08X", \
+                  ctx.r3.u32,ctx.r4.u32,ctx.r10.u32); \
+    TraceStep(#address,voice,ctx.r4.u32&0xFFFF,text); \
+  } \
+  Scope scope(voice!=0,voice); __imp__sub_##address(ctx,base); \
 }
 NSV_SPEECH_SCOPE(824D9370)
 NSV_SPEECH_SCOPE(824D9908)
@@ -434,16 +552,139 @@ NSV_SPEECH_SCOPE(824D92B0)
 NSV_SPEECH_SCOPE(824D9AD8)
 NSV_SPEECH_SCOPE(824D9DB8)
 #undef NSV_SPEECH_SCOPE
+extern "C" REX_FUNC(sub_824ABD90) {  // living-world event switch (r4 event) -> dispatcher
+  t_reached_switch=true;
+  __imp__sub_824ABD90(ctx,base);
+}
+extern "C" REX_FUNC(sub_824ABA18) {  // living-world line request gates (event r6)
+  if(!TraceSpeech()) { __imp__sub_824ABA18(ctx,base); return; }
+  const uint32_t event=ctx.r6.u32&0xFFFF, r4=ctx.r4.u32, r5=ctx.r5.u32, caller=uint32_t(ctx.lr);
+  const bool saved=t_reached_switch;
+  t_reached_switch=false;
+  __imp__sub_824ABA18(ctx,base);
+  const bool reached=t_reached_switch;
+  t_reached_switch=saved;
+  char text[128];
+  std::snprintf(text,sizeof(text),"request %04X (r4 %08X r5 %08X from %08X): %s",event,r4,r5,caller,
+                reached ? "passed the gates" : "DROPPED by the request gates");
+  TraceStep(reached ? "request-ok" : "request-dropped",original_sfx ? original_voice : 0,event,text);
+}
+extern "C" REX_FUNC(sub_824AC560) {  // second request family (event r4 below 294)
+  if(TraceSpeech()) {
+    char text[96];
+    std::snprintf(text,sizeof(text),"request family 2: event %04X r5 %08X from %08X",ctx.r4.u32&0xFFFF,
+                  ctx.r5.u32,uint32_t(ctx.lr));
+    TraceStep("request2",original_sfx ? original_voice : 0,ctx.r4.u32&0xFFFF,text);
+  }
+  __imp__sub_824AC560(ctx,base);
+}
 extern "C" REX_FUNC(sub_824D91F0) {
   const uint32_t object=ctx.r3.u32;
-  Scope scope(Owns(object)); __imp__sub_824D91F0(ctx,base);
+  const uint32_t voice=OwnerVoice(object);
+  Scope scope(voice!=0,voice); __imp__sub_824D91F0(ctx,base);
   std::lock_guard lock(owners_mutex); owners.erase(object);
 }
+namespace {
+// Original living-world speech events (Skate 2 IDs; the 47 shared ones keep
+// the same ID in Skate 3) and the Skate 3-only ones, for the speech log.
+const char* EventName(uint32_t event) {
+  switch(event) {
+    case 0x2000: return "601_Warn_Gen"; case 0x2001: return "602_Warn_NSZ";
+    case 0x2002: return "603_Chase_Start"; case 0x2003: return "604_hot_pursuit";
+    case 0x2004: return "605_chase_terminate"; case 0x2005: return "606_catch";
+    case 0x2006: return "607_chase_join"; case 0x2007: return "609_lunge"; case 0x2008: return "610_block";
+    case 0x2009: return "611_cool_down"; case 0x200A: return "101_pos"; case 0x200B: return "103_repeat";
+    case 0x200C: return "104_spec_slam"; case 0x200D: return "105_spec_chase"; case 0x200E: return "201_grunt";
+    case 0x200F: return "202_impact_react"; case 0x2010: return "204_gasp"; case 0x2011: return "205_spec_collision";
+    case 0x2012: return "501_warn"; case 0x2013: return "805_conv_cell"; case 0x2014: return "806_cls_interact";
+    case 0x2015: return "807_cls_react"; case 0x2016: return "1901_shout"; case 0x2017: return "4402_cell_greet";
+    case 0x2018: return "4405_cell_bye"; case 0x2019: return "109_help"; case 0x201A: return "110_spec_litter";
+    case 0x201B: return "111_litter"; case 0x201C: return "203_concern"; case 0x2020: return "108_flee";
+    case 0x2023: return "502_warn_nsz"; case 0x2024: return "130_collide"; case 0x2025: return "131_collide_object";
+    case 0x2037: return "206_pan_handle"; case 0x2038: return "207_random_bum"; case 0x2055: return "102_Radio";
+    case 0x2062: return "210_CollTeam"; case 0x2063: return "338_gesture"; case 0x206A: return "330_TzerStart";
+    case 0x206B: return "331_TzerDone"; case 0x206C: return "335_ShoveBrd"; case 0x206D: return "336_ShoveSft";
+    case 0x206F: return "339_Leapfrog"; case 0x2070: return "340_HOM"; case 0x2075: return "344_HitReact";
+    case 0x2077: return "126_Outrun";
+    default: return "";
+  }
+}
+// Skate 2 recorded no generic warning (501_warn) for its security guards
+// (voices 75-79, secg1-5); they warn with 601_Warn_Gen, which Skate 3 has no
+// event for (livingworldspeech.big sample names: 501 exists for every other
+// pedestrian voice, 601/602 only for 75-79). Skate 3 asks every ped for 501,
+// so the guards stayed silent (log 350). Same program bank, same namespace.
+// Skate 3's guards shove the skater with 335_ShoveBrd / 336_ShoveSft (206C /
+// 206D, logs 354-355); Skate 2's guard voices have no shove lines, their line
+// for catching the skater is 606_catch.
+uint32_t Skate2EventFor(uint32_t voice, uint32_t event) {
+  if(voice>=75 && voice<=79 && event==0x2012) return 0x2000;
+  if(voice>=75 && voice<=79 && (event==0x206C || event==0x206D)) return 0x2005;
+  return event;
+}
+// skate3_skate2_speech_log: first request of each (voice, event) pair.
+void LogVoiceEvent(uint32_t voice, uint32_t requested, uint32_t sent, bool played) {
+  if(!SpeechLog()) return;
+  static std::mutex mutex;
+  static std::unordered_set<uint64_t> seen;
+  std::lock_guard lock(mutex);
+  if(seen.size()>=256 || !seen.insert((uint64_t(voice)<<32)|requested).second) return;
+  if(!played) {
+    REXLOG_INFO("skate2-speech: voice {} asked for {:04X} {}: not a Skate 2 event, silent",voice,requested,
+                EventName(requested));
+  } else if(sent!=requested) {
+    REXLOG_INFO("skate2-speech: voice {} asked for {:04X} {}: plays Skate 2's {:04X} {} for this voice",voice,
+                requested,EventName(requested),sent,EventName(sent));
+  } else {
+    REXLOG_INFO("skate2-speech: voice {} asked for {:04X} {}: plays",voice,requested,EventName(requested));
+  }
+}
+}  // namespace
 extern "C" REX_FUNC(sub_829717A0) {
+  if(SpeechLog() && instance.load() && skate3::world_loading::OriginalPedestriansActive() &&
+     (!original_sfx || (ctx.r4.u32&0xFFFF)!=1)) {
+    // Log 352: the guards (voice 78, nearby and matched) never asked for a
+    // bank-1 line. Every New San Van request outside the bridged path, once
+    // per (bank, event, caller, voice): bank-1 lines for a speaker the bridge
+    // never matched (Skate 3's bank with an empty voice = silence), and lines
+    // on any other bank (never bridged), with the speaker words r6..r9 and
+    // the Skate 2 voice the bridge gave any of them.
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> seen;
+    const uint32_t event=ctx.r4.u32>>16, bank=ctx.r4.u32&0xFFFF, caller=uint32_t(ctx.lr);
+    uint32_t voice=original_sfx ? original_voice : 0;
+    if(!voice) {
+      std::lock_guard owners_lock(owners_mutex);
+      for(const uint32_t word : {ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32}) {
+        if(const auto it=handles.find(word); it!=handles.end()) { voice=it->second; break; }
+        if(const auto it=owners.find(word); it!=owners.end()) { voice=it->second; break; }
+      }
+    }
+    std::lock_guard lock(mutex);
+    const uint64_t id=(uint64_t(event)<<48)|(uint64_t(bank&0xFF)<<40)|(uint64_t(voice&0xFF)<<32)|caller;
+    if(seen.size()<192 && seen.insert(id).second) {
+      if(bank==1)
+        REXLOG_INFO("skate2-speech: a ped WITHOUT a Skate 2 voice asked for {:04X} {} (from {:08X}, speaker words "
+                    "{:08X} {:08X} {:08X} {:08X}{}): silent",event,EventName(event),caller,ctx.r6.u32,ctx.r7.u32,
+                    ctx.r8.u32,ctx.r9.u32,voice ? " = the bridge's voice " + std::to_string(voice) : std::string());
+      else
+        REXLOG_INFO("skate2-speech: line {:04X} {} on bank {} (not the living-world bank) from {:08X}, speaker "
+                    "{}, words {:08X} {:08X} {:08X} {:08X}",event,EventName(event),bank,caller,
+                    voice ? "Skate 2 voice " + std::to_string(voice) : std::string("without a Skate 2 voice"),
+                    ctx.r6.u32,ctx.r7.u32,ctx.r8.u32,ctx.r9.u32);
+    }
+  }
   if(original_sfx && (ctx.r4.u32&0xFFFF)==1) {
+    const uint32_t requested=ctx.r4.u32>>16;
+    const uint32_t event=Skate2EventFor(original_voice,requested);
     if(!instance.load() || !skate3::world_loading::OriginalPedestriansActive() ||
-        !events.contains(ctx.r4.u32>>16)) { ctx.r3.u64=0; return; }
-    ctx.r4.u64=(ctx.r4.u32&0xFFFF0000u)|event_namespace.load();
+        (event==requested && !events.contains(event))) {
+      if(instance.load() && skate3::world_loading::OriginalPedestriansActive())
+        LogVoiceEvent(original_voice,requested,event,false);
+      ctx.r3.u64=0; return;
+    }
+    LogVoiceEvent(original_voice,requested,event,true);
+    ctx.r4.u64=(event<<16)|event_namespace.load();
     const auto n=++dispatches;
     if(SpeechLog() && (n<=12 || !(n%128)))
       REXLOG_INFO("skate2-speech: dispatch={} event={:04X}",n,ctx.r4.u32>>16);

@@ -124,6 +124,9 @@ void NameCurrentThread(const char* name);
 
 // Capture hotkey: dump the recent history now (plus a few seconds after).
 void RequestCapture();
+// Write a Home capture still waiting for its ~6 s window right away (the game
+// is closing), with the after-press window cut short, instead of losing it.
+void FlushPendingCapture();
 
 // Cooperative timing of outer NSV guest event dispatches. No thread
 // suspension, stack unwinding or output on the measured thread. Events from

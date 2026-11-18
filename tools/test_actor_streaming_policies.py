@@ -129,7 +129,7 @@ inline uint32_t ServeInstancePalette(uint8_t*,uint32_t,float*,uint32_t){return 0
 #include <cstdint>
 #include <vector>
 namespace skate3::native_scene {
-struct DrawItem {uint32_t mesh=5,ctx=10,vb_obj=11,ib_obj=12,char_family=2;bool ropa=false,skinned=true,caster_bank=false,pending=false,retained=false;uint8_t dbg_src=1;float world[16]{},char_rows[72]{};std::vector<float> bones=std::vector<float>(24);};
+struct DrawItem {uint32_t mesh=5,ctx=10,vb_obj=11,ib_obj=12,char_family=2;bool ropa=false,skinned=true,caster_bank=false,pending=false,retained=false;uint8_t dbg_src=1,rows_src=0;float world[16]{},char_rows[72]{};std::vector<float> bones=std::vector<float>(24);};
 struct FrameScene {uint64_t generation=0,world_identity=2;float cam_pos[3]{},view_proj[16]{};std::vector<DrawItem> items;};
 }
 ''')

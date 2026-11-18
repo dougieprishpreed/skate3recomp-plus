@@ -277,6 +277,7 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_texture_lookup.cpp
     src/skate3_context_resource_search.cpp
     src/skate3_pedestrian_speech.cpp
+    src/skate3_ped_behaviour.cpp
     src/skate3_win_icon.cpp
     third_party/rexglue-sdk/thirdparty/crypto/sha256.cpp
 )

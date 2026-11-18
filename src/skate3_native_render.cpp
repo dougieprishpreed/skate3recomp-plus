@@ -90,24 +90,14 @@ REXCVAR_DEFINE_BOOL(skate3_raise_process_priority, true, "Skate 3",
                     "slow to ~25-30 fps under full load. Linux/macOS cannot raise a "
                     "program's own priority without extra rights.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_BOOL(skate3_motion_smoothing_auto, true, "Skate 3",
-                    "Choose the motion smoothing (the camera and actor smoothing switches) "
-                    "by display: full smoothing while frames are shown faster than the "
-                    "game's 60 Hz simulation (120/144 Hz displays, VRR), where it fills in "
-                    "the frames between simulation steps; adaptive smoothing otherwise "
-                    "(see skate3_adaptive_smoothing_max). Off: full smoothing whenever its "
-                    "switches are on.")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(skate3_adaptive_smoothing_max, 0.5, "Skate 3",
-                      "Adaptive smoothing (60 Hz displays, skate3_motion_smoothing_auto): "
-                      "while frames and simulation steps arrive evenly, the game's own "
-                      "camera and actors are drawn with no delay. When frames start "
-                      "running late (heavy CPU load, hitches) the smoothing delay builds "
-                      "up gradually to this share of the full smoothing (1.0 = ~42 ms of "
-                      "delay and a 50 ms filter; 0.5 = ~21 ms and 25 ms) and eases back "
-                      "to none 2 s after they settle; the change is a few percent of "
-                      "playback speed, never a jump. 0 = no smoothing at 60 Hz.")
-    .range(0.0, 1.0)
+REXCVAR_DEFINE_BOOL(skate3_motion_smoothing_auto, false, "Skate 3",
+                    "On: motion smoothing (the camera and actor smoothing switches) only "
+                    "while frames are shown faster than the game's 60 Hz simulation "
+                    "(120/144 Hz displays, VRR); at 60 Hz the game's own camera and actors "
+                    "are drawn with no smoothing delay (~42 ms less), but the game's own "
+                    "camera turns unevenly (about 1 in 6 turning steps off by over 10%) and "
+                    "the ground and skater look jerky. Off (default, as in the original "
+                    "recomp): smoothing whenever its switches are on.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_sim_tick_lock, true, "Skate 3",
                     "Wake the game's 60 Hz simulation tick precisely and in step with "
@@ -151,11 +141,8 @@ int64_t g_pace_locked_period_ns = 0;  // PaceGuestFrame, guest render thread
 std::atomic<double> g_paced_hz{0.0};
 std::atomic<bool> g_smoothing_wanted{false};
 // Share of the full smoothing delay/filter applied this frame (0 = the game's
-// own frame, 1 = full smoothing), slewed by UpdateSmoothingWanted.
+// own frame, 1 = full smoothing), eased in and out by UpdateSmoothingWanted.
 std::atomic<double> g_smooth_k{0.0};
-// Uneven simulation steps the camera showed (NoteUnevenStep), steady ns.
-std::mutex g_uneven_mutex;
-std::deque<int64_t> g_uneven_steps;
 
 
 // One per-mesh submission. kind 0 = RenderMesh (dynamic entities: a = the
@@ -513,31 +500,25 @@ void ApplyProcessPriority() {
 #endif
 }
 
-// Motion smoothing mode and strength, once per guest frame (guest render
-// thread). Full (k = 1) while frames are shown faster than the 60 Hz
-// simulation (paced over ~66 Hz and measured: leaves below ~66 fps after
-// 0.5 s, returns above ~80 fps after 2 s) or with skate3_motion_smoothing_auto
-// off. Otherwise adaptive: k = 0 (the game's own frames) until frames run late
-// (2 releases over 1.25 frame periods within 1.5 s) or the camera shows
-// sustained uneven steps (4 within 1.5 s; the occasional lone one does not
-// count), then up to skate3_adaptive_smoothing_max until 2 s after the last
-// trigger. k moves at most 0.024 per frame up (~1 ms of delay, a 6% playback
-// stretch) and 0.008 down (~2%): the delay builds and fades, never jumps.
+// Motion smoothing on or off, once per guest frame (guest render thread). On
+// only while frames are shown faster than the game's 60 Hz simulation
+// (paced over ~66 Hz and measured: off below ~66 fps after 0.5 s, back on
+// above ~80 fps after 2 s), or with skate3_motion_smoothing_auto off. On a
+// 60 Hz display it stays off: every frame already gets exactly one simulation
+// step (skate3_sim_tick_lock), so the game's own camera and actors are drawn.
+// The strength k eases between 0 and 1 over time (~0.7 s on, ~2 s off: a few
+// percent of playback speed, never a jump).
 void UpdateSmoothingWanted(int64_t release_ns) {
-  static int64_t s_last = 0, s_since = 0, s_trigger = 0;
+  static int64_t s_last = 0, s_since = 0;
   static double s_interval = 0.0;
   static bool s_fast = false;
-  static std::deque<int64_t> s_late;
   static int s_logged = -1;
-  static uint64_t s_frames = 0, s_engaged = 0;
-  static double s_max_k = 0.0;
-  static int64_t s_report = 0;
-  double frame_ns = 0.0;
+  double dt_s = 0.0;
   if (s_last != 0) {
     const double dt = double(release_ns - s_last);
     if (dt > 0.0 && dt < 1e9) {
       s_interval = s_interval == 0.0 ? dt : s_interval * 0.9 + dt * 0.1;
-      frame_ns = dt;
+      dt_s = std::min(dt * 1e-9, 0.1);
     }
   }
   s_last = release_ns;
@@ -552,65 +533,22 @@ void UpdateSmoothingWanted(int64_t release_ns) {
     s_fast = !s_fast;
     s_since = release_ns;
   }
-  // Late frames and sustained uneven steps (adaptive mode's triggers).
-  const double period_ns = paced_hz > 1.0 && paced_hz < 999.0 ? 1e9 / paced_hz : 1e9 / 60.0;
-  if (frame_ns > 1.25 * period_ns) {
-    s_late.push_back(release_ns);
-  }
-  while (!s_late.empty() && s_late.front() < release_ns - 1'500'000'000) {
-    s_late.pop_front();
-  }
-  size_t uneven = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_uneven_mutex);
-    while (!g_uneven_steps.empty() && g_uneven_steps.front() < release_ns - 1'500'000'000) {
-      g_uneven_steps.pop_front();
-    }
-    uneven = g_uneven_steps.size();
-  }
-  if (s_late.size() >= 2 || uneven >= 4) {
-    s_trigger = release_ns;
-  }
-  const bool triggered = s_trigger != 0 && release_ns - s_trigger < 2'000'000'000;
-  const double k_max = std::clamp(REXCVAR_GET(skate3_adaptive_smoothing_max), 0.0, 1.0);
-  int mode = 0;  // 0 off, 1 adaptive, 2 full
-  double target = 0.0;
-  if (!REXCVAR_GET(skate3_motion_smoothing_auto) || s_fast) {
-    mode = 2;
-    target = 1.0;
-  } else if (k_max > 0.0) {
-    mode = 1;
-    target = triggered ? k_max : 0.0;
-  }
+  const bool on = !REXCVAR_GET(skate3_motion_smoothing_auto) || s_fast;
   double k = g_smooth_k.load(std::memory_order_relaxed);
-  k = target > k ? std::min(target, k + 0.024) : std::max(target, k - 0.008);
+  k = on ? std::min(1.0, k + 1.4 * dt_s) : std::max(0.0, k - 0.5 * dt_s);
   g_smooth_k.store(k, std::memory_order_relaxed);
-  g_smoothing_wanted.store(mode != 0 || k > 0.0, std::memory_order_relaxed);
-  if (mode != s_logged) {
-    s_logged = mode;
-    if (mode == 2) {
-      REXLOG_INFO("motion-smoothing: full ({}; frames paced at {:.1f} Hz, measured {:.1f} fps)",
-                  s_fast ? "frames outpace the 60 Hz simulation" : "automatic choice off",
+  g_smoothing_wanted.store(on || k > 0.0, std::memory_order_relaxed);
+  if (int(on) != s_logged) {
+    s_logged = int(on);
+    if (on) {
+      REXLOG_INFO("motion-smoothing: on ({}; frames paced at {:.1f} Hz, measured {:.1f} fps)",
+                  s_fast ? "frames outpace the 60 Hz simulation" : "smoothing switches on",
                   paced_hz, measured_hz);
-    } else if (mode == 1) {
-      REXLOG_INFO("motion-smoothing: adaptive (no delay while frames arrive evenly, up to {:.0f}% "
-                  "of the full smoothing while they run late; frames paced at {:.1f} Hz)",
-                  k_max * 100.0, paced_hz);
     } else {
-      REXLOG_INFO("motion-smoothing: off (the game's own camera and actors are drawn)");
+      REXLOG_INFO("motion-smoothing: off (the game's own camera and actors are drawn; frames "
+                  "paced at {:.1f} Hz)",
+                  paced_hz);
     }
-  }
-  ++s_frames;
-  s_engaged += k > 0.0 ? 1 : 0;
-  s_max_k = std::max(s_max_k, k);
-  if (rex::chrono::GuestTickTraceEnabled() && release_ns - s_report > 60'000'000'000) {
-    if (s_report != 0) {
-      REXLOG_INFO("motion-smoothing: last 60 s smoothing active in {} of {} frames, strongest {:.2f}",
-                  s_engaged, s_frames, s_max_k);
-    }
-    s_report = release_ns;
-    s_frames = s_engaged = 0;
-    s_max_k = 0.0;
   }
 }
 
@@ -771,13 +709,6 @@ double MotionSmoothingScale() {
   return g_smooth_k.load(std::memory_order_relaxed);
 }
 
-void NoteUnevenStep() {
-  std::lock_guard<std::mutex> lock(g_uneven_mutex);
-  g_uneven_steps.push_back(SteadyNowNs());
-  if (g_uneven_steps.size() > 256) {
-    g_uneven_steps.pop_front();
-  }
-}
 
 // The game's simulation tick loop (sub_82966930, on its own thread): each
 // pass waits on a one-shot timer, ticks the simulation (one 60 Hz step, run

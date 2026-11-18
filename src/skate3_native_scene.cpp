@@ -127,6 +127,11 @@ REXCVAR_DEFINE_BOOL(skate3_skate2_texture_probe, false, "Skate 3",
 
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
 
+REXCVAR_DEFINE_BOOL(skate3_native_skinned_pair_log, false, "Skate 3",
+                    "Diagnostic: every 30 s, how many skinned draws sharing a mesh (traffic cars, pedestrians, "
+                    "AI skaters) were matched to an instance out of submit order, by a car's tick position or "
+                    "by a cached pose, and how many matched no waiting instance and were skipped")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(skate3_native_render_scene, true, "Skate 3",
                     "Render the game scene natively from the hooked MeshContext stream, "
                     "replacing the emulated GPU output (requires skate3_native_render). "
@@ -2528,6 +2533,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
   item.decal_art = 0;
   item.hair = false;
   item.char_family = 0;
+  item.char_noshadow = false;
   item.hair_alpha_tex = 0;
   item.ropa = false;
   item.decal = false;
@@ -2755,6 +2761,7 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
               // DrawItem::char_alpha; captured draw order:
               // cac_alpha draws after all opaque CAC, before hair).
               item.char_alpha = std::memcmp(sub, "alpha", 6) == 0;
+              item.char_noshadow = std::memcmp(sub, "default_light", 14) == 0;
             }
             // environment.decal / environment.decal_tileable: graffiti and
             // painted-branding overlay meshes (see DrawItem::decal).
@@ -2963,12 +2970,15 @@ bool BuildItemFromMesh(uint8_t* base, uint32_t mesh, DrawItem& item,
           skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
         item.env_family = 2;
       }
-      // Skate 2 animated.flag (vertexanimate.fx): its own exact family 15
-      // (vertex wave in vs_main, S2 PS: packed lightmap x diffuse x
-      // g_ViewDotLight.x). Unrecognized it took the static generic path.
+      // animated.flag (vertexanimate.fx): its own exact family 15 (vertex
+      // wave in vs_main; PS: lightmap x diffuse x g_ViewDotLight.x, packed
+      // lightmap on Skate 2 items). Both games: Skate 3's
+      // vertexanimate_defaultVS/PS (ucode out/research/log084/s3_disasm) is
+      // the same wave and body, with Skate 3's own m_params (identical to
+      // Skate 2's flag rows). Unrecognized it took the static generic path:
+      // the six Skate 3 Downtown flags never waved.
       if (item.env_family == 0 &&
-          std::strcmp(item.material_name, "animated.flag") == 0 &&
-          skate3::world_loading::IsSkate2TextureNamespace(item.diffuse_guid)) {
+          std::strcmp(item.material_name, "animated.flag") == 0) {
         item.env_family = 15;
       }
 
@@ -4523,7 +4533,11 @@ void OnSetScissor(uint8_t* base, uint32_t rect_ptr) {
 // highlight. Reading c17 here tinted the legacy-path hair with its
 // highlight color (light hair in place of the chosen color). Used as
 // captured.
-void CaptureHairTint(uint8_t* base, DrawItem& item) {
+void CaptureHairTint(uint8_t* base, DrawItem& item, uint32_t vs_bank) {
+  // Shadow-pass hair draws stage no PS constants (see CaptureCharLighting).
+  if (vs_bank != 0 && BankIsOrtho(base, vs_bank)) {
+    return;
+  }
   const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
   if (ps == 0) {
     return;
@@ -4667,8 +4681,23 @@ void CaptureIndicatorRows(uint8_t* base, DrawItem& item, bool own_bank) {
 // rim spec c8, rim c11, fresnel powers c6.w/c5.z; cacstamp: c16/c17/c20,
 // c15.w/c14.z [+ the editor row shift]) exist on fams 1/2 only; [15].w
 // stays 0 when they fail their range gates and the PS terms vanish.
-void CaptureCharLighting(uint8_t* base, DrawItem& item) {
+void CaptureCharLighting(uint8_t* base, DrawItem& item, uint32_t vs_bank) {
   if (item.char_family == 0) {
+    return;
+  }
+  // Shadow-pass draws never stage character/vehicle PS rows: every
+  // character, hair and vehicle shadowPS (vehicle_shadowPS, ..._glass_,
+  // livingworld_stamp_, defaultcharacter_, defaulthair_, cacstamp_*_shadowPS)
+  // has an EMPTY constant table (out/research/log084/s3_fpo). During an
+  // ortho (CSM caster) draw the PS bank therefore still holds an earlier
+  // draw's constants, typically another car's: a plausible foreign bank
+  // validated as THIS item's paint, and then refreshed the per-instance
+  // caches with it. A vehicle the game has stopped drawing in its main view
+  // (our smoothed camera still shows it for ~40 ms at the screen edge) is
+  // captured only through those banks: the edge-of-view colour changes,
+  // bright cars and odd doors (also in stock 2.0.2). Its own last validated
+  // rows stay served from the per-instance / per-ctx caches.
+  if (vs_bank != 0 && BankIsOrtho(base, vs_bank)) {
     return;
   }
   const uint32_t ps = g_ps_bank.load(std::memory_order_relaxed);
@@ -4758,6 +4787,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     d[14 * 4 + 0] = 1.0f;
     d[14 * 4 + 1] = 8.0f;
     std::memcpy(item.char_rows, local, sizeof(item.char_rows));
+    item.rows_src = 1;
     g_char_valid.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -4805,7 +4835,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       case 1: light_r = 0; key_r = 6; expo_r = 4; expo_c = 2; break;
       case 2: case 3: case 6: case 7: break;  // defaults above
       case 4: light_r = 4; key_r = 16; expo_r = 8; expo_c = 2; break;
-      case 5: light_r = 4; key_r = 15; expo_r = 8; expo_c = 2; break;
+      case 5: light_r = 4; key_r = 10; expo_r = 8; expo_c = 2; break;
     }
     light_r += plus;
     key_r += plus;
@@ -4964,6 +4994,10 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     if (item.char_alpha && item.hair_alpha_tex != 0) {
       d[14 * 4 + 2] = 1.0f;
     }
+    // defaultcharacter_light: no shadow receive (see DrawItem::char_noshadow).
+    if (fam == 1 && item.char_noshadow) {
+      d[2 * 4 + 2] = 1.0f;
+    }
   } else if (fam == 3) {
     const float amb = row(19u, 3);
     if (!(amb >= 0.0f && amb < 16.0f)) return;
@@ -4976,6 +5010,43 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     }
     d[12 * 4 + 3] = 1.0f;
     d[14 * 4 + 0] = std::clamp(row(21u, 0), 0.0f, 1.0f);
+    // livingworld_stamp_defaultPS (ucode out/research/log084/s3_disasm;
+    // Skate 2 livingworld_stamp.fx): material multiplier m_params[0].y
+    // (c14.y) in [0].w, world-shadow floor g_CSMSelfBias.w (c8.w) in
+    // [14].z, and the fam-1/2 rim/spec layout: [15] key spec c16 + power,
+    // [16] rim spec c17 + power, [17] rim light c20 + key fresnel power
+    // c15.w, [14].w rim fresnel power c14.z. The rim/spec rows are
+    // all-or-nothing behind range gates ([15].w stays 0 and the PS skips
+    // the rim and spec terms).
+    const float mult = row(14u, 1);
+    d[3] = mult > 0.25f && mult < 4.0f ? mult : 1.0f;
+    const float floor_w = row(8u, 3);
+    d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
+    const float kfres = row(15u, 3);
+    const float rfres = row(14u, 2);
+    float sr[12];
+    bool spec_ok = kfres >= 0.0f && kfres < 512.0f && rfres >= 0.0f && rfres < 512.0f;
+    for (int r = 0; r < 3 && spec_ok; ++r) {
+      const uint32_t src = r == 0 ? 16u : (r == 1 ? 17u : 20u);
+      for (int c = 0; c < 4; ++c) {
+        sr[r * 4 + c] = row(src, uint32_t(c));
+      }
+      for (int c = 0; c < 3; ++c) {
+        spec_ok = spec_ok && sr[r * 4 + c] >= 0.0f && sr[r * 4 + c] < 64.0f;
+      }
+    }
+    spec_ok = spec_ok && sr[3] >= 0.5f && sr[3] < 512.0f && sr[7] >= 0.5f && sr[7] < 512.0f;
+    if (spec_ok) {
+      for (int c = 0; c < 4; ++c) {
+        d[15 * 4 + c] = sr[c];
+        d[16 * 4 + c] = sr[4 + c];
+      }
+      d[17 * 4 + 0] = sr[8];
+      d[17 * 4 + 1] = sr[9];
+      d[17 * 4 + 2] = sr[10];
+      d[17 * 4 + 3] = kfres;
+      d[14 * 4 + 3] = rfres;
+    }
   } else if (fam == 6 || fam == 7) {
     // vehicle.fx body / vehicle_glass.fx windows (row map above). The
     // otherwise-unused SH row 0 carries the phong spec color + power.
@@ -4988,6 +5059,10 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     for (int c = 0; c < 4; ++c) {
       d[3 * 4 + c] = std::clamp(row(16u, uint32_t(c)), 0.0f, 64.0f);
     }
+    // World-shadow floor g_CSMSelfBias.w (c8.w): vehicle_defaultPS /
+    // vehicle_glass_defaultPS take max(world shadow, c8.w).
+    const float floor_w = row(8u, 3);
+    d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
     if (fam == 6) {
       for (int c = 0; c < 3; ++c) {
         d[12 * 4 + c] = std::clamp(row(21u, uint32_t(c)), 0.0f, 4.0f);
@@ -5008,25 +5083,67 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
       d[12 * 4 + 3] = 1.0f;
       d[14 * 4 + 0] = std::clamp(row(20u, 0) * row(18u, 3), 0.0f, 1.0f);
     }
-  } else {
-    // Hair: flat ambient scalar + fresnel rim tint, strand-alpha scale.
+  } else if (fam == 4) {
+    // cac_hair: flat ambient c14.w/4, Kajiya-Kay strand tint c17 with its
+    // exponent c11.w (authored up to a few hundred), strand-alpha scale
+    // c15.x, world-shadow floor g_CSMSelfBias.w (c3.w; the ucode takes
+    // max(shadow, c3.w)), riding the fam-1/2-only lens-flag slot.
     const float amb = row(14u, 3) * 0.25f;
     d[2 * 4 + 3] = std::clamp(amb, 0.0f, 4.0f);
-    // Highlight power: cac_hair's Kajiya-Kay exponent (c11.w, authored up
-    // to a few hundred) / defaulthair's fresnel power (c9.z).
-    d[3] = std::clamp(row(fam == 4 ? 11u : 9u, fam == 4 ? 3u : 2u), 1.0f,
-                      fam == 4 ? 512.0f : 64.0f);
-    const uint32_t fres_r = fam == 4 ? 17u : 10u;
+    d[3] = std::clamp(row(11u, 3), 1.0f, 512.0f);
     for (int c = 0; c < 3; ++c) {
-      d[13 * 4 + c] = std::clamp(row(fres_r, uint32_t(c)), 0.0f, 8.0f);
+      d[13 * 4 + c] = std::clamp(row(17u, uint32_t(c)), 0.0f, 8.0f);
     }
-    d[13 * 4 + 3] = std::clamp(row(fam == 4 ? 15u : 16u, 0), 0.0f, 4.0f);
+    d[13 * 4 + 3] = std::clamp(row(15u, 0), 0.0f, 4.0f);
     d[14 * 4 + 0] = 1.0f;
-    if (fam == 4) {
-      // cac_hair: the world-shadow floor g_CSMSelfBias.w (c3.w; the ucode
-      // takes max(shadow, c3.w)). Rides the fam-1/2-only lens-flag slot.
-      const float floor_w = row(3u, 3);
-      d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
+    const float floor_w = row(3u, 3);
+    d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
+  } else {
+    // defaulthair (pros' and pedestrians' hair), exact from
+    // defaulthair_defaultPS (ucode out/research/log084/s3_disasm, the same
+    // body as Skate 2's character_functions.fxh CalculateCharacterLighting):
+    // key color c10 (key fresnel power c10.w), key spec c11 (power c11.w),
+    // rim spec c12 (power c12.w), flat ambient c14.w/4, rim light c15,
+    // material multiplier m_params[0].y (c9.y), rim fresnel power c9.z,
+    // world-shadow floor c3.w, strand-alpha scale c16.x. The key (c10) and
+    // the key light (rows_valid above) go through the shared slots; the
+    // rest use the fam-1/2 rim/spec layout so the PS shares their terms:
+    // [15] key spec + power, [16] rim spec + power, [17] rim light + key
+    // fresnel power, [14].w rim fresnel power, [14].z the shadow floor,
+    // [13].w the alpha scale, [0].w the multiplier. The spec rows are
+    // all-or-nothing behind range gates ([15].w stays 0 and the PS skips
+    // the spec terms).
+    const float amb = row(14u, 3) * 0.25f;
+    d[2 * 4 + 3] = std::clamp(amb, 0.0f, 4.0f);
+    const float mult = row(9u, 1);
+    d[3] = mult > 0.25f && mult < 4.0f ? mult : 1.0f;
+    for (int c = 0; c < 3; ++c) {
+      d[17 * 4 + c] = std::clamp(row(15u, uint32_t(c)), 0.0f, 8.0f);
+    }
+    d[13 * 4 + 3] = std::clamp(row(16u, 0), 0.0f, 4.0f);
+    d[14 * 4 + 0] = 1.0f;
+    const float floor_w = row(3u, 3);
+    d[14 * 4 + 2] = floor_w >= 0.0f && floor_w <= 1.0f ? floor_w : 0.0f;
+    const float kfres = row(10u, 3);
+    const float rfres = row(9u, 2);
+    d[17 * 4 + 3] = kfres >= 0.0f && kfres < 512.0f ? kfres : 1.0f;
+    d[14 * 4 + 3] = rfres >= 0.0f && rfres < 512.0f ? rfres : 1.0f;
+    float sr[8];
+    bool spec_ok = true;
+    for (int r = 0; r < 2 && spec_ok; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        sr[r * 4 + c] = row(r == 0 ? 11u : 12u, uint32_t(c));
+      }
+      for (int c = 0; c < 3; ++c) {
+        spec_ok = spec_ok && sr[r * 4 + c] >= 0.0f && sr[r * 4 + c] < 64.0f;
+      }
+      spec_ok = spec_ok && sr[r * 4 + 3] >= 0.5f && sr[r * 4 + 3] < 512.0f;
+    }
+    if (spec_ok) {
+      for (int c = 0; c < 4; ++c) {
+        d[15 * 4 + c] = sr[c];
+        d[16 * 4 + c] = sr[4 + c];
+      }
     }
   }
   d[14 * 4 + 1] = float(fam);
@@ -5049,6 +5166,7 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
     }
   }
   std::memcpy(item.char_rows, local, sizeof(item.char_rows));
+  item.rows_src = 1;
   g_char_valid.fetch_add(1, std::memory_order_relaxed);
   // Cloth-family stamp evidence (cacstamp_cloth: tf5 graphic, tf6 dirt,
   // dirt level i_params.y = c22.y; cac_cloth: tf5 dirt only): log the
@@ -5126,7 +5244,9 @@ void CaptureCharLighting(uint8_t* base, DrawItem& item) {
   if (g_char_rows_cache.size() > 4096) {
     g_char_rows_cache.clear();
   }
-  std::memcpy(g_char_rows_cache[item.mesh].data(), local, sizeof(local));
+  CharRowsMesh& cm = g_char_rows_cache[item.mesh];
+  std::memcpy(cm.rows.data(), local, sizeof(local));
+  cm.ctx = item.ctx;
 }
 
 // The game's per-entity spawn/streaming fade. LivingWorld presentation
@@ -5498,9 +5618,9 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
         // ident[] w416/w352 telemetry proves or refutes that live.
         skate3::native_entity::ObserveRopaWorld(base, item.ctx, rows);
         if (item.hair) {
-          CaptureHairTint(base, item);
+          CaptureHairTint(base, item, bank);
         }
-        CaptureCharLighting(base, item);
+        CaptureCharLighting(base, item, bank);
         return true;
       }
       // Implausible or off-clip matrix: the bank belongs to another mesh
@@ -5546,9 +5666,9 @@ bool CaptureSkinnedState(uint8_t* base, uint32_t bank, uint32_t palette_base,
     item.bones[i] = (f > -1e7f && f < 1e7f) ? f : 0.0f;
   }
   if (item.hair) {
-    CaptureHairTint(base, item);
+    CaptureHairTint(base, item, bank);
   }
-  CaptureCharLighting(base, item);
+  CaptureCharLighting(base, item, bank);
   // The refined home: the skin VS's tattoo-UV rows follow its bone array.
   CaptureStampUv(base, bank, palette_base, item);
   return true;
@@ -6033,6 +6153,24 @@ void OnSetStreamSource(uint32_t stream, uint32_t vb_obj, uint32_t offset, uint32
     g_cur_streams[stream][1].store(offset, std::memory_order_relaxed);
     g_cur_streams[stream][2].store(stride, std::memory_order_relaxed);
   }
+}
+
+// One line per 30 s with skate3_native_skinned_pair_log (counters reset).
+static void ReportSkinnedPairing() {
+  if (!REXCVAR_GET(skate3_native_skinned_pair_log)) return;
+  static std::atomic<int64_t> next_ms{0};
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t due = next_ms.load(std::memory_order_relaxed);
+  if (now < due || !next_ms.compare_exchange_strong(due, now + 30000)) return;
+  if (due == 0) return;  // First call starts the window.
+  const uint64_t draws = g_skinned_pair_draws.exchange(0), lw = g_skinned_pair_moved_lw.exchange(0),
+                 cached = g_skinned_pair_moved_cached.exchange(0), refused = g_skinned_pair_refused.exchange(0),
+                 cached_fifo = g_skinned_pair_cached_fifo.exchange(0);
+  REXLOG_INFO("native-scene: skinned pairing last 30 s: {} draws, out of submit order {} (car tick position) + {} "
+              "(cached pose: peds, skaters), skipped {} (cars), kept in submit order {} (peds, skaters: "
+              "no cached pose matched)",
+              draws, lw, cached, refused, cached_fifo);
 }
 
 void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t r6,
@@ -7190,38 +7328,32 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
   // draw collapsed all clones onto the LAST instance's rows (the teal-vest
   // twins). Pair draw to instance by the bone palette: the draw's VS bank
   // holds the instance's palette, which matches exactly one item's captured
-  // bones.
+  // bones. The WHOLE first affine (3 rows, 12 floats) must match: its first
+  // row alone is the rotation's first row + the x translation, equal for two
+  // same-model cars parked in a line along z (or driving parallel), which
+  // then took each other's paint.
   auto refresh = g_frame_char_refresh.equal_range(key);
   if (refresh.first != refresh.second) {
     const uint32_t pb = BankPaletteBase(base, bank);
-    float row0[4] = {};
-    if (pb != 0) {
-      for (int i = 0; i < 4; ++i) {
-        row0[i] = LoadGuestF32(base, bank + (pb * 4 + uint32_t(i)) * 4);
-      }
-    }
     for (auto it = refresh.first; it != refresh.second; ++it) {
       if (it->second >= g_frame_dynitems.size()) continue;
       DrawItem& d = g_frame_dynitems[it->second];
       if (d.bones.size() >= 4 && pb != 0) {
-        bool match = true;
-        for (int i = 0; i < 4 && match; ++i) {
-          // The refined palette can sit one register past BankPaletteBase
-          // (cloth/morph layouts); compare against both candidate rows.
-          match = std::fabs(d.bones[size_t(i)] - row0[i]) < 1e-4f;
-        }
-        if (!match) {
-          bool match1 = true;
-          for (int i = 0; i < 4 && match1; ++i) {
-            match1 = std::fabs(d.bones[size_t(i)] -
-                               LoadGuestF32(base, bank + ((pb + 1) * 4 + uint32_t(i)) * 4)) <
-                     1e-4f;
+        const size_t n = std::min<size_t>(12, d.bones.size());
+        // The refined palette can sit one register past BankPaletteBase
+        // (cloth/morph layouts); compare against both candidate homes.
+        const auto matches_at = [&](uint32_t reg) {
+          for (size_t i = 0; i < n; ++i) {
+            const float v = LoadGuestF32(base, bank + (reg * 4 + uint32_t(i)) * 4);
+            if (!(std::fabs(d.bones[i] - v) < 1e-4f)) {
+              return false;
+            }
           }
-          match = match1;
-        }
-        if (!match) continue;
+          return true;
+        };
+        if (!matches_at(pb) && !matches_at(pb + 1)) continue;
       }
-      CaptureCharLighting(base, d);
+      CaptureCharLighting(base, d, bank);
     }
   }
   auto range = g_frame_pending_by_buffers.equal_range(key);
@@ -7308,6 +7440,103 @@ void OnDrawDone(uint8_t* base, uint32_t func, uint32_t r4, uint32_t r5, uint32_t
       return;
     }
     caster_refresh = true;
+  }
+  // Skinned clone disambiguation: same-mesh skinned instances (traffic cars
+  // of one model, a taxi and the sedans sharing its body, pedestrians)
+  // share these buffers, and the FIFO assumption (draw order == submit
+  // order) breaks whenever the game submits an instance but does not draw
+  // it in this pass, e.g. a car leaving the main view: the next same-model
+  // car's draw then paired with the waiting car, which took that car's
+  // pose AND paint (the per-instance caches kept the foreign paint: the
+  // taxi that turned red as it left the screen). Pair by identity: the
+  // waiting instance whose own current position (the LW entity's packed
+  // palette this sim tick, else its last published palette from the last
+  // few frames) matches this draw's bone 0. Instances with no known
+  // position (first sight) keep FIFO; a draw matching none of the known
+  // waiting instances, with no unknown one left, pairs with nobody.
+  if (!caster_refresh && oldest->second < g_frame_dynitems.size() &&
+      g_frame_dynitems[oldest->second].skinned) {
+    const uint32_t pb_id = BankPaletteBase(base, bank);
+    if (pb_id != 0) {
+      float nt[2][3];
+      for (uint32_t h = 0; h < 2; ++h) {
+        for (uint32_t r = 0; r < 3; ++r) {
+          nt[h][r] = LoadGuestF32(base, bank + ((pb_id + h + r) * 4 + 3) * 4);
+        }
+      }
+      auto best = range.second;
+      auto first_unknown = range.second;
+      float best_d2 = 1e30f;
+      bool any_known = false, any_known_lw = false;
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second >= g_frame_dynitems.size()) {
+          continue;
+        }
+        const DrawItem& c = g_frame_dynitems[it->second];
+        if (!c.pending || !c.skinned) {
+          continue;
+        }
+        float ex[3];
+        float bound2 = 4.0f;  // 2 m: one sim tick of travel at any car speed
+        bool known = skate3::native_lw::LookupLwBone0(c.ctx, ex);
+        any_known_lw = any_known_lw || known;
+        if (!known && c.ctx != 0) {
+          const auto bit = g_bones_cache_ctx.find(c.ctx);
+          if (bit != g_bones_cache_ctx.end() && bit->second.bones.size() >= 12 &&
+              g_guest_frame - bit->second.frame <= 3) {
+            ex[0] = bit->second.bones[3];
+            ex[1] = bit->second.bones[7];
+            ex[2] = bit->second.bones[11];
+            bound2 = 9.0f;  // up to a few frames old
+            known = true;
+          }
+        }
+        if (!known) {
+          if (first_unknown == range.second || it->second < first_unknown->second) {
+            first_unknown = it;
+          }
+          continue;
+        }
+        any_known = true;
+        for (int h = 0; h < 2; ++h) {
+          const float dx = nt[h][0] - ex[0];
+          const float dy = nt[h][1] - ex[1];
+          const float dz = nt[h][2] - ex[2];
+          const float d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < bound2 && d2 < best_d2) {
+            best_d2 = d2;
+            best = it;
+          }
+        }
+      }
+      const auto fifo = oldest;
+      if (best != range.second) {
+        oldest = best;
+      } else if (first_unknown != range.second) {
+        oldest = first_unknown;
+      } else if (any_known_lw) {
+        // A living-world vehicle's exact tick position matched none: the
+        // car this draw belongs to was not submitted (the taxi case).
+        g_skinned_pair_refused.fetch_add(1, std::memory_order_relaxed);
+        ReportSkinnedPairing();
+        return;
+      } else if (any_known) {
+        // Only cached poses (up to a few frames old) to go by: refusing hid
+        // the ped for frames (no fixup, so its cache never re-stamped). Keep
+        // submit order, as before identity pairing.
+        g_skinned_pair_cached_fifo.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (oldest != fifo) {
+        // Paired out of submit order: by a living-world vehicle's tick
+        // position, or by a cached pose (pedestrians, skaters).
+        float ex[3];
+        const bool lw = oldest->second < g_frame_dynitems.size() &&
+                        skate3::native_lw::LookupLwBone0(g_frame_dynitems[oldest->second].ctx, ex);
+        (lw ? g_skinned_pair_moved_lw : g_skinned_pair_moved_cached).fetch_add(1, std::memory_order_relaxed);
+      }
+      g_skinned_pair_draws.fetch_add(1, std::memory_order_relaxed);
+      ReportSkinnedPairing();
+    }
   }
   // Rigid clone disambiguation: same-mesh piece clones share these buffers,
   // and under batched dispatch (park-editor venues: every capture defers,
@@ -7873,11 +8102,8 @@ void CountUnevenSteps(const RawCamSample& s) {
         // No step, or about two; past 3x is a cut, not a doubled step.
         if (step < 0.1f * usual || (step > 1.8f * usual && step < 3.0f * usual)) {
           ++odd_count;
-          skate3::native_render::NoteUnevenStep();  // adaptive smoothing trigger
-          if (!rex::chrono::GuestTickTraceEnabled()) {
-            // Research captures and the meter only with the timing trace on.
-          } else if (capture_at == 0.0 && captures < kMaxCaptures &&
-                     s.t - last_capture > kCaptureGapS) {
+          if (rex::chrono::GuestTickTraceEnabled() && capture_at == 0.0 &&
+              captures < kMaxCaptures && s.t - last_capture > kCaptureGapS) {
             capture_at = s.t + kCaptureDelayS;
           }
         }
@@ -8352,9 +8578,10 @@ bool LoadingOrFrontendActive() {
 // their pose rings with it instead of the frame time avoids the same
 // aliasing. See the frame camera in SmoothCamera.
 double g_latest_cam_tick = 0.0;
-// Share of the full smoothing delay and filter applied this frame (0 = the
-// game's own frame, 1 = full; skate3::native_render::MotionSmoothingScale),
-// shared by the camera (SmoothCamera) and the actors (InterpolateDynamicItems).
+// Share of the full smoothing delay and filter applied this frame while it
+// eases in or out (0 = the game's own frame, 1 = full;
+// skate3::native_render::MotionSmoothingScale), shared by the camera
+// (SmoothCamera) and the actors (InterpolateDynamicItems).
 double g_smooth_scale = 1.0;
 
 // `view` is this frame's camera as the build read it from guest memory at
@@ -11710,6 +11937,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             iit->second.entity == lw_entity) {
           std::memcpy(item.char_rows, iit->second.rows.data(),
                       sizeof(item.char_rows));
+          item.rows_src = 2;
           g_char_rows_inst_served.fetch_add(1, std::memory_order_relaxed);
         } else if (item.ropa) {
           // Sim-switch bridge: rows from the garment's sibling renderable
@@ -11722,6 +11950,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             if (eit != g_char_rows_cache_ent.end()) {
               std::memcpy(item.char_rows, eit->second.rows.data(),
                           sizeof(item.char_rows));
+              item.rows_src = 3;
               if (eit->second.fam != 0 &&
                   eit->second.fam != item.char_family) {
                 static std::atomic<uint32_t> s_fam_logged{0};
@@ -11760,10 +11989,22 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
         continue;
       }
       const auto cit = g_char_rows_cache.find(item.mesh);
-      if (cit != g_char_rows_cache.end()) {
-        std::memcpy(item.char_rows, cit->second.data(), sizeof(item.char_rows));
-        g_char_rows_reused.fetch_add(1, std::memory_order_relaxed);
+      if (cit == g_char_rows_cache.end()) {
+        continue;
       }
+      // Pedestrians (stamp tints) and vehicles (paint, glass tint) carry
+      // PER-INSTANCE rows: a model shared by many cars holds whichever car
+      // last validated, and a single instance only means one is visible
+      // THIS frame. Those families take the entry only when it is their own.
+      const bool per_instance_rows = item.char_family == 3 ||
+                                     item.char_family == 6 ||
+                                     item.char_family == 7;
+      if (per_instance_rows && cit->second.ctx != item.ctx) {
+        continue;
+      }
+      std::memcpy(item.char_rows, cit->second.rows.data(), sizeof(item.char_rows));
+      item.rows_src = 4;
+      g_char_rows_reused.fetch_add(1, std::memory_order_relaxed);
     }
   }
   {
@@ -12296,6 +12537,7 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
             rit->second.entity == entity) {
           std::memcpy(item.char_rows, rit->second.rows.data(),
                       sizeof(item.char_rows));
+          item.rows_src = 5;
           g_lw_rows_served.fetch_add(1, std::memory_order_relaxed);
         }
       }

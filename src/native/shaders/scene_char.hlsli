@@ -57,17 +57,20 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
     // map = the emulated car).
     float3 vn = cn;
     if (overlay.z > 0.5) {
-      // Imported DXT5nm uses AG; retail DXN uses RG. overlay.w is
-      // selected from the resolved texture format in New San Van only.
+      // DXT5nm (overlay.w, from the resolved format in both games) uses
+      // AG, the channels the game's vehicle PSes read; a DXN map keeps RG.
       float4 normal_sample = macro.Sample(smp, i.uv);
       float2 nm = (overlay.w > 0.5 ? normal_sample.ag : normal_sample.rg) * 2.0 - 1.0;
-      float3 dp1 = ddx(i.rpos), dp2 = ddy(i.rpos);
-      float2 du1 = ddx(i.uv), du2 = ddy(i.uv);
-      float3 dp2p = cross(dp2, cn), dp1p = cross(cn, dp1);
-      float3 tt = dp2p * du1.x + dp1p * du2.x;
-      float3 bb = dp2p * du1.y + dp1p * du2.y;
-      float im = rsqrt(max(max(dot(tt, tt), dot(bb, bb)), 1e-12));
-      vn = normalize(nm.x * tt * im + nm.y * bb * im +
+      // The calibrated screen frame every other family uses (negated U
+      // axis, raw V axis: measured against the stored usage-6/7 frames of
+      // world and character meshes; the game's vehicle VS builds its frame
+      // from the same stored tangent/binormal). This branch used to build
+      // its own UNNEGATED frame: the map's x tilt ran backwards, and the
+      // panels' baked curvature lit as large dark blotches on hoods and
+      // doors (user A/B vs the emulated renderer, 15 Nov).
+      float3 tt, bb;
+      ScreenTangentFrame(cn, i.rpos, i.uv, tt, bb);
+      vn = normalize(nm.x * tt + nm.y * bb +
                      cn * sqrt(saturate(1.0 - dot(nm, nm))));
     }
     float vndl = saturate(dot(vn, ch_light.xyz));
@@ -79,20 +82,28 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
     float fres = pow(1.0 - saturate(dot(vn, vd)), max(ch_light.w, 1.0));
     float3 cube = float3(0.0, 0.0, 0.0);
     if (overlay.y > 0.5) {
-      cube = env_cube.Sample(smp, reflect(-vd, vn)).rgb;
+      // vehicle_defaultPS looks the cube up at (R.x, R.y, -R.z), R =
+      // reflect(-V, N): its reflected eye vector has xy negated (c252.y =
+      // -1), the same lookup as the world and water families. The
+      // unmirrored lookup reflected the wrong side of the surroundings.
+      float3 rv = reflect(-vd, vn);
+      cube = env_cube.Sample(smp, float3(rv.x, rv.y, -rv.z)).rgb;
       cube *= cube;  // the PS consumes the cube squared (linear space)
     }
     // Gloss = the diffuse alpha SQUARED: the ucode squares the whole
     // diffuse fetch (linear-space decode), alpha included; raw alpha
     // over-specs ~5x and mottles the body panels.
     float gloss = fam < 6.5 ? albedo.a * albedo.a : 1.0;
-    // Original vehicle.fx shadows direct diffuse and key specular;
-    // ambient and the environment reflection remain independent of it.
-    float vehicle_shadow = 1.0;
-    if (overlay.w > 0.5) {
-      vehicle_shadow = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy),
-                           SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy));
-    }
+    // vehicle_defaultPS / vehicle_glass_defaultPS (ucode, both games' cars)
+    // shadow the direct diffuse and the key specular only, ambient and the
+    // environment reflection stay unshadowed: shadow = min(CSM x (N.L >= 0),
+    // max(world shadow, g_CSMSelfBias.w)). Before, only New San Van's
+    // imported cars took it, so Skate 3's cars stayed fully sunlit in shade
+    // (the "bright cars"). The CSM tap keeps the character receiver bias.
+    float vehicle_shadow = min(
+        SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy) *
+            (dot(vn, ch_light.xyz) >= 0.0 ? 1.0 : 0.0),
+        max(SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy), ch_misc.z));
     lin = sel * (ch_key.rgb * vndl * vehicle_shadow + ch_amb.rgb) +
           (spec * ch_sh[0].rgb * vehicle_shadow + cube) * fres * gloss;
     out_a = ch_misc.x;
@@ -125,33 +136,104 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
                   ch_tintB.rgb * strand * saturate(hndl * 1.75 + 0.25) * hs);
     out_a = saturate(decal_art.Sample(smp, i.uv2).r * ch_tintB.w);
   } else if (fam > 3.5) {
-    // NPC hair (defaulthair): key on a wrapped N.L ramp + flat
-    // ambient, fresnel rim tint on a steeper ramp; strand coverage from
-    // the mesh's "alpha" channel at the raw second texcoord (bound at t4)
-    // - alpha-blended in the sorted sub-pass (hair drawn opaque is the
-    // blocky-helmet look).
-    float fres = pow(1.0 - saturate(dot(cn, vd)), max(ch_light.w, 1.0));
-    float3 hl = ch_key.rgb * (saturate(ndl * 0.75 + 0.25) + ch_amb.w) +
-                ch_tintB.rgb * fres * saturate(ndl * 1.75 + 0.25);
-    lin = dlin * hl;
+    // Pro / pedestrian hair (defaulthair), exact from defaulthair_defaultPS
+    // (ucode + constant table, out/research/log084/s3_disasm; the same body
+    // as Skate 2's character_functions.fxh CalculateCharacterLighting):
+    //   lit  = c10 * sat(N.L) * shadow + c14.w/4 + c15 * sat(sat(N.RL) * rF)
+    //   spec = sat(D.a^2 * (phong(L)^c11.w * shadow * c11 * kF
+    //                     + phong(RL)^c12.w * c12 * rF))
+    //   col  = (D^2 * lit + spec) * m_params[0].y
+    // RL = normalize(L * (-1, 0.2, -1) - V) (the game's fixed rim light),
+    // kF / rF = (1 - sat(N.V))^c10.w / ^c9.z, phong(X) = sat(V.-reflect(X)),
+    // the key spec with no N.L gate (unlike the body PSes). shadow =
+    // max(world shadow, c3.w) as in cac_hair: the baked building/tree shade
+    // (our static sun map); hair takes no CSM. N = the DXN normal map on
+    // the strand frame (cac_hair's channel pairing). The previous port had
+    // no shadow term and swapped the key and rim colors, so the key light
+    // rode an unshadowed rim term and light (blonde) hair stayed bright in
+    // shade. Strand coverage from the mesh's "alpha" channel at the raw
+    // second texcoord (bound at t4), alpha-blended in the sorted sub-pass.
+    float3 htt, hbb;
+    ScreenTangentFrame(cn, i.rpos, i.uv, htt, hbb);
+    float3 hn = cn;
+    if (overlay.z > 0.5) {
+      float2 nm = macro.SampleBias(smp, i.uv, misc.y).ag * 2.0 - 1.0;
+      hn = normalize(nm.x * htt + nm.y * hbb +
+                     cn * sqrt(saturate(1.0 - dot(nm, nm))));
+    }
+    float hndl_u = dot(hn, ch_light.xyz);
+    float hs = max(SampleStaticSun(i.rpos + cam_pos.xyz, hn, i.pos.xy), ch_misc.z);
+    float fb = 1.0 - saturate(dot(hn, vd));
+    float kfres = pow(max(fb, 1e-6), ch_rim.w);
+    float rfres = pow(max(fb, 1e-6), ch_misc.w);
+    float3 rd = normalize(ch_light.xyz * float3(-1.0, 0.2, -1.0) - vd);
+    float3 lit = ch_key.rgb * saturate(hndl_u) * hs + ch_amb.w +
+                 ch_rim.rgb * saturate(saturate(dot(hn, rd)) * rfres);
+    float3 spec = float3(0.0, 0.0, 0.0);
+    if (ch_ks.w > 0.0) {
+      float3 kr = ch_light.xyz - 2.0 * hndl_u * hn;
+      float ks = pow(saturate(dot(vd, -kr)), ch_ks.w) * hs;
+      float3 rr = rd - 2.0 * dot(hn, rd) * hn;
+      float rs = pow(saturate(dot(vd, -rr)), ch_rs.w);
+      spec = saturate(albedo.a * albedo.a *
+                      (ks * ch_ks.rgb * kfres + rs * ch_rs.rgb * rfres));
+    }
+    lin = (dlin * lit + spec) * (ch_light.w > 0.25 ? ch_light.w : 1.0);
     out_a = saturate(decal_art.Sample(smp, i.uv2).r * ch_tintB.w);
   } else if (fam > 2.5) {
-    // livingworld pedestrians: the diffuse is a stamp-mask atlas; red
-    // regions recolor with tintA, blue with tintB (judged in linear
-    // space; real-color regions have green above the threshold).
-    // The game's character PSes multiply the key light by the CSM shadow
-    // (tap >= ray = lit); characters are casters themselves, so an extra
-    // receiver bias suppresses self-shadow acne while the body-onto-board
-    // / body-onto-NPC shading survives (the sun-axis depth gap there is
-    // tens of cm). Without this the held skateboard, a big flat surface
-    // that is almost always inside the skater's own shadow, renders
-    // fully sunlit (near-white) against the emulated dark deck.
-    float csm = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy),
-                    SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy));
+    // livingworld pedestrians, exact from livingworld_stamp_defaultPS
+    // (ucode + constant table, out/research/log084/s3_disasm; Skate 2's
+    // livingworld_stamp.fx source, the near and the low-detail body
+    // materials both run it): the diffuse is a stamp-mask atlas; red
+    // regions recolor with tintA (c22), blue with tintB (c23) (judged in
+    // linear space; real-color regions have green above the threshold).
+    //   lit  = c15 sat(N.L) shadow + c19.w (0.1, 0.175, 0.3)
+    //        + c20 sat(sat(N.RL) rF)
+    //   spec = sat(nm.g (phong(L)^c16.w shadow c16 kF + phong(RL)^c17.w c17 rF))
+    //   col  = (sel lit + spec) m_params[0].y
+    // N = the RGB tangent-space normal map (x on the tangent, y on the
+    // binormal, z on the vertex normal, normalized after the frame; NOT
+    // reconstructed), whose GREEN channel is also the spec mask
+    // (fSpecValue = vNormal.g in the source). RL = normalize(L (-1, 0.2, -1)
+    // - V), kF / rF = (1 - sat(N.V))^c15.w / ^c14.z, phong(X) =
+    // sat(V.-reflect(X)). shadow = min(CSM x (N.L >= 0), max(world shadow,
+    // c8.w)). Characters are casters themselves, so the CSM tap keeps the
+    // extra receiver bias that suppresses self-shadow acne. The previous
+    // port had only the key and the flat ambient: no normal map, rim light
+    // or specular.
     float3 sel = dlin.g > 0.001225
                      ? dlin
                      : ch_tintA.rgb * dlin.r + ch_tintB.rgb * dlin.b;
-    lin = sel * (ch_key.rgb * ndl * csm + ch_amb.rgb);
+    float3 pn = cn;
+    float smask = 0.0;
+    if (overlay.z > 0.5) {
+      float3 nm = macro.SampleBias(smp, i.uv, misc.y).rgb * 2.0 - 1.0;
+      float3 ptt, pbb;
+      ScreenTangentFrame(cn, i.rpos, i.uv, ptt, pbb);
+      float3 pm = nm.x * ptt + nm.y * pbb + nm.z * cn;
+      pn = dot(pm, pm) > 1e-8 ? normalize(pm) : cn;
+      smask = nm.y;
+    }
+    float pndl_u = dot(pn, ch_light.xyz);
+    float pcsm = SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, cn, i.pos.xy) *
+                 (pndl_u >= 0.0 ? 1.0 : 0.0);
+    float psh = min(pcsm, max(SampleStaticSun(i.rpos + cam_pos.xyz, cn, i.pos.xy),
+                              ch_misc.z));
+    float3 plit = ch_key.rgb * saturate(pndl_u) * psh + ch_amb.rgb;
+    float3 pspec = float3(0.0, 0.0, 0.0);
+    if (ch_ks.w > 0.0) {
+      float fb = 1.0 - saturate(dot(pn, vd));
+      float kfres = pow(max(fb, 1e-6), ch_rim.w);
+      float rfres = pow(max(fb, 1e-6), ch_misc.w);
+      float3 rd = normalize(ch_light.xyz * float3(-1.0, 0.2, -1.0) - vd);
+      plit += ch_rim.rgb * saturate(saturate(dot(pn, rd)) * rfres);
+      float3 kr = ch_light.xyz - 2.0 * pndl_u * pn;
+      float ks = pow(saturate(dot(vd, -kr)), ch_ks.w) * psh;
+      float3 rr = rd - 2.0 * dot(pn, rd) * pn;
+      float rs = pow(saturate(dot(vd, -rr)), ch_rs.w);
+      pspec = saturate((ks * ch_ks.rgb * kfres + rs * ch_rs.rgb * rfres) * smask);
+    }
+    lin = (sel * plit + pspec) * (ch_light.w > 0.25 ? ch_light.w : 1.0);
     // livingworld_stamp_defaultPS ends `max oC0.w, c21.x`: the entity's
     // spawn/distance fade. Only visible when the item is routed to the
     // blended sub-pass (alpha < 1); the opaque pass ignores it.
@@ -186,8 +268,13 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
     }
     float vndl_u = dot(vn, ch_light.xyz);
     float vndl = saturate(vndl_u);
-    float csm = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, vn, i.pos.xy),
-                    SampleStaticSun(i.rpos + cam_pos.xyz, vn, i.pos.xy));
+    // ch_amb.b > 0.5 (fam 1 only) = defaultcharacter_light: no shadow receive
+    // and no N.L gate on the key spec (DrawItem::char_noshadow).
+    bool noshadow = fam < 1.5 && ch_amb.b > 0.5;
+    float csm = noshadow
+                    ? 1.0
+                    : min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.012, vn, i.pos.xy),
+                          SampleStaticSun(i.rpos + cam_pos.xyz, vn, i.pos.xy));
     if (ch_tintA.w > 0.0) {
       dlin *= ch_tintA.rgb;
     }
@@ -249,7 +336,7 @@ float4 ShadeCharacter(VSOut i, float4 albedo) {
       lit += saturate(rfres * saturate(dot(vn, rd))) * ch_rim.rgb;
       float3 kr = ch_light.xyz - 2.0 * vndl_u * vn;
       float ks = pow(saturate(dot(vd, -kr)), ch_ks.w) * csm *
-                 (vndl_u >= 0.0 ? 1.0 : 0.0);
+                 (vndl_u >= 0.0 || noshadow ? 1.0 : 0.0);
       float3 rr = rd - 2.0 * dot(vn, rd) * vn;
       float rs = pow(saturate(dot(vd, -rr)), ch_rs.w) * rfres;
       float smask = overlay.w > 2.5 ? decal_art.SampleBias(smp, i.uv, misc.y).r

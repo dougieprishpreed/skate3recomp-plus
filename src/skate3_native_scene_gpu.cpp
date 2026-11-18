@@ -422,6 +422,16 @@ bool IsSkate2Water(const DrawItem& item) {
   return item.water && item.water_ocean == 0 && item.packed_lightmap &&
          uint32_t(item.diffuse_guid) == 0x03E3870Au;
 }
+// Skate 3's own water.default / water.alpha (water_defaultPS /
+// wateralpha_defaultPS, family 37): Skate 2's PCA water surface with Skate
+// 3's lighting, RGB lightmaps. Flowing water and the ocean have their own
+// exact families; park water (water.skatepark*) keeps the legacy path.
+bool IsSkate3Water(const DrawItem& item) {
+  return item.water && item.water_ocean == 0 && !item.water_flowing &&
+         !item.packed_lightmap &&
+         (std::strcmp(item.material_name, "water.default") == 0 ||
+          std::strcmp(item.material_name, "water.alpha") == 0);
+}
 bool IsSkate2Ocean(const DrawItem& item) {
   // S2 ocean uses a selected mono lightmap plus chromaticity; S3 uses RGB.
   // There is no diffuse GUID on this family. Never select S3's captured
@@ -1017,7 +1027,7 @@ void CommitStagedGuestTexture(const NativeGuestOutputRenderContext& context,
     static bool logged = false;  // render thread only
     if (!logged) {
       logged = true;
-      REXLOG_INFO("native-scene: New San Van Vulkan texture views prepared on decode workers");
+      REXLOG_INFO("native-scene: Vulkan texture views prepared on decode workers");
     }
   }
   if (gt.srv == nullptr) {
@@ -1044,12 +1054,17 @@ struct StagedTexResult {
   bool ui = false;
 };
 // Called only after decode, before the result is visible to the render
-// thread. D3D12, Skate 3 maps and animated UI retain their existing path.
-// Copies/barriers and the stability verify still happen at commit; an early
-// view never makes the texture valid or exposes an unfinished upload.
+// thread. Both games (Skate 3 maps since round 252: a Skate 3 Downtown
+// streaming threshold stalled the guest 34-50 ms while PrewarmCommit's
+// render-thread vkCreateImageView calls waited ~15 ms per frame on the
+// driver lock the below-normal decode workers hold while creating images;
+// profiler capture perf_1_1794790801). D3D12 (cheap descriptor writes) and
+// animated UI retain their existing path. Copies/barriers and the stability
+// verify still happen at commit; an early view never makes the texture valid
+// or exposes an unfinished upload.
 void PrepareStagedTextureView(nrhi::Device* device, StagedTexResult& tr) {
-  if (tr.valid && !tr.ui && skate3::world_loading::IsSkate2Gameplay() &&
-      PerformanceOptimizationsEnabled(true) &&
+  if (tr.valid && !tr.ui &&
+      PerformanceOptimizationsEnabled(skate3::world_loading::IsSkate2Gameplay()) &&
       device->backend() == nrhi::Backend::kVulkan) {
     tr.gt.srv = device->CreateTextureViewAsync(tr.gt.texture,
                                               StagedTextureViewDesc(tr.commit));
@@ -10555,6 +10570,20 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       cb[192] = water_time;
       cb[193] = 1.0f;
       std::memcpy(cb + 196, kS2AnimRows, sizeof(kS2AnimRows));
+    } else {
+      // Skate 3's own m_params (db.big skatercollections, material_animated
+      // `flag` and `tree`; out/research/re-tools/wpdump.py). The flag rows
+      // equal Skate 2's; the tree (and shrub) rows are a 2.5 cm flutter at
+      // 10 rad/s. cb[194] = 1 selects Skate 3's treeanimate phase
+      // (treeanimate_defaultVS: + uvscale * m_params[2].xyz, see vs_main).
+      static constexpr float kS3AnimRows[24] = {
+          0.0f, 1.0f, 0.0f, 0.1f, 10.0f, 9.0f, 5.0f, 0.1f, 1.0f, 6.0f, 5.0f, 0.2f,  // flag
+          0.0f, 1.0f, 0.0f, 0.025f, 10.0f, 10.0f, 10.0f, 0.025f,
+          1.0f, 2.0f, 4.0f, 0.025f};  // tree
+      cb[192] = water_time;
+      cb[193] = 1.0f;
+      cb[194] = 1.0f;
+      std::memcpy(cb + 196, kS3AnimRows, sizeof(kS3AnimRows));
     }
     // scene_opts (cb[220..223]): x = smooth lightmap reconstruction, y = the
     // cube LOD bias log2(render height / 640) for the Skate 2 reflection
@@ -11953,10 +11982,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         item.macro_tex != 0 && REXCVAR_GET(skate3_native_render_scene_macro)
             ? resolve_texture(item.macro_tex, 2)
             : &g_r.white;
-    if ((item.water || item.char_family >= 6 ||
-         (item.char_family >= 1 && item.char_family <= 2) ||
-         item.char_family == 4) &&
-        item.water_normal != 0) {
+    if ((item.water || item.char_family >= 1) && item.water_normal != 0) {
       // Water rides its ripple normal map in the macro slot (water never
       // carries a macro overlay; overlay.z stays 0 below so the macro
       // composite path never runs). Vehicles do the same with their DXN
@@ -12079,7 +12105,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     // overlay.w == 3 tells the shader the masks are live.
     bool spec_bound = false;
     if (((item.env_family != 0 && !item.decal && item.env_family != 10) ||
-         item.water_flowing || IsSkate2Water(item) || s2_trans_exact) &&
+         item.water_flowing || IsSkate2Water(item) || IsSkate3Water(item) ||
+         s2_trans_exact) &&
         item.spec_tex != 0) {
       const GuestTexture* spec = resolve_texture(item.spec_tex, 6);
       if (spec != &g_r.white) {
@@ -12260,7 +12287,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     bool ocean_n2 = false;
     bool ocean_ov = false;
     if (debug_mode == 0 && scene.shadow_valid &&
-        ((item.water_ocean == 1 && scene.ocean_valid) || IsSkate2Water(item) || IsSkate2Ocean(item))) {
+        ((item.water_ocean == 1 && scene.ocean_valid) || IsSkate2Water(item) ||
+         IsSkate2Ocean(item) || IsSkate3Water(item))) {
       if (item.water_normal2 != 0) {
         const GuestTexture* n2 = resolve_texture(item.water_normal2, 7);
         if (n2 != &g_r.white && n2->valid && n2->srv_mips != 0) {
@@ -12312,7 +12340,7 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // never take the is_decal/spec_bound paths, so the slot is theirs.
       constants[47] = char_spec;
     }
-    if (item.char_family == 1 || item.char_family == 2 || item.char_family == 4) {
+    if (item.char_family >= 1 && item.char_family <= 5) {
       // misc.y = normal/spec-map LOD bias to the console's 640p-gradient
       // mip (the fam 5/6 cube-bias rationale): at 4K the shader's UV
       // gradients pick ~1.75 mips finer than the game's own render, and
@@ -12337,6 +12365,9 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
         scene.shadow_valid && macro_tex != &g_r.white &&
         (item.water_flowing || ocean_n2) && lightmap && lightmap != &g_r.white &&
         chromaticity && chromaticity != &g_r.white;
+    const bool skate3_water_exact = IsSkate3Water(item) && debug_mode == 0 &&
+        scene.shadow_valid && macro_tex != &g_r.white && ocean_n2 && lightmap &&
+        lightmap != &g_r.white;
     const bool water_exact = item.water && item.water_flowing && !skate2_water &&
                              debug_mode == 0 && scene.shadow_valid &&
                              scene.water_valid && macro_tex != &g_r.white;
@@ -12357,6 +12388,16 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
       constants[46] = ocean_ov ? 1.0f : 0.0f;
       constants[47] = item.macro_scale;
+      g_water_drawn.fetch_add(1, std::memory_order_relaxed);
+    } else if (skate3_water_exact) {
+      // overlay.x = spec/reflection masks bound at t4, overlay.y = real
+      // environment cube at t6, overlay.z = the PCA animation clock,
+      // overlay.w = the alpha floor m_params[3].w (water.alpha 0.5).
+      constants[39] = -37.0f;
+      constants[44] = spec_bound ? 1.0f : 0.0f;
+      constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
+      constants[46] = water_time;
+      constants[47] = std::strcmp(item.material_name, "water.alpha") == 0 ? 0.5f : 0.0f;
       g_water_drawn.fetch_add(1, std::memory_order_relaxed);
     } else if (skate2_water_exact) {
       // S2 flowingwater is opaque, distinct from S3 flowingwateralpha.
@@ -12410,15 +12451,20 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       // defaults staged above are inert, but overlay.y must not inherit
       // macro_opacity's 1.0 default when no cube resolved.
       constants[45] = cube_tex != &g_r.white_cube ? 1.0f : 0.0f;
-      // Original vehicle normals are DXT5nm (AG), native traffic uses
-      // DXN (RG). Gate original shadow reception on the same source data.
+      // overlay.w = the normal map is DXT5nm: x in ALPHA, y in GREEN, the
+      // channels vehicle_defaultPS / vehicle_glass_defaultPS read (tf4.wy,
+      // GetDXNNormalMapValue; ucode out/research/log084/s3_disasm). Chosen
+      // by the resolved texture's own format in BOTH games (it was New San
+      // Van only): Skate 3's car textures are DXT5/DXT1 too, and reading
+      // red/green there turned the wrong channel into the panel direction
+      // (the doors' odd built-in shading, report log131 for Skate 2's cars).
+      // A two-channel DXN map keeps red/green.
       xenos::xe_gpu_texture_fetch_t normal_fetch = {};
       normal_fetch.dword_1 = macro_tex->fetch_words[1];
-      const bool original_vehicle = item.char_family <= 7 &&
-          skate3::world_loading::IsSkate2Gameplay() &&
+      const bool dxt5_normal = item.char_family <= 7 &&
           macro_tex != &g_r.white &&
           rex::graphics::GetBaseFormat(normal_fetch.format) == xenos::TextureFormat::k_DXT4_5;
-      constants[47] = original_vehicle ? 1.0f : 0.0f;
+      constants[47] = dxt5_normal ? 1.0f : 0.0f;
     }
     // misc.x: alpha-blended sub-pass item (1 = transparentenvironment
     // shading, 2 = water branch); fog rides in misc.yzw (ramp) and the
@@ -12431,7 +12477,8 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
     if (item.s2_blend == 5) {
       constants[48] = -1.0f;
     }
-    if (water_exact || ocean_exact || oceanrefl_exact || skate2_water_exact || skate2_ocean_exact) {
+    if (water_exact || ocean_exact || oceanrefl_exact || skate2_water_exact ||
+        skate2_ocean_exact || skate3_water_exact) {
       // misc.y = cube LOD bias (same 640p-gradient rationale as fams 5/6);
       // fog comes from the shared b1 rows; misc.zw stay free. misc.x keeps
       // the water marker for the SSR G-buffer restage.

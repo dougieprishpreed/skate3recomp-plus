@@ -14,8 +14,10 @@ void RequestLoad();
 // installed DLC map).
 bool ArmMenuSpawn(uint8_t* base, const std::string& label, const std::string& stream,
                   uint64_t& world_key);
-// Before the retail location teleport: leaving New San Van must reload.
-void BeforeRetailTeleport(uint8_t* base, uint64_t world);
+// Before the retail location teleport: leaving New San Van must reload; the
+// goals package's own teleports (destination locator listed in goals.txt)
+// stay in the city.
+void BeforeRetailTeleport(uint8_t* base, uint64_t world, const std::string& locator);
 bool IsSkate2Gameplay();
 // Native shadow lifetime: changes for EVERY configured map, including a
 // reload of the same district. Bit 0 identifies the loaded Skate 2 world

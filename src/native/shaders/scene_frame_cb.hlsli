@@ -94,10 +94,11 @@ cbuffer S : register(b1) {
   float4 nsm_p2;
   // Skate 2 PCA water animation. Separate from the captured S3 ocean rows.
   float4 s2_pca[7]; // mean, R0, R1, G0, G1, B0, B1 (cb[164..191])
-  // Skate 2 vertex animation (vertexanimate.fx flags / treeanimate.fx
-  // trees), read by vs_main: x = g_fAnimationTime (seconds), y = enable
-  // (New San Van only) (cb[192..195]); then m_params[0..2] of
-  // animated.flag (rows 0-2) and animated.tree (rows 3-5) (cb[196..219]).
+  // Vertex animation (vertexanimate.fx flags / treeanimate.fx trees), read
+  // by vs_main: x = g_fAnimationTime (seconds), y = enable, z = 1 for
+  // Skate 3's treeanimate phase (cb[192..195]); then m_params[0..2] of
+  // animated.flag (rows 0-2) and animated.tree (rows 3-5) (cb[196..219]),
+  // Skate 2's in New San Van, Skate 3's on its own maps.
   float4 s2_anim_t;
   float4 s2_anim[6];
   // Scene options (cb[220..223]): x = smooth lightmap reconstruction

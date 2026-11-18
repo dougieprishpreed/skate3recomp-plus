@@ -211,17 +211,22 @@ VSOut vs_main(float3 p : POSITION, float2 uv : TEXCOORD0, float2 uv2 : TEXCOORD1
   } else {
     n = mul(n, (float3x3)world);
   }
-  // Skate 2 vertexanimate.fx (flags, fam 15) / treeanimate.fx (trees,
-  // fam 10) vertex wave, verbatim: TEXCOORD1.zw (carried in uv3) weights a
-  // per-axis sine of the animation clock by the material's m_params rows.
-  // Enabled only while New San Van is loaded (s2_anim_t.y).
+  // vertexanimate.fx (flags, fam 15) / treeanimate.fx (trees, fam 10)
+  // vertex wave, verbatim: TEXCOORD1.zw (carried in uv3) weights a per-axis
+  // sine of the animation clock by the material's m_params rows (s2_anim:
+  // Skate 2's rows in New San Van, Skate 3's on its own maps; s2_anim_t.y =
+  // enable). Skate 3's treeanimate_defaultVS offsets the phase by
+  // uvscale * m_params[2].xyz where Skate 2's adds m_params[2].xyz
+  // (s2_anim_t.z = 1 on Skate 3 maps; its flags match Skate 2's).
   if (s2_anim_t.y > 0.0 && tint.g == 0.0 &&
       (abs(cam_pos.w + 15.0) < 0.5 || abs(cam_pos.w + 10.0) < 0.5)) {
     int r = cam_pos.w < -12.5 ? 0 : 3;
     float3 uvscale = float3(uv3.x, uv3.y, uv3.x + uv3.y) - float3(0.5, 0.5, 1.0);
     float3 wave_time = s2_anim_t.xxx - uvscale;
     float3 amplitude = uvscale * float3(s2_anim[r].w, s2_anim[r + 1].w, s2_anim[r + 2].w);
-    mp.xyz += sin(wave_time * s2_anim[r + 1].xyz + s2_anim[r + 2].xyz) * amplitude;
+    float3 phase = r == 3 && s2_anim_t.z > 0.5 ? uvscale * s2_anim[r + 2].xyz
+                                               : s2_anim[r + 2].xyz;
+    mp.xyz += sin(wave_time * s2_anim[r + 1].xyz + phase) * amplitude;
   }
   // Skate 2 glare.fx (fam 17, lamp halos): each quad corner sits at its
   // center + (uv - 0.5) in xz; the VS collapses it to the center and
@@ -508,6 +513,9 @@ float4 ShadePixel(VSOut i) {
     }
     if (fam > 35.5 && fam < 36.5) {
       return ShadeSkate2Transparent(i, albedo, fog_a, fog_rgb, expo);
+    }
+    if (fam > 36.5 && fam < 37.5) {
+      return ShadeSkate3Water(i, fog_a, fog_rgb, expo);
     }
     if (fam > 18.5 && fam < 19.5) {
       // visualindicator_defaultPS (the Hall of Meat bone overlays), from

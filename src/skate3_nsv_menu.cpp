@@ -166,6 +166,6 @@ extern "C" REX_FUNC(sub_828646E0) {
                 "pos=({:.3f},{:.3f},{:.3f}) +40={:016X} +48={:016X} caller={:08X}",
                 world, locator, xyz[0], xyz[1], xyz[2], loaded, target, uint32_t(ctx.lr));
   }
-  if (have_world) skate3::world_loading::BeforeRetailTeleport(base, world);
+  if (have_world) skate3::world_loading::BeforeRetailTeleport(base, world, locator);
   __imp__sub_828646E0(ctx, base);
 }

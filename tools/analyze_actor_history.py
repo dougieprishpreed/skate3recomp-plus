@@ -72,7 +72,11 @@ def load(path):
                 pose = actor + a[name]
                 flags = read('I', pose + p['flags'])[0]
                 row[name + '_present'] = read('I', pose + p['present'])[0]
-                row[name + '_source'] = flags >> 8
+                row[name + '_source'] = (flags >> 8) & 0xff
+                # build 245+: where the paint/lighting rows came from (0 none, 1 capture,
+                # 2 per-instance cache, 3 entity bridge, 4 mesh cache, 5 per-ctx LW cache)
+                row[name + '_rows_src'] = (flags >> 16) & 0xff
+                row[name + '_flags'] = flags & 0xff
                 row[name + '_hash'] = read('I', pose + p['crc'])[0]
                 bone = flags & 1 and read('I', pose + p['bone_count'])[0] > 0
                 row[name + '_position'] = (tuple(read('f', pose + p['bones'] + k * 4)[0] for k in (3, 7, 11)) if bone

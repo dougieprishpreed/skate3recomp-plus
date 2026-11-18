@@ -41,6 +41,9 @@ bool LookupLwCtx(uint32_t ctx, float* out_alpha, uint32_t* out_entity);
 // the authoritative replacement for GUESSED ortho caster-bank palettes on
 // edge-of-view vehicles.
 uint32_t LookupLwPalette(uint32_t ctx, float* out, uint32_t max_floats);
+// The same fresh slice's bone-0 translation only (the instance's current
+// position), for pairing a draw to its own instance. False when stale/absent.
+bool LookupLwBone0(uint32_t ctx, float out[3]);
 
 // Store size counters for the periodic stats line: live ctx entries and
 // distinct entities ticked in the last second.

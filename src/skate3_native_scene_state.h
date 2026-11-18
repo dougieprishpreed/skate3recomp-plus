@@ -410,7 +410,13 @@ inline bool g_traffic_have[2] = {};
 // teal-vest twins), so the fallback applies only to meshes with a single
 // instance in the frame. Guest-render-thread only (capture hooks +
 // BuildFrameScene), no lock needed.
-inline std::unordered_map<uint32_t, std::array<float, 72>> g_char_rows_cache;
+// The entry also keeps the MeshContext it was captured from: per-instance
+// families (peds, vehicles) only take their own.
+struct CharRowsMesh {
+  std::array<float, 72> rows;
+  uint32_t ctx = 0;
+};
+inline std::unordered_map<uint32_t, CharRowsMesh> g_char_rows_cache;
 // Frame-global character CSM receive biases (see FrameScene::char_shadow_bias)
 // + the guest frame they were captured on (served while <120 frames stale;
 // they only change with the scene lighting setup). Guest render thread only.
@@ -432,6 +438,19 @@ struct CachedBones {
 // rescues each instance with ITS OWN last palette regardless of how many
 // clones are alive.
 inline std::unordered_map<uint32_t, CachedBones> g_bones_cache_ctx;
+// Post-draw fixups refused because the draw matched none of the waiting
+// same-mesh skinned instances' own positions (identity pairing). Only a
+// living-world vehicle's exact tick position refuses; draws whose candidates
+// are known only by a cached pose (peds, skaters) keep submit order instead
+// (g_skinned_pair_cached_fifo; log 350: hundreds of ped draws refused every
+// 30 s while the user saw peds twitch and flash).
+inline std::atomic<uint64_t> g_skinned_pair_refused{0};
+inline std::atomic<uint64_t> g_skinned_pair_cached_fifo{0};
+// Identity-paired skinned draws, and those paired out of submit order
+// (skate3_native_skinned_pair_log, log 349: peds and AI skaters twitch).
+inline std::atomic<uint64_t> g_skinned_pair_draws{0};
+inline std::atomic<uint64_t> g_skinned_pair_moved_lw{0};
+inline std::atomic<uint64_t> g_skinned_pair_moved_cached{0};
 inline std::atomic<uint64_t> g_lw_ctx_rescued{0};
 // LW entity store consumption counters (stats line lw[...]).
 inline std::atomic<uint64_t> g_lw_stamped{0};

@@ -211,6 +211,12 @@ struct DrawItem {
   // rides the same hair_alpha_tex/decal-slot plumbing (ch_misc.z > 0
   // signals the PS fam-2 branch to take alpha from t4@uv2).
   bool char_alpha = false;
+  // character.default_light (the Legend skater's backpack accessory):
+  // defaultcharacter_light_defaultPS = the defaultcharacter body and register
+  // layout (family 1) WITHOUT any shadow receive (no CSM or world-shadow
+  // fetch; ucode out/research/log084/s3_disasm) and without the N.L >= 0 gate
+  // on the key spec. Flagged to the PS through ch_amb.b (unused by fam 1).
+  bool char_noshadow = false;
   // The game submitted this ctx through an ortho (shadow caster-cascade)
   // bank this frame; the game's caster list is PER-PIECE (the CAS trucker
   // hat never enters the shadow passes) and the native atlas pass mirrors
@@ -357,6 +363,11 @@ struct DrawItem {
   // 11 = authoritative packed palette serve (including player pieces),
   // 12 = rigid-world clone rescue. Copies preserve the original tag.
   uint8_t dbg_src = 0;
+  // Diagnosis: where this item's character-lighting/paint rows came from
+  // this frame (recorded by the actor-history capture, flags bits 16-23):
+  // 0 = none, 1 = this frame's capture, 2 = per-instance cache, 3 = entity
+  // bridge (ropa), 4 = mesh cache, 5 = per-ctx LW cache. Copies keep it.
+  uint8_t rows_src = 0;
   // The palette was captured from an ORTHOGRAPHIC (CSM caster-cascade)
   // bank. The game does not reliably re-evaluate fine bone animation for
   // the shadow passes (vehicle wheel spin measured ~40 ms stale in bursts)

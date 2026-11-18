@@ -1,3 +1,29 @@
+diff --git a/include/rex/audio/output_tap.h b/include/rex/audio/output_tap.h
+new file mode 100644
+index 0000000..2daea18
+--- /dev/null
++++ b/include/rex/audio/output_tap.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace rex::audio {
++
++// Diagnostic tap on the guest's mixed audio output. While the cvar
++// audio_output_tap_seconds is above 0 the SDL driver keeps the last N seconds
++// (at most 60) of what the guest submitted, downmixed to interleaved stereo
++// float at 48 kHz, exactly as the device's stereo conversion does.
++//
++// Feed one guest frame (6 channels x 256 samples, sequential, big-endian).
++void TapOutputFrame(const float* guest_frame);
++
++// Write the kept seconds to a 32-bit float stereo WAV. False when the tap is
++// off or empty, or on an I/O error.
++bool SaveOutputTap(const std::string& path_utf8);
++
++}  // namespace rex::audio
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
 index 67064f8..009f0ee 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
@@ -424,6 +450,20 @@ index 5d607c6..292dd0f 100644
    Presenter* presenter() const { return presenter_; }
  
    // SetPresenter may be called from the destructor.
+diff --git a/include/rex/ui/keybinds.h b/include/rex/ui/keybinds.h
+index d092130..5bc8fa5 100644
+--- a/include/rex/ui/keybinds.h
++++ b/include/rex/ui/keybinds.h
+@@ -86,4 +86,9 @@ void UnregisterBind(std::string_view name);
+  */
+ bool ProcessKeyEvent(KeyEvent& e);
+ 
++/**
++ * Whether any registered bind uses @p key (with or without modifiers).
++ */
++bool IsBoundKey(VirtualKey key);
++
+ }  // namespace rex::ui
 diff --git a/include/rex/ui/overlay/simple_settings_overlay.h b/include/rex/ui/overlay/simple_settings_overlay.h
 index e4d1c0c..fc311ef 100644
 --- a/include/rex/ui/overlay/simple_settings_overlay.h
@@ -629,12 +669,29 @@ index 2d9d4ba..438cf82 100644
    GtkWidget* window_ = nullptr;
    GtkWidget* box_ = nullptr;
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 0e7cfce..7be6273 100644
+index 0e7cfce..703e9b1 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -24,6 +24,13 @@
+@@ -13,20 +13,129 @@
+ #include <array>
+ #include <chrono>
+ #include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
+ #include <string>
++#include <vector>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+ #include <rex/audio/flags.h>
++#include <rex/audio/output_tap.h>
+ #include <rex/audio/sdl/sdl_audio_driver.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
  #include <rex/logging.h>
  #include <rex/perf/counter.h>
++#include <rex/platform/fpscr.h>
  #include <SDL3/SDL.h>
 +#include <rex/platform.h>
 +
@@ -646,7 +703,106 @@ index 0e7cfce..7be6273 100644
  
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
  
-@@ -42,6 +49,16 @@ REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
++REXCVAR_DEFINE_INT32(audio_output_tap_seconds, 0, "Audio",
++                     "Diagnostics: keep the last N seconds (max 60) of the game's mixed audio "
++                     "(stereo) so a capture can save it as a WAV; 0 = off")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++namespace rex::audio {
++namespace {
++std::mutex g_tap_mutex;
++std::vector<float> g_tap;  // ring of interleaved stereo samples
++size_t g_tap_pos = 0;
++bool g_tap_full = false;
++}  // namespace
++
++void TapOutputFrame(const float* guest_frame) {
++  const int32_t seconds = std::clamp(REXCVAR_GET(audio_output_tap_seconds), 0, 60);
++  if (seconds <= 0) {
++    if (!g_tap.empty()) {
++      std::lock_guard<std::mutex> lock(g_tap_mutex);
++      std::vector<float>().swap(g_tap);
++      g_tap_pos = 0;
++      g_tap_full = false;
++    }
++    return;
++  }
++  // This runs on the guest's audio thread, which can return from guest code
++  // with host float exceptions unmasked (the FPSCR emulation leaks MXCSR
++  // state, see AudioSystem's worker): the downmix below then trapped with
++  // STATUS_FLOAT_INEXACT_RESULT at boot. Mask them for the downmix and give
++  // the guest its own state (and flags) back afterwards.
++  float stereo[256 * 2];
++  {
++    const uint32_t guest_csr = rex::platform::FPSCRPlatform::getcsr();
++    uint32_t host_csr = guest_csr;
++    rex::platform::FPSCRPlatform::InitHostExceptions(host_csr);
++    if (host_csr != guest_csr) {
++      rex::platform::FPSCRPlatform::setcsr(host_csr);
++    }
++    conversion::sequential_6_BE_to_interleaved_2_LE(stereo, guest_frame, 256);
++    if (host_csr != guest_csr) {
++      rex::platform::FPSCRPlatform::setcsr(guest_csr);
++    }
++  }
++  std::lock_guard<std::mutex> lock(g_tap_mutex);
++  const size_t capacity = size_t(seconds) * 48000 * 2;
++  if (g_tap.size() != capacity) {
++    g_tap.assign(capacity, 0.0f);
++    g_tap_pos = 0;
++    g_tap_full = false;
++  }
++  for (float v : stereo) {
++    g_tap[g_tap_pos++] = v;
++    if (g_tap_pos == capacity) {
++      g_tap_pos = 0;
++      g_tap_full = true;
++    }
++  }
++}
++
++bool SaveOutputTap(const std::string& path_utf8) {
++  std::vector<float> samples;
++  {
++    std::lock_guard<std::mutex> lock(g_tap_mutex);
++    if (g_tap.empty() || (!g_tap_full && g_tap_pos == 0)) {
++      return false;
++    }
++    if (g_tap_full) {
++      samples.assign(g_tap.begin() + g_tap_pos, g_tap.end());
++      samples.insert(samples.end(), g_tap.begin(), g_tap.begin() + g_tap_pos);
++    } else {
++      samples.assign(g_tap.begin(), g_tap.begin() + g_tap_pos);
++    }
++  }
++  std::ofstream f(std::filesystem::u8path(path_utf8), std::ios::binary);
++  if (!f) {
++    return false;
++  }
++  const auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
++  const auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
++  const uint32_t data_bytes = uint32_t(samples.size() * sizeof(float));
++  f.write("RIFF", 4);
++  u32(36 + data_bytes);
++  f.write("WAVEfmt ", 8);
++  u32(16);
++  u16(3);  // IEEE float
++  u16(2);
++  u32(48000);
++  u32(48000 * 2 * 4);
++  u16(2 * 4);
++  u16(32);
++  f.write("data", 4);
++  u32(data_bytes);
++  f.write(reinterpret_cast<const char*>(samples.data()), data_bytes);
++  return bool(f);
++}
++}  // namespace rex::audio
++
+ REXCVAR_DEFINE_BOOL(audio_realtime_credit_pacing, true, "Audio",
+                     "Limit the rate at which consumed audio frames release guest submission "
+                     "credits to slightly above real time. Prevents a misbehaving audio device "
+@@ -42,6 +151,16 @@ REXCVAR_DEFINE_BOOL(audio_stats, false, "Audio",
                      "crackling audio reports.")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -663,7 +819,7 @@ index 0e7cfce..7be6273 100644
  REXCVAR_DEFINE_INT32(audio_device_sample_frames, 0, "Audio",
                       "Requested audio device buffer size in sample frames (0 = backend default). "
                       "Larger values (e.g. 1024 or 2048) add latency but tolerate scheduling "
-@@ -64,6 +81,7 @@ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* s
+@@ -64,6 +183,7 @@ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* s
      : AudioDriver(memory), semaphore_(semaphore) {}
  
  SDLAudioDriver::~SDLAudioDriver() {
@@ -671,7 +827,7 @@ index 0e7cfce..7be6273 100644
    assert_true(frames_queued_.empty());
    assert_true(frames_unused_.empty());
  }
-@@ -132,6 +150,8 @@ bool SDLAudioDriver::Initialize() {
+@@ -132,6 +252,8 @@ bool SDLAudioDriver::Initialize() {
      }
    }
  
@@ -680,7 +836,15 @@ index 0e7cfce..7be6273 100644
    if (!SDL_ResumeAudioDevice(sdl_device)) {
      REXAPU_ERROR("SDL_ResumeAudioDevice() failed: {}", SDL_GetError());
      return false;
-@@ -185,6 +205,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -167,6 +289,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   }
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
++  TapOutputFrame(output_frame);
+ 
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+@@ -185,6 +308,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
  }
  
  void SDLAudioDriver::Shutdown() {
@@ -688,7 +852,7 @@ index 0e7cfce..7be6273 100644
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
      sdl_stream_ = nullptr;
-@@ -251,13 +272,30 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -251,13 +375,30 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    int64_t wait_budget_ns =
        std::min<int64_t>(15000000, request_chunks * int64_t(channel_samples_) * 1000000000ll /
                                        int64_t(frame_frequency_) / 2);
@@ -720,7 +884,7 @@ index 0e7cfce..7be6273 100644
        if (driver->frames_queued_.empty() && credits_released && wait_budget_ns > 0) {
          const auto wait_start = std::chrono::steady_clock::now();
          driver->frames_available_cv_.wait_for(guard, std::chrono::nanoseconds(wait_budget_ns),
-@@ -313,7 +351,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -313,7 +454,11 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
          break;
        }
  
@@ -733,7 +897,7 @@ index 0e7cfce..7be6273 100644
        if (stats_enabled) {
          driver->stats_frames_++;
        }
-@@ -329,13 +371,15 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -329,13 +474,15 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
        REXAPU_INFO(
            "Audio stats ({:.1f}s): callbacks={} frames={} ({:.1f}/s, real-time={:.1f}/s) "
            "silence_chunks={} queue_depth={}..{} deferred_credits={} allowance={:.1f} "
@@ -752,7 +916,7 @@ index 0e7cfce..7be6273 100644
        driver->stats_window_start_ns_ = now_ns;
        driver->stats_callbacks_ = 0;
        driver->stats_frames_ = 0;
-@@ -397,4 +441,88 @@ uint64_t SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
+@@ -397,4 +544,88 @@ uint64_t SDLAudioDriver::ReleasePacedCredits(uint32_t new_credits) {
    return releasable;
  }
  
@@ -3395,10 +3559,18 @@ index 146c021..59a85d3 100644
    // internally before the failure according to Jesse Natalie from the DirectX
    // Discord server.
 diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
-index 50a26d0..b64ed8e 100644
+index 50a26d0..4f54345 100644
 --- a/src/ui/imgui_drawer.cpp
 +++ b/src/ui/imgui_drawer.cpp
-@@ -387,7 +387,6 @@ void ImGuiDrawer::SetupFonts() {
+@@ -24,6 +24,7 @@
+ #include <rex/ui/fonts_inter.h>
+ #include <rex/ui/imgui_dialog.h>
+ #include <rex/ui/imgui_drawer.h>
++#include <rex/ui/keybinds.h>
+ #include <rex/ui/ui_event.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+@@ -387,7 +388,6 @@ void ImGuiDrawer::SetupFonts() {
      // DirectWrite white-on-black edge
      // profiles (identity was measurably thinner/dimmer). The *_on_light_
      // variants below keep gamma 1.0 - dark-on-light needs no correction.
@@ -3406,7 +3578,7 @@ index 50a26d0..b64ed8e 100644
      config.FontLoaderFlags = ImGuiFreeTypeBuilderFlags_NoHinting;
      ui_font_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
          GetInterRegularCompressedBase85(), 18.0f, &config);
-@@ -406,9 +405,6 @@ void ImGuiDrawer::SetupFonts() {
+@@ -406,9 +406,6 @@ void ImGuiDrawer::SetupFonts() {
      // experiment read as "lighter, not sharper" in playtest. Kept as the
      // per-polarity tuning knob.
      config_on_light.RasterizerMultiply = 1.0f;
@@ -3416,7 +3588,7 @@ index 50a26d0..b64ed8e 100644
      ui_font_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
          GetInterRegularCompressedBase85(), 18.0f, &config_on_light);
      ui_font_semibold_on_light_ = io.Fonts->AddFontFromMemoryCompressedBase85TTF(
-@@ -502,6 +498,15 @@ void ImGuiDrawer::SetupFonts() {
+@@ -502,6 +499,15 @@ void ImGuiDrawer::SetupFonts() {
                (void*)io.Fonts, io.Fonts->Fonts.Size, (void*)ui_font_, (void*)ui_font_semibold_);
  }
  
@@ -3432,6 +3604,57 @@ index 50a26d0..b64ed8e 100644
  void ImGuiDrawer::SetupFontTexture() {
    if (font_texture_ || !immediate_drawer_) {
      return;
+@@ -908,6 +914,12 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
+   // the game (typing a name must not toggle overlays or drive MnK input).
+   // Releases always propagate so lower listeners can't get stuck keys.
+   if (is_down && io.WantTextInput) {
++    if (!e.prev_state() && rex::ui::IsBoundKey(virtual_key)) {
++      // A hotkey that silently did nothing is hard to tell from a broken one.
++      REXLOG_INFO("keybind: key {:#x} went to an active text field, not to its key binding "
++                  "(close the console or menu field for hotkeys)",
++                  static_cast<unsigned>(virtual_key));
++    }
+     e.set_handled(true);
+   }
+ }
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 8a473e7..8564d70 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -10,6 +10,7 @@
+  */
+ #include <rex/ui/keybinds.h>
+ #include <rex/cvar.h>
++#include <rex/logging.h>
+ #include <mutex>
+ #include <string>
+ #include <deque>
+@@ -275,6 +276,10 @@ bool ProcessKeyEvent(KeyEvent& e) {
+          e.is_super_pressed() != chord.super_key)) {
+       continue;
+     }
++    // One line per hotkey press: shows that the key reached its binding.
++    if (!e.prev_state()) {
++      REXLOG_INFO("keybind: {} ({})", entry.name, entry.current_key);
++    }
+     entry.callback();
+     e.set_handled(true);
+     return true;
+@@ -282,4 +287,14 @@ bool ProcessKeyEvent(KeyEvent& e) {
+   return false;
+ }
+ 
++bool IsBoundKey(VirtualKey key) {
++  std::lock_guard lock(g_binds_mutex);
++  for (const auto& entry : g_binds) {
++    if (entry.callback && ParseKeyChord(entry.current_key).key == key) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ }  // namespace rex::ui
 diff --git a/src/ui/overlay/simple_settings_overlay.cpp b/src/ui/overlay/simple_settings_overlay.cpp
 index c22345f..5069f64 100644
 --- a/src/ui/overlay/simple_settings_overlay.cpp

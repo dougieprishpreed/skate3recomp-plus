@@ -276,6 +276,23 @@ uint32_t LookupLwPalette(uint32_t ctx, float* out, uint32_t max_floats) {
   return it->second.pal_rows;
 }
 
+bool LookupLwBone0(uint32_t ctx, float out[3]) {
+  if (ctx == 0 || out == nullptr) {
+    return false;
+  }
+  const uint64_t now = NowMs();
+  std::lock_guard<std::mutex> lock(g_mu);
+  const auto it = g_ctx.find(ctx);
+  if (it == g_ctx.end() || it->second.pal_rows == 0 ||
+      now - it->second.pal_stamp_ms > 100 || it->second.palette.size() < 12) {
+    return false;
+  }
+  out[0] = it->second.palette[3];
+  out[1] = it->second.palette[7];
+  out[2] = it->second.palette[11];
+  return true;
+}
+
 void QueryLwStats(uint32_t* out_ctxs, uint32_t* out_entities) {
   if (out_entities != nullptr) {
     *out_entities = g_ents_last.load(std::memory_order_relaxed);

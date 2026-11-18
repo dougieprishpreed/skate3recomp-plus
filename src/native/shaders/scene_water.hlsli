@@ -204,6 +204,60 @@ float4 ShadeFlowingWater(VSOut i, float3 dlin, float fog_a,
 
 }
 
+// Skate 3 water.default / water.alpha (fam 37): water_defaultPS /
+// wateralpha_defaultPS (ucode out/research/log084/s3_disasm). The surface
+// is Skate 2's water.fx: the same 30-frame PCA normal table (byte-identical
+// in Skate 3's executable, s2_pca), the same material rows (db.big
+// material_water default/alpha = skater.bin water.default; alpha adds the
+// 0.5 alpha floor m_params[3].w), the PCA normal used directly as the world
+// normal, and the diffuse/mask fetch displaced by 0.02 x a second PCA tap.
+// The lighting tail is Skate 3's, the flowingwateralpha one (same literals):
+// RGB lightmap at uv2 + 0.01 N.xz min-clamped against the shadow, the
+// (0.58, 0.62, 0.39) tangent-light axis, phong vs the sun in (2.1, 1.8, 1.5)
+// x sat(lightmap green - 0.1), the cube reflection with its luminosity
+// lerp, the material multiplier on the fog term. overlay.x = masks bound,
+// overlay.y = real cube, overlay.z = animation time, overlay.w = alpha
+// floor (0 = water_defaultPS, opaque alpha 1).
+float4 ShadeSkate3Water(VSOut i, float fog_a, float3 fog_rgb, float expo) {
+  float4 p0 = float4(0, 1, .31, .31);
+  float4 p1 = float4(.01, .01, 0, 0);
+  float4 p2 = float4(.02, .02, 1, 1);
+  float4 p3 = float4(1, .11, 500, overlay.w);
+  float4 uv = i.uv.xyxy * p3.x * p2 + p1 * overlay.z;
+  float3 wn = Skate2PcaNormal(uv.zw, p0.z);
+  float2 diffuse_uv = i.uv + .02 * Skate2PcaNormal(uv.xy, p0.w).xz;
+  float3 d = diffuse.Sample(smp, diffuse_uv).rgb;
+  float3 dlin = d * d;
+  float2 wmask = float2(0.0, 0.0);
+  if (overlay.x > 0.0) {
+    float4 wm4 = decal_art.Sample(smp, diffuse_uv);
+    wmask = saturate(float2(wm4.x, wm4.z) - p3.y);
+  }
+  float3 vd = -normalize(i.rpos);
+  float s = min(SampleCsmShadowSoft(i.rpos + cam_pos.xyz, 0.0, wn, i.pos.xy),
+                SampleStaticSun(i.rpos + cam_pos.xyz, wn, i.pos.xy));
+  float2 wlm_uv = i.uv2 + 0.01 * wn.xz;
+  float3 wlm = lightmap.SampleLevel(smp_clamp, wlm_uv, 0.0).rgb;
+  float3 lml = tint.r > 0.0 ? min(wlm * wlm, s + sh_color.rgb) : wlm * wlm;
+  float kd = (wn.x * 0.58 * sign(sh_sun.x) + wn.y * 0.62 * sign(sh_sun.y) +
+              wn.z * 0.39) * 2.39562;
+  float3 lin = lml * kd * dlin;
+  float3 wrl = 2.0 * wn * dot(wn, sh_sun.xyz) - sh_sun.xyz;
+  float ks = pow(max(saturate(dot(vd, wrl)), 1e-6), p3.z);
+  float3 wspec = ks * wmask.x * float3(2.1, 1.8, 1.5) * saturate(lml.g - 0.1);
+  float3 wrv = vd - 2.0 * wn * dot(vd, wn);
+  float3 wcube = overlay.y > 0.0
+                     ? env_cube.SampleBias(smp, float3(-wrv.x, -wrv.y, wrv.z), misc.y).rgb
+                     : float3(0.0, 0.0, 0.0);
+  float wrlum = 0.3 * saturate(4.0 * wmask.y - 2.6);
+  float3 wrefl = wcube * (lml.g + wrlum * (1.0 - lml.g)) * wmask.y * 1.5;
+  float3 wspec_term = wspec + wrefl;
+  lin += wspec_term;
+  lin *= NightGrade();
+  float3 wxe = (lin * (fog_a * p0.y) + fog_rgb) * expo;
+  return ToneOut(wxe, p3.w > 0.0 ? max(wspec_term.g, p3.w) : 1.0, false);
+}
+
 // Exact ocean surface (fam 31, ocean_defaultPS; verified per-pixel
 // against the ucode): PCA-compressed dual-component normal map, lerped
 // toward flat by the overlay-scaled tonedown, cube reflection x squared

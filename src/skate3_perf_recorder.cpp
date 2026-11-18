@@ -53,6 +53,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/audio/output_tap.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/presenter.h>
@@ -849,13 +850,33 @@ uint32_t ActivityTotal(Activity a) {
 bool RenderPaused() { return g_render_paused.load(std::memory_order_relaxed); }
 
 void RequestCapture() {
+  if (!REXCVAR_GET(skate3_perf_recorder)) {
+    REXLOG_WARN("perf-capture: Home pressed, but the performance recorder is off "
+                "(skate3_perf_recorder = false): nothing will be written");
+    return;
+  }
   const int64_t now = NowUs();
   g_manual_press_us.store(now, std::memory_order_release);
   REXLOG_WARN("perf-capture: capture requested (Home); writing in ~6 s");
+  // audio_output_tap_seconds > 0: the same key saves the last seconds of the
+  // game's mixed audio right away (what was heard just before the press).
+  {
+    std::error_code ec;
+    std::filesystem::create_directories("logs", ec);
+    char name[64];
+    std::snprintf(name, sizeof(name), "logs/audio_%lld.wav",
+                  static_cast<long long>(std::time(nullptr)));
+    if (rex::audio::SaveOutputTap(name)) {
+      REXLOG_WARN("perf-capture: saved the recent game audio to {}", name);
+    }
+  }
 }
 
 void SetPresenter(rex::ui::Presenter* presenter) {
-  if (!presenter) skate3::freeze_capture::Shutdown();
+  if (!presenter) {
+    FlushPendingCapture();
+    skate3::freeze_capture::Shutdown();
+  }
   std::lock_guard<std::mutex> lock(PresenterMutex());
   g_presenter = presenter;
 }
@@ -2034,9 +2055,10 @@ void SamplerLoop() {
     }
 
     // ---- Manual capture: ~6 s after the press ----
-    const int64_t press = g_manual_press_us.load(std::memory_order_acquire);
-    if (press != 0 && now - press >= kManualCaptureUs) {
-      g_manual_press_us.store(0, std::memory_order_release);
+    // compare_exchange: FlushPendingCapture (game closing) may take it first.
+    int64_t press = g_manual_press_us.load(std::memory_order_acquire);
+    if (press != 0 && now - press >= kManualCaptureUs &&
+        g_manual_press_us.compare_exchange_strong(press, 0, std::memory_order_acq_rel)) {
       float min_fps = fps1;
       for (const TickRec& tk : g_ticks.Snapshot()) {
         if (tk.t_us > press && tk.t_us <= press + kManualCaptureUs && tk.len_us > 0) {
@@ -2061,4 +2083,19 @@ void StartSampler() {}
 #endif
 
 }  // namespace
+
+void FlushPendingCapture() {
+#if defined(_WIN32)
+  const int64_t press = g_manual_press_us.exchange(0, std::memory_order_acq_rel);
+  if (press == 0 || !REXCVAR_GET(skate3_perf_recorder)) {
+    return;
+  }
+  const int64_t now = NowUs();
+  REXLOG_WARN("perf-capture: the game is closing {:.1f} s after Home; writing the capture now",
+              double(now - press) / 1e6);
+  WriteCapture("Home key, written at exit", press, Window{press, std::max(now, press + 1)},
+               Window{press - 20'000'000, press}, 0.0f, 0.0f);
+#endif
+}
+
 }  // namespace skate3::perf_recorder
